@@ -21,9 +21,10 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
   - §5.16 — threat model: untrusted metadata
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (gaps resolved in v0.2; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
-- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (storage, lifecycle, concurrency, real-time, authz, deletion, job queue, meta-model, frontend).
+- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (storage, lifecycle, concurrency, real-time, authz, deletion, job queue, meta-model, frontend, GraphQL).
 
 ## Roadmap (summary)
 
 Phased from foundation → metadata engine → dynamic data → security → rules →
-workflow → UI → reporting → Studio → integrations → hardening. See §9 of `PLAN.md`.
+workflow → UI → reporting → Studio → integrations → bulk data & attachments → hardening.
+See §9 of `PLAN.md` (MVP milestone lands ~week 26).

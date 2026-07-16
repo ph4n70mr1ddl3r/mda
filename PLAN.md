@@ -14,7 +14,7 @@ A platform where the "application" is data, not code. Business analysts define e
 2. **Single source of truth** — The database holds the model *and* the data. The model is queryable, versionable, and migratable.
 3. **Late binding / interpretation** — The engine reads metadata at request time (with aggressive caching) rather than generating code.
 4. **Extensible** — Pluggable field types, custom functions, scripting (via a sandboxed expression language), webhooks, and connectors.
-5. **Multi-tenant ready** — Schema isolation strategy from day one (tenant_id or schema-per-tenant).
+5. **Multi-tenant ready** — tenant isolation from day one (`tenant_id` + PostgreSQL Row-Level Security, §5.4).
 6. **Auditable** — Every record change, workflow transition, and security decision is logged.
 7. **API-first** — Everything the UI can do, the API can do.
 
@@ -871,24 +871,27 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 
 ## 12. Immediate Next Steps (Week 1)
 
-1. **Confirm decisions in §5** (especially §5.1 storage and §8 frontend) — these are hard to reverse.
-2. Scaffold the Cargo workspace (`crates/` layout in §6).
-3. Stand up dev environment: `docker-compose.yml` with Postgres 16 + Redis + the server binary.
-4. Implement Phase 0: config, tracing, health, migration runner, empty `meta` schema.
-5. Write the **first E2E test scaffold** so vertical testing is ready for Phase 1.
-6. Create `docs/adr/` (Architecture Decision Records) — record the §5 decisions formally.
+Architectural decisions are settled (§5, recorded as ADRs 0001–0010); the focus is now execution:
+
+1. **Run the Phase 0 frontend spike** (ADR-0009) — a throwaway metadata-driven form renderer in both Leptos and React, to pick the Studio/Runtime UI stack on evidence.
+2. **Scaffold the Cargo workspace** (`crates/` layout in §6).
+3. **Stand up the dev environment** — `docker-compose.yml` with Postgres 16 + Redis + the server binary.
+4. **Implement Phase 0** — config, `tracing`, `/health`, the SQLx migration runner, and an empty `meta` schema.
+5. **Write the first E2E test scaffold** so vertical (define-model → use-it) testing is ready for Phase 1.
 
 ---
 
-## 13. Open Questions for You
+## 13. Open Questions
 
-1. **Deployment target:** self-hosted on-prem, cloud (AWS/GCP/Azure), or both? Affects multi-tenancy & storage choices.
-2. **Team size & Rust experience:** drives how aggressive the timeline and the all-Rust-frontend choice are.
-3. **Must-have integrations on day one** (e.g., specific ERP, email provider, SSO) — these shape Phase 9.
-4. **Licensing/commercial model:** open core? proprietary? Affects dependency choices.
-5. **Is there a reference system you admire** (Salesforce, ServiceNow, Odoo, FileMaker, Retool, Appsmith)? Naming it sharpens the design language.
-6. **Expression language appetite:** happy with a restricted declarative DSL, or do you expect users to write real scripts?
+The architecture no longer blocks on these, but they shape later phases and ops:
+
+1. **Deployment target** — self-hosted on-prem, cloud (AWS/GCP/Azure), or both? Drives HA/replication scope (U9) and multi-tenancy ops.
+2. **Team size & Rust experience** — drives timeline realism (§9 solo-vs-team estimates) and the frontend call coming out of the Phase 0 spike.
+3. **Must-have integrations on day one** (specific ERP, email provider, SSO/IdP) — shape Phase 9 (integration layer).
+4. **Licensing / commercial model** — open core vs proprietary; affects dependency choices.
+
+> Resolved during planning: storage/RI, metadata lifecycle, concurrency, real-time, authorization, and expression language are all decided (§5, ADRs 0001–0010).
 
 ---
 
-*This plan is a living document. Update §5 decisions into `docs/adr/` as they are confirmed, and revise the roadmap in §9 as estimates firm up.*
+*This plan is v0.2 — decisions are recorded as ADRs 0001–0010 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
