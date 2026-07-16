@@ -6,8 +6,12 @@ version.workspace = true
 
 [dependencies]
 mda-core = { workspace = true }
+mda-meta = { workspace = true }
 sqlx = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }

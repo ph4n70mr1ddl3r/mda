@@ -1,0 +1,480 @@
+//! Studio API — draft → validate → publish lifecycle (PLAN §5.8, Phase 1).
+//!
+//! Phase 1 supports **additive ops only**: a publish may add modules, entities,
+//! fields, and relationships; it may not remove, rename, or retype anything
+//! already active (transforms/destructive arrive in Phase 2). `biz.*` table
+//! generation also arrives in Phase 2 — here publish only updates the `meta`
+//! model and bumps `md_active_version`.
+//!
+//! Editing is document-style: `PUT /drafts/:id/model` replaces the whole draft
+//! model under an `If-Match` etag (optimistic concurrency → 409 on conflict).
+
+use std::collections::HashSet;
+
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use mda_core::{Error, Result};
+use mda_meta::draft::{diff, AdditionSummary, DiffReport, DraftModel};
+use mda_meta::loader;
+
+use crate::error::ApiResult;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::extract::TenantId;
+use crate::AppState;
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/studio/drafts", post(create_draft))
+        .route("/api/studio/drafts/:id", get(get_draft))
+        .route(
+            "/api/studio/drafts/:id/model",
+            axum::routing::put(put_model),
+        )
+        .route("/api/studio/drafts/:id/validate", post(validate_draft))
+        .route("/api/studio/drafts/:id/publish", post(publish_draft))
+        .route("/api/studio/model", get(get_active_model))
+        .route("/api/studio/export", get(get_active_model))
+        .route("/api/studio/import", post(import_model))
+        .route("/api/studio/snapshots", get(list_snapshots))
+        .route("/api/studio/entities/:id", get(get_entity_definition))
+}
+
+// ===== DTOs =====
+
+#[derive(sqlx::FromRow, Serialize)]
+struct Draft {
+    id: Uuid,
+    tenant_id: Uuid,
+    name: String,
+    status: String,
+    version_etag: Uuid,
+    model: serde_json::Value,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct EtagResp {
+    version_etag: Uuid,
+}
+
+#[derive(Deserialize, Default)]
+struct CreateDraftReq {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PublishResult {
+    draft_id: Uuid,
+    version: i64,
+    snapshot_id: Uuid,
+    additions: AdditionSummary,
+}
+
+#[derive(sqlx::FromRow, Serialize)]
+struct SnapshotRow {
+    id: Uuid,
+    version: i64,
+    created_at: DateTime<Utc>,
+}
+
+// ===== handlers =====
+
+async fn create_draft(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+    Json(req): Json<CreateDraftReq>,
+) -> ApiResult<Json<Draft>> {
+    let name = req.name.unwrap_or_else(|| "draft".to_string());
+    let active = loader::load_active_model(&st.pool, tenant).await?;
+    let model_json = serde_json::to_value(&active).map_err(Error::internal)?;
+    let draft: Draft = sqlx::query_as::<_, Draft>(
+        "INSERT INTO meta.md_draft (tenant_id, name, model, status)
+         VALUES ($1, $2, $3, 'draft')
+         RETURNING id, tenant_id, name, status, version_etag, model, created_at, updated_at",
+    )
+    .bind(tenant)
+    .bind(&name)
+    .bind(&model_json)
+    .fetch_one(&st.pool)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(draft))
+}
+
+async fn get_draft(
+    State(st): State<AppState>,
+    TenantId(_tenant): TenantId,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Draft>> {
+    let draft = fetch_draft(&st.pool, id).await?;
+    Ok(Json(draft))
+}
+
+async fn put_model(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(model): Json<DraftModel>,
+) -> ApiResult<Json<EtagResp>> {
+    let if_match = etag_from_headers(&headers)?;
+    let model_json = serde_json::to_value(&model).map_err(Error::internal)?;
+
+    // Ensure the draft belongs to this tenant before mutating.
+    let existing = fetch_draft(&st.pool, id).await?;
+    if existing.tenant_id != tenant {
+        return Err(Error::NotFound(format!("draft {id}")).into());
+    }
+    if existing.status != "draft" {
+        return Err(Error::Conflict(format!("draft is {} (not editable)", existing.status)).into());
+    }
+
+    let updated: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE meta.md_draft
+            SET model = $3, version_etag = gen_random_uuid(), updated_at = now()
+          WHERE id = $1 AND version_etag = $2
+          RETURNING version_etag",
+    )
+    .bind(id)
+    .bind(if_match)
+    .bind(&model_json)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(Error::internal)?;
+
+    match updated {
+        Some((etag,)) => Ok(Json(EtagResp { version_etag: etag })),
+        None => Err(Error::Conflict(
+            "version_etag mismatch — draft was modified by another editor".into(),
+        )
+        .into()),
+    }
+}
+
+async fn validate_draft(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<DiffReport>> {
+    let draft = fetch_draft(&st.pool, id).await?;
+    ensure_tenant(&draft, tenant)?;
+    let model: DraftModel = serde_json::from_value(draft.model.clone()).map_err(Error::internal)?;
+    let active = loader::load_active_model(&st.pool, tenant).await?;
+    Ok(Json(diff(&active, &model)))
+}
+
+async fn publish_draft(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<PublishResult>> {
+    let draft = fetch_draft(&st.pool, id).await?;
+    ensure_tenant(&draft, tenant)?;
+    if draft.status == "published" {
+        return Err(Error::Conflict("draft already published".into()).into());
+    }
+    if draft.status == "publishing" {
+        return Err(Error::Conflict("draft is currently publishing".into()).into());
+    }
+
+    let model: DraftModel = serde_json::from_value(draft.model.clone()).map_err(Error::internal)?;
+    let active = loader::load_active_model(&st.pool, tenant).await?;
+    let report = diff(&active, &model);
+    if !report.valid {
+        return Err(Error::Invalid(format!(
+            "draft is not publishable (Phase 1 = additive only): {}",
+            summarize(&report)
+        ))
+        .into());
+    }
+
+    let result = apply_additive_publish(&st.pool, tenant, id, &active, &model).await?;
+
+    // Notify other instances + drop the local cache (fast path + eager).
+    let _ = sqlx::query("SELECT pg_notify('meta_changed', $1)")
+        .bind(tenant.to_string())
+        .execute(&st.pool)
+        .await;
+    st.cache.invalidate_all();
+
+    Ok(Json(result))
+}
+
+async fn get_active_model(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+) -> ApiResult<Json<DraftModel>> {
+    let model = loader::load_active_model(&st.pool, tenant).await?;
+    Ok(Json(model))
+}
+
+async fn import_model(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+    Json(model): Json<DraftModel>,
+) -> ApiResult<Json<Draft>> {
+    // Branch from active, then overlay the imported model as the draft content.
+    let active = loader::load_active_model(&st.pool, tenant).await?;
+    let _ = active; // branched model is the starting point; we replace with imported
+    let model_json = serde_json::to_value(&model).map_err(Error::internal)?;
+    let draft: Draft = sqlx::query_as::<_, Draft>(
+        "INSERT INTO meta.md_draft (tenant_id, name, model, status)
+         VALUES ($1, 'imported', $2, 'draft')
+         RETURNING id, tenant_id, name, status, version_etag, model, created_at, updated_at",
+    )
+    .bind(tenant)
+    .bind(&model_json)
+    .fetch_one(&st.pool)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(draft))
+}
+
+async fn list_snapshots(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+) -> ApiResult<Json<Vec<SnapshotRow>>> {
+    let rows: Vec<SnapshotRow> = sqlx::query_as::<_, SnapshotRow>(
+        "SELECT id, version, created_at FROM meta.md_snapshot
+          WHERE tenant_id = $1 ORDER BY version DESC",
+    )
+    .bind(tenant)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(Error::internal)?;
+    Ok(Json(rows))
+}
+
+/// Read an entity definition **through the cache** (exercises the loader +
+/// invalidation; the runtime data layer in Phase 2 will use the same path).
+async fn get_entity_definition(
+    State(st): State<AppState>,
+    TenantId(tenant): TenantId,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<mda_meta::EntityDefinition>> {
+    let def = st.cache.get_entity(&st.pool, tenant, id).await?;
+    Ok(Json((*def).clone()))
+}
+
+// ===== helpers =====
+
+async fn fetch_draft(pool: &PgPool, id: Uuid) -> Result<Draft> {
+    sqlx::query_as::<_, Draft>(
+        "SELECT id, tenant_id, name, status, version_etag, model, created_at, updated_at
+           FROM meta.md_draft WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(|| Error::NotFound(format!("draft {id}")))
+}
+
+fn ensure_tenant(draft: &Draft, tenant: Uuid) -> Result<()> {
+    if draft.tenant_id != tenant {
+        return Err(Error::NotFound(format!("draft {}", draft.id)));
+    }
+    Ok(())
+}
+
+fn etag_from_headers(headers: &HeaderMap) -> Result<Uuid> {
+    headers
+        .get("if-match")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| Error::Invalid("If-Match version_etag header required".into()))
+}
+
+fn summarize(report: &DiffReport) -> String {
+    let mut parts = Vec::new();
+    if !report.violations.is_empty() {
+        parts.push(format!("violations=[{}]", report.violations.join("; ")));
+    }
+    if !report.errors.is_empty() {
+        parts.push(format!("errors=[{}]", report.errors.join("; ")));
+    }
+    parts.join(", ")
+}
+
+/// Apply an additive-only publish in a single transaction: archive the prior
+/// active model to a snapshot, INSERT the new artifacts, bump the version, mark
+/// the draft published.
+async fn apply_additive_publish(
+    pool: &PgPool,
+    tenant: Uuid,
+    draft_id: Uuid,
+    active: &DraftModel,
+    draft: &DraftModel,
+) -> Result<PublishResult> {
+    let active_module_ids: HashSet<Uuid> = active.modules.iter().map(|m| m.id).collect();
+    let active_entity_ids: HashSet<Uuid> = active.entities.iter().map(|e| e.id).collect();
+    let active_field_ids: HashSet<Uuid> = active
+        .entities
+        .iter()
+        .flat_map(|e| e.fields.iter().map(|f| f.id))
+        .collect();
+    let active_rel_ids: HashSet<Uuid> = active
+        .entities
+        .iter()
+        .flat_map(|e| e.relationships.iter().map(|r| r.id))
+        .collect();
+
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+
+    // 1) archive the current active model
+    let active_json = serde_json::to_value(active).map_err(Error::internal)?;
+    let (snapshot_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO meta.md_snapshot (tenant_id, version, model, manifest)
+         VALUES ($1, COALESCE((SELECT version FROM meta.md_active_version WHERE tenant_id = $1), 0), $2, $3)
+         RETURNING id",
+    )
+    .bind(tenant)
+    .bind(&active_json)
+    .bind(serde_json::json!({"reason":"publish","draft_id":draft_id.to_string()}))
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+
+    // 2) INSERT additions: modules
+    let mut additions = AdditionSummary::default();
+    for m in &draft.modules {
+        if active_module_ids.contains(&m.id) {
+            continue;
+        }
+        additions.modules += 1;
+        sqlx::query(
+            "INSERT INTO meta.md_module (id, tenant_id, name, label)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(m.id)
+        .bind(tenant)
+        .bind(&m.name)
+        .bind(&m.label)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    }
+
+    // 3) INSERT additions: entities
+    for e in &draft.entities {
+        if active_entity_ids.contains(&e.id) {
+            continue;
+        }
+        additions.entities += 1;
+        sqlx::query(
+            "INSERT INTO meta.md_entity
+                (id, tenant_id, module_id, table_name, name, label, description, status)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')",
+        )
+        .bind(e.id)
+        .bind(tenant)
+        .bind(e.module_id)
+        .bind(&e.table_name)
+        .bind(&e.name)
+        .bind(&e.label)
+        .bind(&e.description)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    }
+
+    // 4) INSERT additions: fields (entity must exist — either active or just inserted)
+    for e in &draft.entities {
+        for f in &e.fields {
+            if active_field_ids.contains(&f.id) {
+                continue;
+            }
+            additions.fields += 1;
+            sqlx::query(
+                "INSERT INTO meta.md_field
+                    (id, tenant_id, entity_id, name, label, field_type, required,
+                     is_unique, is_indexed, default_expr, config, status)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active')",
+            )
+            .bind(f.id)
+            .bind(tenant)
+            .bind(e.id)
+            .bind(&f.name)
+            .bind(&f.label)
+            .bind(&f.field_type)
+            .bind(f.required)
+            .bind(f.is_unique)
+            .bind(f.is_indexed)
+            .bind(&f.default_expr)
+            .bind(&f.config)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        }
+    }
+
+    // 5) INSERT additions: relationships
+    for e in &draft.entities {
+        for r in &e.relationships {
+            if active_rel_ids.contains(&r.id) {
+                continue;
+            }
+            additions.relationships += 1;
+            sqlx::query(
+                "INSERT INTO meta.md_relationship
+                    (id, tenant_id, source_entity_id, source_field_name, target_entity_id,
+                     cardinality, strength, on_delete, required, reference_qualifier, rollup_summary)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            )
+            .bind(r.id)
+            .bind(tenant)
+            .bind(e.id)
+            .bind(&r.source_field_name)
+            .bind(r.target_entity_id)
+            .bind(&r.cardinality)
+            .bind(&r.strength)
+            .bind(&r.on_delete)
+            .bind(r.required)
+            .bind(&r.reference_qualifier)
+            .bind(&r.rollup_summary)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        }
+    }
+
+    // 6) bump the active version (create-or-increment)
+    sqlx::query(
+        "INSERT INTO meta.md_active_version (tenant_id, version, snapshot_id, updated_at)
+         VALUES ($1, 1, $2, now())
+         ON CONFLICT (tenant_id) DO UPDATE
+            SET version = meta.md_active_version.version + 1,
+                snapshot_id = EXCLUDED.snapshot_id,
+                updated_at = now()",
+    )
+    .bind(tenant)
+    .bind(snapshot_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+
+    // 7) mark draft published
+    sqlx::query("UPDATE meta.md_draft SET status = 'published', updated_at = now() WHERE id = $1")
+        .bind(draft_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+
+    tx.commit().await.map_err(Error::internal)?;
+
+    let version = loader::active_version(pool, tenant).await?;
+    Ok(PublishResult {
+        draft_id,
+        version,
+        snapshot_id,
+        additions,
+    })
+}

@@ -1,6 +1,6 @@
-//! `mda-server` — wiring & bootstrap. The `main` binary constructs config,
-//! tracing, and the DB pool, runs migrations, and serves the API with graceful
-//! shutdown.
+//! `mda-server` — wiring & bootstrap. Constructs config, tracing, the DB pool,
+//! the metadata cache (+ invalidation tasks), runs migrations, and serves the
+//! API with graceful shutdown.
 
 pub mod config;
 pub mod migrate;
@@ -25,7 +25,15 @@ pub async fn run() -> anyhow::Result<()> {
     migrate::run(&pool).await?;
     tracing::info!("database migrated");
 
-    let app: Router = mda_api::router(AppState { pool: pool.clone() });
+    // Metadata cache + invalidation (PLAN §5.3): LISTEN fast path + version poll.
+    let cache = mda_meta::MetadataCache::new();
+    mda_meta::cache::spawn_listen(pool.clone(), cache.clone());
+    mda_meta::cache::spawn_poll(pool.clone(), cache.clone());
+
+    let app: Router = mda_api::router(AppState {
+        pool: pool.clone(),
+        cache,
+    });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr)

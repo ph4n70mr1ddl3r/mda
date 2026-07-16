@@ -4,8 +4,8 @@ A declarative, data-driven, model-driven **no-code enterprise system** built in 
 Everything — entities, forms, screens, reports, workflows, rules, integrations — is
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
-> **Status:** Architecture & planning → **Phase 0 (foundation) implemented**. No code
-> beyond the foundation yet.
+> **Status:** Architecture & planning → **Phases 0–1 implemented** (foundation +
+> metadata engine: draft → validate → publish lifecycle, metadata cache).
 
 ## Quick start (Phase 0)
 
@@ -23,6 +23,18 @@ Health check:
 ```bash
 curl localhost:8080/health
 # {"status":"ok","database":"up","version":"0.1.0"}
+```
+
+Studio API (Phase 1) — branch → edit → validate → publish:
+
+```bash
+TENANT=00000000-0000-0000-0000-000000000000
+curl -s -X POST localhost:8080/api/studio/drafts -H "x-tenant-id: $TENANT" \
+     -H "content-type: application/json" -d '{"name":"v1"}'
+# PUT  /api/studio/drafts/:id/model   (If-Match: <version_etag>)  — edit
+# POST /api/studio/drafts/:id/validate                          — dry-run diff
+# POST /api/studio/drafts/:id/publish                           — additive-only
+# GET  /api/studio/model                                        — active model
 ```
 
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
@@ -57,6 +69,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (17 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL).
+- [`docs/PHASE0.md`](./docs/PHASE0.md) · [`docs/PHASE1.md`](./docs/PHASE1.md) — phase status & handoffs.
 
 ## Roadmap (summary)
 

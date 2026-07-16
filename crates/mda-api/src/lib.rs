@@ -1,23 +1,31 @@
-//! `mda-api` — the HTTP edge (Axum). Phase 0 exposes only `/health`; the
-//! Studio, runtime, auth, GraphQL, and real-time routes arrive in later phases.
+//! `mda-api` — the HTTP edge (Axum). Phase 0 added `/health`; Phase 1 adds the
+//! Studio API (draft → validate → publish). Runtime, auth, GraphQL, and
+//! real-time routes arrive in later phases.
 
-use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use serde::Serialize;
 use sqlx::PgPool;
 
+pub mod error;
+pub mod extract;
+pub mod studio;
+
+use mda_meta::MetadataCache;
+
 /// Shared application state injected into every handler.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub cache: MetadataCache,
 }
 
 /// Build the application router.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .merge(studio::routes())
         .with_state(state)
 }
 
@@ -33,7 +41,7 @@ struct HealthReport {
 /// Returns 200 `{ "status":"ok", "database":"up" }` when the DB answers
 /// `SELECT 1`; 503 `database:"down"` otherwise. The platform is not "ready"
 /// until the database is reachable.
-async fn health(State(state): State<AppState>) -> Response {
+async fn health(axum::extract::State(state): axum::extract::State<AppState>) -> Response {
     let db_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
         .fetch_one(&state.pool)
         .await

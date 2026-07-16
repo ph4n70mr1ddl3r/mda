@@ -33,10 +33,11 @@ async fn migrations_apply_and_meta_schema_exists() {
     .expect("query meta tables");
     assert_eq!(count, 9, "all meta skeleton tables should exist");
 
-    // the bootstrap active-version pointer should be present
-    let versions: i64 = sqlx::query_scalar("SELECT count(*) FROM meta.md_active_version")
-        .fetch_one(&pool)
-        .await
-        .expect("query md_active_version");
-    assert_eq!(versions, 1, "bootstrap active_version row should exist");
+    // the bootstrap active-version pointer should still be present
+    let bootstrap: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM meta.md_active_version WHERE tenant_id = '00000000-0000-0000-0000-000000000000'")
+            .fetch_one(&pool)
+            .await
+            .expect("query md_active_version");
+    assert!(bootstrap >= 1, "bootstrap active_version row should exist");
 }
