@@ -87,7 +87,7 @@ The database holds **two distinct models**:
 | AuthN | `jsonwebtoken`, `argon2`, OAuth2 (`openidconnect`) | JWT + refresh tokens |
 | Serialization | `serde` + `serde_json` | Everywhere |
 | Validation | `validator` + custom expression engine | |
-| Async jobs | **`apalis`** or `tokio-cron-scheduler` + Redis | Cron, retries, delayed |
+| Async jobs | **`apalis`** (Postgres-backed) | Cron, retries, delayed, DLQ; drives scheduled reports, workflow timers, two-phase purge, and the outbox-drain worker (§5.9.4) |
 | Search | PostgreSQL FTS → OpenSearch later | Start simple |
 | Frontend | **Leptos** (CSR/SSR, WASM) *or* React + TypeScript | See §8 |
 | Frontend build | Trunk (WASM) / Vite | |
@@ -104,6 +104,8 @@ SeaORM offers nicer ergonomics but obscures the dynamic SQL we need for runtime 
 ## 4. The Meta-Meta-Model (the heart of the system)
 
 This is the schema that *describes the descriptions*. Everything below is a table in the `meta` schema.
+
+> **Note — fixed meta-model (ADR-0008):** the platform's own definitions (`md_entity`, `md_field`, …) are **static Rust structs + SQL**, not first-class runtime entities. This is deliberate (avoids the bootstrapping / infinite-regress of self-hosting meta-metadata); the consequence is "no edit the editor." See §5.12.
 
 ### 4.1 Modules & Entities
 ```
@@ -226,7 +228,7 @@ This is the Odoo / Microsoft Dataverse model, chosen over Salesforce's universal
 
 | Column group | Columns | Notes |
 |---|---|---|
-| **Core (every table)** | `id ULID PK`, `tenant_id`, `owner_id`, `state`, `version BIGINT`, `created_at`, `updated_at`, `deleted_at` | Fixed across all entities; `tenant_id` in every composite index + RLS policy; `version` drives optimistic concurrency (§5.9) |
+| **Core (every table)** | `id ULID PK`, `tenant_id`, `owner_id`, `state`, `version BIGINT`, `created_at`, `updated_at` | Fixed across all entities; `tenant_id` in every composite index + RLS policy; `version` drives optimistic concurrency (§5.9); **no `deleted_at`** (deletion = hard-delete + archive, §5.7 / ADR-0006) |
 | **Hoisted relational** | one real typed column per reference field, e.g. `ref_customer_id ULID` | Real `FOREIGN KEY ... ON DELETE <behavior>`; `DEFERRABLE INITIALLY DEFERRED` for mutual references |
 | **Hoisted scalar (optional)** | real columns for indexed/unique/hot fields, e.g. `email TEXT UNIQUE` | Hoist from JSONB automatically via **generated columns**: `email TEXT GENERATED ALWAYS AS (attributes->>'email') STORED` |
 | **Flexible payload** | `attributes JSONB` | Everything else; GIN-indexed for ad-hoc query |
@@ -305,12 +307,12 @@ md_relationship
 
 **Mutual references** (A references B, B references A) use `DEFERRABLE INITIALLY DEFERRED` FKs so integrity is checked at commit, not per statement.
 
-**Soft-delete interaction (decide in Phase 0):** Soft-delete (`deleted_at`) **defeats native cascade** because the row isn't actually deleted, so `ON DELETE CASCADE` never fires. Two coherent choices:
+**Deletion (recorded decision — ADR-0006):** deletion is **hard-delete + archive**. The row moves to `biz_archive.<table>` (carrying `archived_at` / `archived_by`); native `ON DELETE CASCADE` / `SET NULL` / `RESTRICT` fire naturally, preserving RI end to end, and the archive gives recoverability/undo. **Soft-delete is rejected**: it defeats native cascade (the row isn't actually deleted, so `ON DELETE …` never fires) and would force RI to be re-implemented in the app layer (the ServiceNow/Salesforce route).
 
-- **Hard-delete + archive (recommended):** move the row to `biz_archive.<table>` on delete; native FKs cascade naturally; the archive gives recoverability without a cascade-complexity tax. Keeps RI trustworthy end to end.
-- **Soft-delete + app-layer cascade:** runtime walks inbound relationships and applies `on_delete` on the logical delete. Re-implements cascade in app code (the ServiceNow/Salesforce route).
-
-> Recommendation: **hard-delete + archive table.** It preserves native RI end to end and the archive gives recoverability.
+Consequences:
+- The core columns carry **no `deleted_at`** (§5.1) — `biz` tables hold live rows only.
+- This also resolves REVIEW.md **U3**: unique constraints need no `WHERE deleted_at IS NULL` partial-index gymnastics — a deleted value (e.g. email) can be re-created immediately, since the old row is gone from the live table.
+- Restore is an explicit operation that re-inserts from `biz_archive` (re-running FK/cascade checks), not a flag flip.
 
 ### 5.8 Metadata lifecycle: draft → validate → publish → activate
 
@@ -518,6 +520,14 @@ sys_event_log
 
 **No negative permissions.** The model is purely additive on top of a deny-by-default baseline (matches Salesforce; avoids deny-vs-grant precedence ambiguity). For an exception, narrow the role or add a more specific OWD/sharing rule.
 
+### 5.12 Meta-model: fixed, not self-hosting
+
+(Decides REVIEW.md **U8**, ADR-0008.) Salesforce makes its own model first-class (`EntityDefinition` is itself an entity the Studio can edit). We do **not**, for v1: the meta-model (`md_entity`, `md_field`, `md_relationship`, …) is fixed Rust structs + SQL, edited by dedicated Studio handlers — not treated as runtime entities.
+
+**Why:** self-hosting introduces bootstrapping and an infinite-regress of meta-meta-(meta-)tables, adds large complexity for modest v1 gain, and every reference platform that isn't Salesforce (Odoo, Dataverse, ServiceNow's core) ships a fixed core model. Pragmatism wins.
+
+**Consequence:** "no edit the editor" — the Studio cannot redefine the platform's own definition tables. Custom entity/field types remain extensible via the registry + `wasmtime` (§5.6). Revisit only if a use case demands user-defined meta-types.
+
 ---
 
 ## 6. Component Breakdown (crate / module level)
@@ -628,6 +638,8 @@ GET    /api/auth/me
 
 The runtime UI is a **metadata interpreter**: fetch form/view JSON → render inputs/tables → POST back. It is thin; the server is the brain.
 
+> **Decision deferred to a Phase 0 spike (ADR-0009):** the drag-and-drop Studio designers are the highest-risk, highest-effort component. Phase 0 builds a throwaway metadata-driven form renderer in *both* Leptos and React to make the call on evidence rather than committing now. Until then the frontend stack is provisional.
+
 ---
 
 ## 9. Development Roadmap (Phased)
@@ -639,6 +651,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - `mda-core`: error types, IDs (`ulid`), traits
 - Config, logging (`tracing`), health endpoint
 - SQLx setup + migration runner; `meta` schema skeleton
+- **Frontend spike:** throwaway metadata-driven form renderer built in *both* Leptos and React to pick the Studio tech on evidence (§8, ADR-0009) before Phase 6/8 — runs in parallel with infra setup
 - **Deliverable:** `cargo run` boots, `/health` responds, migrations run.
 
 ### Phase 1 — Metadata Engine (Weeks 3–6)
