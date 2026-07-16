@@ -1,0 +1,18 @@
+[package]
+name = "mda-runtime-ui"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone (not a workspace member); built by Trunk → WASM.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+leptos = { version = "0.6", features = ["csr"] }
+gloo-net = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+web-sys = { version = "0.3", features = ["Window", "Storage"] }
+console_error_panic_hook = "0.1"

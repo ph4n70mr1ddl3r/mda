@@ -41,6 +41,7 @@ pub fn router(state: AppState) -> Router {
         .merge(reports::routes())
         .merge(notifications::routes())
         .merge(blobs::routes())
+        .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
 

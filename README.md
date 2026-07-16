@@ -4,9 +4,9 @@ A declarative, data-driven, model-driven **no-code enterprise system** built in 
 Everything — entities, forms, screens, reports, workflows, rules, integrations — is
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
-> **Status:** Architecture & planning → **Phases 0–3 implemented** (foundation +
-> metadata engine + dynamic data layer + security/auth + rules: bounded expression
-> DSL, set-field rules, calculated fields).
+> **Status:** Phases 0–7, 10 implemented + Phase 6 Runtime UI (Leptos).
+> Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
+> notifications, sharing. Frontend: login + entity list (WASM).
 
 ## Quick start (Phase 0)
 
