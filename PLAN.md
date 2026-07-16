@@ -67,7 +67,7 @@ A platform where the "application" is data, not code. Business analysts define e
 ### The two-data-model insight (critical)
 The database holds **two distinct models**:
 1. **Metadata model** — statically-typed tables (`md_entity`, `md_field`, `md_form`, etc.) that *describe* the application. Fixed schema, known at compile time.
-2. **Business data model** — the dynamic instances of those entities. Stored in a **single generic table** (EAV-ish) OR in **generated/dynamic tables** per entity.
+2. **Business data model** — the dynamic instances of those entities. Stored as **one real table per entity** (`biz.<table>`) with a stable core schema + hoisted relational columns + native FK constraints + a JSONB payload for the rest (§5.1).
 
 > **Decision (recorded): Pattern B — real table per entity + native Postgres FK constraints, JSONB only for the non-relational remainder.** See §5.1, §5.7, and `docs/ri-strategies.md`.
 
@@ -241,7 +241,7 @@ This is the Odoo / Microsoft Dataverse model, chosen over Salesforce's universal
 
 ### 5.2 Expression language (DSL)
 Business rules, validations, workflow guards, report filters all need expressions ("`amount > 1000 AND status == 'open'`").
-- **Option 1:** Embed a scripting language (Rhpr / Rune / Boa) — powerful, slower, sandbox risk.
+- **Option 1:** Embed a scripting language (`rhai` / Rune / Boa) — powerful, slower, sandbox risk.
 - **Option 2:** Build a small typed expression AST evaluator in Rust (like `eval` crates or custom).
 - **Recommendation:** **Custom JSON AST evaluator** stored as JSONB, evaluated by a Rust interpreter. Safe, serializable, fast, testable. Add a `rune` escape hatch later for power users behind a capability flag.
 
@@ -257,9 +257,7 @@ Metadata changes must take effect without restart:
 - **Recommendation v1:** **Strategy A** with PostgreSQL **Row-Level Security** enforcing tenant isolation at the DB layer (defense in depth). Make tenant_id part of all composite indexes.
 
 ### 5.5 Versioning & migrations of metadata
-- Metadata is deployable like code. Export/import as JSON bundles.
-- Track `md_version` snapshots. Support "promote model from dev → staging → prod" via import.
-- Always backward-compatible additive changes; destructive changes require a migration job.
+Fully specified in **§5.8** (draft → validate → publish → activate lifecycle) and **§4.8** (lifecycle tables). In short: metadata is deployable as JSON bundles (Studio export/import) across dev → staging → prod; publish classifies changes as additive / transforming / two-phase destructive and runs a validated migration against live data.
 
 ### 5.6 Extensibility model
 - **Field types:** registry of built-in types + a Rust trait `FieldType` that plugins implement (compiled into the binary via a registry pattern; dynamic loading via `wasmtime` later).
@@ -451,7 +449,7 @@ sys_event_log
 **6. AuthZ on the channel (critical).** A client must only receive events for records/fields it is authorized to see:
 - Authenticate the SSE connection (JWT).
 - Authorize each subscription (can this user see this entity/record/view?).
-- The relay filters events per client using the same RBAC+ABAC+data filters as the REST API (§5.6, C6) — including **field-level visibility** (never leak a change to a masked field). Access decisions are cached to keep this cheap.
+- The relay filters events per client using the same RBAC+ABAC+data filters as the REST API (§5.11) — including **field-level visibility** (never leak a change to a masked field). Access decisions are cached to keep this cheap.
 
 **7. Client merge strategy (ties to OCC §5.9).** On receiving `record.updated` for the record the client is viewing:
 - Not editing → refresh the view.
@@ -735,7 +733,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 | Integration | `cargo test` + testcontainers (real Postgres/Redis) | Metadata CRUD, dynamic data, rules, workflows |
 | E2E | `cargo test` HTTP + (optional) Playwright for UI | Full vertical: define model → use it |
 | Property | `proptest` | Expression eval invariants, query builder |
-| Load | `katoa`/`oha`/`wrk` | API throughput, metadata cache |
+| Load | `k6`/`oha`/`wrk`/`vegeta` | API throughput, metadata cache |
 | Metadata regression | Snapshot golden tests | Model export format stability |
 
 **Golden rule:** every Phase deliverable is backed by an E2E test that defines metadata via API and exercises the runtime against it. This is the only way to trust a metadata-driven system.

@@ -2,6 +2,8 @@
 
 A critical, self-imposed architectural review. Verdict up front, then strengths, then the gaps that will actually hurt.
 
+> **Status:** All six critical gaps (C1–C6) identified below are now resolved in `PLAN.md` v0.2 (§5.7–§5.11). This review is retained as the reasoning trail.
+
 ---
 
 ## Verdict
