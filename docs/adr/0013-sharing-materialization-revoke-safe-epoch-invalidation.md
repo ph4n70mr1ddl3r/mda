@@ -49,7 +49,7 @@ rule_visible(U, R) =
     WHERE E ≥ current_epoch(K)        -- stale shares are ignored, never honored
 ```
 
-Bumping `current_epoch(K)` is a **single O(1) update** to one `sec_sharing_rule`
+Bumping `current_epoch(K)` is a **single O(1) update** to one `sec_share_rule`
 row — it invalidates *all* shares computed under the old epoch instantly, without
 touching `sec_record_share`. Recomputation then runs async to write new-epoch
 rows; until it does, the safe under-grant holds (stale shares filtered out).
@@ -131,6 +131,6 @@ latency low across the cluster.
   security) until batched recomputation catches up — surfaced as progress in the
   Studio. This is the deliberate, correct trade: confidentiality is never
   compromised; availability degrades briefly and recovers.
-- **(−)** Extra schema: `epoch` on `sec_sharing_rule` and `sec_record_share`, plus a
+- **(−)** Extra schema: `epoch` on `sec_share_rule` and `sec_record_share`, plus a
   per-tenant `hierarchy_epoch`; a reshard job and a stale-row GC job. Real but
   bounded surface area.

@@ -17,11 +17,13 @@ A platform where the "application" is data, not code. Business analysts define e
 5. **Multi-tenant ready** — tenant isolation from day one (`tenant_id` + PostgreSQL Row-Level Security, §5.4).
 6. **Auditable** — Every record change, workflow transition, and security decision is logged.
 7. **API-first** — Everything the UI can do, the API can do.
+8. **Domain-neutral** — the engine knows no business nouns (no "invoice," "ledger," "period," or "account"). CRM, ITSM, ERP, or any vertical is an *app built on top* as metadata + sandboxed extensions — never a feature baked into the core. The test for any proposed core feature: *could a different domain use it too?* If not, it belongs in a custom field type / expression function / `wasmtime` module (§5.6) or a reference-app bundle, not in `mda-*`. Demanding domains (ERP being the hardest stress test) are made possible by a strong *generic extension surface*, not by domain-specific code.
 
 ### Non-goals (for v1)
 - Code generation / compile-step deployment (we interpret, not generate)
 - Mobile-native apps (responsive web first)
 - Real-time collaborative editing of metadata
+- **General-purpose stateless integration broker / iPaaS** (MuleSoft/Boomi class) — we integrate as a **hub** with our own canonical model and business logic, not as a pass-through broker (§5.22)
 
 ---
 
@@ -55,7 +57,8 @@ A platform where the "application" is data, not code. Business analysts define e
 ┌───────────▼─────────────────────────────────────────────────┐ │
 │                    PERSISTENCE                                │ │
 │  PostgreSQL:  metadata schema  │  data schema (dynamic)      │ │
-│               audit/event log  │  blob store                 │ │
+│               audit/event/outbox logs                        │ │
+│  (blob bytes live outside Postgres; see 5.14 BlobStore)      │ │
 └──────────────────────────────────────────────────────────────┘ │
                                                                   │
 ┌──────────────────────────────────────────────────────────────┐ │
@@ -98,6 +101,9 @@ The database holds **two distinct models**:
 
 ### Alternative considered: SeaORM
 SeaORM offers nicer ergonomics but obscures the dynamic SQL we need for runtime data access. **SQLx with hand-written queries for metadata + a query-builder module for dynamic data** is the recommendation.
+
+### Rate limiting
+Enforced at the API edge via Tower middleware — **per-tenant and per-user** quotas, returning `429 Too Many Requests` + `Retry-After`. It composes with the per-query **cost budgets** for list and report queries (§5.16/§5.17): a request that would blow the budget is rejected (or routed async) rather than throttled blindly, so expensive metadata-driven queries can't be used to DoS the cluster.
 
 ---
 
@@ -163,19 +169,24 @@ sec_owd(entity, default)                     -- org-wide default: private|team|p
 sec_role_hierarchy                           -- role tree (optional; "see records below me"); hierarchy-derived shares are epoch-gated by a per-tenant hierarchy_epoch (ADR-0013)
 sec_share(record, principal, access)         -- explicit/manual record share
 sec_share_rule(entity, cond, principal, access, epoch)  -- criteria-based auto-share (ABAC); epoch = rule version for revoke-safe invalidation (ADR-0013)
-sec_record_share(record, principal, access, rule_id, epoch)  -- MATERIALIZED computed shares; revoke-safe via epoch invalidation (ADR-0013). Per-record recompute is synchronous in the write txn; admin rule/hierarchy changes bump an epoch (instant revoke) + async batched recompute (progressive grant).
-sec_policy                                   -- general ABAC policies (expression engine)
+sec_record_share(record_id, principal_id, access, rule_id, epoch)  -- MATERIALIZED computed shares; revoke-safe via epoch invalidation (ADR-0013). Per-record recompute is synchronous in the write txn; admin rule/hierarchy changes bump an epoch (instant revoke) + async batched recompute (progressive grant).
+-- (ABAC is expressed through the six grains above — record predicates + field constraints — via the
+--  expression engine, §5.11; there is no separate policy table.)
 ```
 
 ### 4.6 Integration
 ```
-int_connector    - typed adapter (REST/SOAP/DB/file/GraphQL/mq)
-  └─ int_endpoint
-int_mapping      - field mapping between external & internal entities
-int_flow         - inbound/outbound ETL pipelines
-  └─ int_flow_step
-int_schedule
-int_webhook      - outbound event subscriptions
+int_connector    - typed adapter; CORE ships universal transports (HTTP/DB/file/MQ/GraphQL/SOAP)
+  └─ int_endpoint        + a pluggable Format + Auth boundary (§5.6/§5.22) so niche formats & vendor
+                          protocols (EDI, IDoc, AS2/OFTP, vendor auth) are EXTENSION connectors
+int_mapping      - field mapping between external & internal entities (per-flow transform steps)
+int_flow         - inbound/outbound ETL pipelines — HUB model: external ↔ internal canonical entities
+  └─ int_flow_step       each step may apply an expression-engine transform (value map/conditional/debatch)
+int_value_map    - code-set translation tables (e.g. status codes) used by mapping steps — data, not code
+int_external_id  - correlation registry: (entity, record_id, system, external_key) — idempotent, dedupe,
+                   bidirectional sync between a platform record and an external system's natural key (§5.22)
+int_schedule     - cron / event triggers for flows
+int_webhook      - outbound event subscriptions (contract: §5.21)
 ```
 
 ### 4.7 System
@@ -198,6 +209,8 @@ sys_impex_row    - per-row import result (resumability + error report): (job_id,
 sys_blob         - attachment storage metadata: (id, storage, storage_key, filename, mime, size, checksum,
                    owner_id, scan_status, created_at) — bytes live in the BlobStore, not here. §5.14
 sys_blob_ref     - back-references for orphan cleanup / dedup: (blob_id, entity, record_id, field)
+sys_secret       - secret REFERENCE only (the value lives in the SecretStore, never here): (id, tenant_id, name, kind, ref, rotated_at, created_at) §5.20
+sys_notification_preference - per-user notification opt-in/out by (type, channel): (user_id, type, channel, enabled) §5.18
 ```
 
 ### 4.8 Model lifecycle & versioning
@@ -239,16 +252,18 @@ This is the Odoo / Microsoft Dataverse model, chosen over Salesforce's universal
 
 | Column group | Columns | Notes |
 |---|---|---|
-| **Core (every table)** | `id` ULID PK (stored as native `uuid`, 16 bytes — preserves ULID's b-tree-friendly monotonic sort order; never `text`/37 bytes, which would bloat every index and FK), `tenant_id`, `owner_id`, `state`, `version BIGINT`, `created_at`, `updated_at` | Fixed across all entities; `tenant_id` in every composite index + RLS policy; `version` drives optimistic concurrency (§5.9); **no `deleted_at`** (deletion = hard-delete + archive, §5.7 / ADR-0006) |
+| **Core (every table)** | `id` ULID PK (stored as native `uuid`, 16 bytes — preserves ULID's b-tree-friendly monotonic sort order; never `text`/37 bytes, which would bloat every index and FK), `tenant_id`, `owner_id`, `state`, `version BIGINT`, `created_at`, `updated_at` | Fixed across all entities; `tenant_id` in every composite index + RLS policy; `version` drives optimistic concurrency (§5.9); **no `deleted_at`** (deletion = hard-delete + archive, §5.7 / ADR-0006 / ADR-0015). All timestamps are `timestamptz` **stored as UTC** (see *Timestamps & time zones* below) |
 | **Hoisted relational** | one real typed column per reference field, e.g. `ref_customer_id ULID` | Real `FOREIGN KEY ... ON DELETE <behavior>`; `DEFERRABLE INITIALLY DEFERRED` for mutual references |
-| **Hoisted scalar (optional)** | real columns for indexed/unique/hot fields, e.g. `email TEXT UNIQUE` | Hoist from JSONB automatically via **generated columns**: `email TEXT GENERATED ALWAYS AS (attributes->>'email') STORED` |
+| **Hoisted scalar (optional)** | a **generated** column for indexed/unique/hot fields, e.g. `email TEXT GENERATED ALWAYS AS (attributes->>'email') STORED` (+ `UNIQUE`/index on it) | **JSONB `attributes` is the single source of truth** for scalars; the generated column is a *derived*, queryable/indexable/unique-able projection that is **never written directly** — so there is no dual-write inconsistency. (Contrast reference fields below, where the real column *is* the source and the value is absent from JSONB.) |
 | **Flexible payload** | `attributes JSONB` | Everything else; GIN-indexed for ad-hoc query |
 
 **Rules:**
 - A reference field is **always** hoisted to a real column with a real FK — never stored only in JSONB. Non-negotiable; this is the whole point of choosing Pattern B.
-- Plain scalars default to JSONB; promote to a real column (or generated column) when they need an index, a unique constraint, or heavy filter load.
+- Plain scalars default to JSONB; promote to a **generated column** (derived from `attributes`) when they need an index, a unique constraint, or heavy filter load. JSONB remains the source of truth; the generated column is never written directly. (A genuine real-column source-of-truth is reserved for reference fields, above.)
 - Indexes (incl. unique) on JSONB values use expression or generated-column indexes.
 - Table DDL is generated and applied **at publish time** by the DDL/migration engine, never ad hoc at runtime.
+
+**Timestamps & time zones.** Every timestamp column (core `created_at`/`updated_at`, `sys_*` logs, archive, outbox) is `timestamptz` **stored as UTC**; the DB never stores local time. A per-tenant **timezone** (IANA name) is a *display/parsing* concern only: the Runtime UI formats UTC into the user's zone, and inputs are parsed in that zone to UTC on write. Time-based scheduling — scheduled-report cron (`md_report_schedule`, §4.4) and workflow timers (§5.9.6) — is expressed in the configured/tenant timezone and **resolved to UTC at fire time**, so SLA escalations and report schedules behave correctly across geographies.
 
 **Why not pure JSONB (Pattern D)?** A value inside JSONB cannot carry a real FK, so RI would have to be enforced in the application layer — re-implementing existence checks, cascade rules, orphan sweeps, and race handling that Postgres already provides correctly. See `docs/ri-strategies.md` §3 for what that costs. Not worth it without Salesforce's justification.
 
@@ -269,6 +284,7 @@ Metadata changes must take effect without restart:
 - **Strategy A:** `tenant_id` column on every table + app-enforced filter. Simple, shared-everything.
 - **Strategy B:** Schema-per-tenant in PostgreSQL. Strong isolation, more ops.
 - **Recommendation v1:** **Strategy A** with PostgreSQL **Row-Level Security** enforcing tenant isolation at the DB layer (defense in depth). Make tenant_id part of all composite indexes.
+- **Tenant lifecycle (deferred, alongside U9):** provisioning a new tenant (creating the tenant row, seeding the first admin, and bootstrapping its `biz.*` tables on first publish) and suspending / deleting a tenant (draining its `biz` + `biz_archive` tables and blobs per §5.14/§5.15) are **not yet specified** — tracked here as a later-phase ops concern, not designed in v1.
 
 ### 5.5 Versioning & migrations of metadata
 Fully specified in **§5.8** (draft → validate → publish → activate lifecycle) and **§4.8** (lifecycle tables). In short: metadata is deployable as JSON bundles (Studio export/import) across dev → staging → prod; publish classifies changes as additive / transforming / two-phase destructive and runs a validated migration against live data.
@@ -276,8 +292,9 @@ Fully specified in **§5.8** (draft → validate → publish → activate lifecy
 ### 5.6 Extensibility model
 - **Field types:** registry of built-in types + a Rust trait `FieldType`; built-ins compile into the binary, and **custom / tenant-specific field types, expression functions, and rule actions run as sandboxed `wasmtime` modules** — a first-class extensibility boundary that lets customers ship logic safely without forking the platform (REVIEW.md §5.6).
 - **Functions:** the expression DSL calls registered Rust functions (e.g., `now()`, `sum()`, custom); custom functions are also deliverable as `wasmtime` modules.
-- **Connectors:** trait `Connector` with HTTP/DB/file/generic implementations.
+- **Connectors:** trait `Connector` is a **pluggable Format + Auth boundary**. The core ships only *universal* transports/formats (HTTP/DB/file/MQ/GraphQL/SOAP) and standard auth handlers (bearer, basic, mTLS, OAuth client-credentials, signed requests). Niche formats (EDI X12/EDIFACT, IDoc, AS2/OFTP) and vendor-specific protocols/auth (e.g. a vendor's CSRF-token dance) are **extension connectors** — adapters or `wasmtime` modules — never built into the engine, and never encoded as domain document types. The platform parses a format's *envelope*; what a document *means* is a mapping the integrator authors (§5.22).
 - **Webhooks:** outbound HTTP on domain events.
+- **Where domain behavior lives (domain neutrality, principle 8):** the core ships only *generic* types and functions. Domain-specific behavior — money rounding rules, FX conversion, tax calculation, depreciation, posting logic, document-numbering schemes beyond the generic `auto_number` — is implemented as **custom field types / expression functions / `wasmtime` modules here**, never as new core types. Consequently an ERP, CRM, or vertical is a *reference-app bundle* (metadata + extensions, transportable via the §5.8 export/import) built on this surface, not a change to the engine. Hard rule: if only one domain needs it, it doesn't belong in `mda-*`.
 
 ### 5.7 Relationship modeling & cascade behaviors
 
@@ -321,9 +338,11 @@ md_relationship
                           --   *other* (child) records.
 ```
 
-**Many-to-many** is materialized as a real **join table** `biz.<a>_<b>` with a composite PK and FKs to both sides — real constraints, real integrity.
+**Many-to-many** is materialized as a real **join table** `biz.<a>_<b>` with a composite PK and FKs to both sides — real constraints, real integrity. The join-table name is derived deterministically from the two entity table names in **ascending lexicographic order** (`biz.<smaller>_<larger>`), with a collision check against existing entity table names at publish (§5.8); a name that would collide requires an explicit override name on the relationship.
 
 **Mutual references** (A references B, B references A) use `DEFERRABLE INITIALLY DEFERRED` FKs so integrity is checked at commit, not per statement.
+
+**Calculated fields (same-record formulas).** Distinct from a rollup (which aggregates *other* records, above and ADR-0017): a calculated field is a DSL formula (§5.2) over fields of the *same* record (e.g. `line_total = qty * unit_price`). It is **stored (hoisted), not virtual** — recomputed **synchronously in the write transaction** whenever one of its declared dependencies changes (same side-effect slot as after-rules, §5.9.3 step 5), so it is transactionally consistent with the write and queryable/indexable like any scalar. It is **write-protected**: clients never set it directly (the engine overwrites it from the formula).
 
 **Deletion (recorded decision — ADR-0006):** deletion is **hard-delete + archive**. The row moves to `biz_archive.<table>` (carrying `archived_at` / `archived_by`); native `ON DELETE CASCADE` / `SET NULL` / `RESTRICT` fire naturally, preserving RI end to end, and the archive gives recoverability/undo. **Soft-delete is rejected**: it defeats native cascade (the row isn't actually deleted, so `ON DELETE …` never fires) and would force RI to be re-implemented in the app layer (the ServiceNow/Salesforce route).
 
@@ -343,7 +362,7 @@ Consequences:
 
 **Lifecycle:**
 1. **Branch** — create a draft from the current active model (or from a snapshot).
-2. **Edit** — Studio mutates the draft JSONB. v1: one editor per draft (checkout lock + optimistic `version_etag`); multi-editor collaboration is a v2 extension.
+2. **Edit** — Studio mutates the draft JSONB. v1: one editor per draft (checkout lock + optimistic `version_etag`); multi-editor collaboration is a v2 extension. Multiple drafts per tenant are allowed, but there is **no merge**: if two drafts diverge, each publish is re-validated against the *then-current* active model and applies sequentially (last publish wins on conflicting changes). Collaborative/3-way merge is a v2 concern.
 3. **Validate** — server runs dependency/integrity checks and produces a **migration plan** (dry-run). Nothing is applied.
 4. **Preview/Test** — Studio renders forms/views/reports against the draft (loaded into an ephemeral cache), optionally against a scratch dataset.
 5. **Publish** — apply the migration plan atomically, promote draft → active, archive previous active → snapshot.
@@ -362,6 +381,7 @@ Consequences:
 - No orphaned dependencies (forms/views/rules/reports referencing deleted fields/entities)
 - Type-compatibility for transforms (e.g. every value must parse as the target type)
 - FK cycle detection → mark `DEFERRABLE` (§5.7)
+- **Formula dependency DAG check** — calculated fields (§5.7) and rollup summaries (ADR-0017) form a directed graph (a calculated field may reference other calculated fields; a rollup references child fields). Detect cycles at validate time (a cyclic set, e.g. `C = A + B` and `B = C + 1`, is a hard publish error), enforce a max dependency depth, and confirm every referenced field exists and is type-compatible. This is the publish-time analog of the runtime recursion budget (§5.9.5) — without it a cyclic formula set would only blow up at runtime.
 - Reserved-name / duplicate-name collisions
 - Row-count estimate for transforming ops (warn on large tables)
 
@@ -376,7 +396,7 @@ Consequences:
 > **Rollback caveat:** a reversing transform is not guaranteed lossless (e.g. `numeric → integer` truncates; rollback restores the *truncated* values). The migration plan flags lossy transforms at validate time so reduced rollback fidelity is explicit.
 
 **Two-phase destructive deletes:**
-- **Retire** — `status = retired`. Data preserved; runtime & UI hide it; queries exclude it. Fully reversible (un-retire).
+- **Retire** — set `status = retired` on the `md_*` definition (`md_entity` / `md_field` / `md_relationship`) and record a pending-purge row in `md_retirement`. Data preserved; runtime & UI hide it; queries exclude it. Fully reversible (un-retire clears the status and removes the `md_retirement` row).
 - **Purge** — scheduled job after grace. Before the irreversible drop, data is **exported to cold storage** (S3/Parquet) — a column's values, or the whole `biz.<table>` + its `biz_archive` for a dropped entity — keyed for compliance retention (ADR-0015, §5.15). Then the column/table is dropped. **Irreversible to the live schema** (the metadata definition is retired); a cold-storage export is for compliance reads, not one-click restore (undoing a purge = re-create via publish §5.8 + bulk-import §5.13). Blocked if any non-retired dependency still references it.
 
 **Rollback:** keep last N snapshots (default 10). Rollback loads the snapshot as a draft and re-publishes (reverse migration). **Caveat:** rollback cannot restore data already purged by a two-phase destructive op; retire-phase changes are fully reversible.
@@ -402,7 +422,7 @@ Consequences:
 3. **Before-rules** (validate / mutate input) — may **reject** → rollback
 4. Apply field changes (incl. workflow `state`)
 5. **After-rules, synchronous** — data side-effects (set fields, update related rows, incl. parent rollup deltas — ADR-0017) within the same txn; failure rolls back the whole write
-6. **Recompute this record's `sec_record_share` rows synchronously** — only if owner or a sharing-rule-relevant field changed; O(rules) for one record (ADR-0013). Keeps record-level security fresh with zero per-record revoke lag.
+6. **Recompute this record's `sec_record_share` rows synchronously** — only if owner or a sharing-rule-relevant field changed; O(rules) for one record (ADR-0013). Keeps record-level security fresh with zero per-record revoke lag. **Caveat — rollup × sharing (ADR-0017):** a synchronous rollup delta that lands on a *parent's* sharing-rule-relevant field must also trigger **that parent's** share recompute here; without it, a sharing rule keyed on a rollup (e.g. "share Account where `total_invoices` > 10k") would go stale until the parent is next written. **Owner transfer** (reassignment) is itself a permissioned, audited write — gated as an action (§5.11 grain 5) or a dedicated `transfer_ownership` capability — and triggers this same recompute.
 7. **Write the three logs** (all in the same txn): `sys_audit_log` (full before/after JSONB — the **compliance** record, §4.7), `sys_event_log` (lightweight domain events for **real-time/replay**, §5.10), and `sys_outbox` rows (**async side-effects**: email, webhook, ETL kick — §5.9.4). Audit and event are **distinct tables** — different schema and retention (§5.15) — not one.
 8. `UPDATE … version + 1` (OCC)
 9. Commit
@@ -533,6 +553,8 @@ Ownership / team / manual-share layers are evaluated **live** from the cached ef
 **6. Value constraints (write ABAC).** `sec_field_constraint(entity, field, condition, message)` — per-role conditions evaluated by the expression engine at write time (e.g. "role=sales_rep ⇒ discount ≤ 0.05"). **Distinct from validations** (`md_rule` / field validations): validations are universal data-correctness rules; field constraints are authorization-scoped ("*who* may set *what*"). Both use the same engine. **Composition (ADR-0012):** when a user holds several roles that grant write on a field, the applicable constraints *intersect* — all must hold — so a constraint cannot be bypassed by adding a permissive role. A role granting only `read` imposes no write constraint.
 
 **Effective-context caching.** At session start, compute the user's effective context — roles (direct + via teams/groups), teams, role-hierarchy ancestors, and compiled sharing-rule predicates — and cache it (Redis, TTL) keyed by `user_id`; invalidate on role/team/hierarchy/sharing-rule change. **Invalidation is a tenant-scoped broadcast** over the `meta_changed`/event channel (§5.3/§5.10), not a local call — a role/team change processed on instance A must invalidate sessions on instance B too. Correctness holds regardless (the next check re-reads from the `sec_*` tables), but the broadcast keeps authorization changes prompt across the cluster, and is load-bearing for sharing-rule/hierarchy *epoch* invalidation (ADR-0013). Every grain consults this cached context rather than re-querying the `sec_*` tables per request.
+
+**Token revocation (AuthN).** Invalidating the *cache* is not enough on its own: a stateless JWT remains valid until it expires. So **access tokens are short-lived** (minutes), and a gateway-checked **revocation list** (or a `token_epoch` claim on the user, bumped on logout / role-narrowing / suspension / termination) is evaluated on every request, so a revoked or compromised session is killed **before natural expiry**. Refresh tokens are rotated and independently revocable. This closes the gap between "authorization changed" and "the old token stops working."
 
 **Enforcement map (the key artifact):**
 
@@ -669,6 +691,56 @@ Reference traversals (e.g. `customer.region.name`) resolve to **real joins over 
 
 **5. Dashboards & exports reuse the same path.** Dashboard widgets (§4.2) run datasets under the *viewer's* context (interactive). Exporting a report's result set reuses the bulk-export field-read rules (§5.13) — you cannot export fields you can't read.
 
+### 5.18 Notifications & messaging
+
+A first-class platform subsystem, not just a table. Built on `sys_notification` (§4.7) + the real-time channel (§5.10) + the transactional outbox (§5.9.4). The engine knows no notification *content* — types and templates are metadata; this is the generic delivery machinery.
+- **Notification types are metadata** (authored in Studio): a key (e.g. `invoice.overdue` — the *name* is the modeler's; the engine treats it opaquely), source event (rule / workflow / system), default channels, and a link to a template (§5.19).
+- **Per-user preferences** (`sys_notification_preference`, §4.7): a user may mute a type or opt out of a channel; defaults come from the type definition and are overridable per user. **Honored at fan-out time** — a muted type is never produced, not just hidden.
+- **Multi-channel delivery:** in-app (write `sys_notification` + push over `user:<id>:notifications`, §5.10.3), plus email / SMS / push. Every channel *except in-app* is an async side-effect routed through the outbox (at-least-once, idempotent, §5.9.4). Channel implementations are pluggable (a `Channel` trait, analogous to `Connector`, §5.6).
+- **Digest / batching:** a type may be marked digestible; a scheduled job (apalis) rolls undelivered notifications for a user within a window into one message (prevents notification storms from a bulk event).
+- **AuthZ:** a notification inherits its record's access — a user is notified about, and can open, only records they can read; the push payload is field-level filtered exactly like the SSE relay (§5.10.6). Retention follows §5.15.
+
+### 5.19 Templating
+
+A template engine for rendered output — email bodies, notification text, and document/mail-merge (invoice PDF, contract, letter). Templates are metadata authored in Studio; the *content* is domain data, the *mechanism* is generic.
+- **Template store** `md_template(name, kind[email|document|message], body, content_type, locale?)`: the body is a **sandboxed template DSL** — a restricted subset of the expression engine (§5.2) plus variable interpolation. It is **bounded-evaluated** (§5.2 limits), has **no arbitrary code / no I/O**, and cannot emit raw SQL. Variables are the render context (record fields, actor, params).
+- **Render context is AuthZ-filtered:** a template renders under the *recipient's* (or running user's) field-level visibility (§5.11) — a template can never emit a field the recipient cannot read, same structural rule as reports (§5.17).
+- **Document / mail-merge:** render a record (or a list) through a document template to PDF/DOCX/HTML, reusing the report renderer path (`mda-reports`, §6). Triggered by a rule/action/workflow and delivered async via the outbox if external.
+- **Localization:** a template carries a locale; the resolver picks the best match for the recipient/tenant from `sys_translation`. (Template *labels* are translatable; record *data* i18n remains deferred — U5.)
+
+### 5.20 Secrets management
+
+Connectors (§4.6), integrations, and outbound channels (§5.18) need credentials — API keys, DB passwords, OAuth tokens — per tenant, never in plaintext metadata.
+- **Reference vs. value** (same pattern as blobs, §5.14): `sys_secret` (§4.7) holds only a *reference* (`name`, `kind`, `ref`, `rotated_at`); the **secret value lives in an external `SecretStore`**, never in Postgres.
+- **`trait SecretStore`** with impls: `LocalSecretStore` (dev — encrypted file / OS keyring) and cloud KMS (AWS KMS / GCP Secret Manager / Azure Key Vault / HashiCorp Vault). Configurable per deployment.
+- **Resolution:** secret values are resolved **server-side only**, at the moment a connector/channel runs, under that connector's authz. Values are **never** returned by any API, **never logged** (`tracing` redacts known-sensitive fields), and **never serialized** into events, audit, or outbox payloads.
+- **Rotation & audit:** `rotated_at` is tracked; rotation is an explicit operation; every resolution is audited (who/when resolved which secret). References are tenant-scoped (RLS, §5.4).
+
+### 5.21 Event & webhook contract
+
+The canonical **outbound** event contract for integrations. `sys_event_log` (§5.10) is the *internal* stream; this is the *external* contract delivered to webhook subscribers (`int_webhook`, §4.6). The contract is structural; event *types* and payloads are metadata/extension-defined.
+- **Envelope:** every delivery is a versioned JSON envelope `{event_id, tenant_id, schema_version, type, entity, record_id, occurred_at, actor, data}`. `event_id` is the idempotency key (§5.9.4); `schema_version` lets consumers evolve without breakage.
+- **Signing (integrity):** each delivery is **HMAC-signed** (e.g. `X-MDA-Signature: t=…,v1=…`) with a per-subscription secret held in the SecretStore (§5.20); recipients verify origin and the timestamp guards against replay within a window.
+- **Delivery:** via the outbox (at-least-once) with backoff + jitter + DLQ (§5.9.4); recipient acks with 2xx, otherwise retried.
+- **Subscription model:** a webhook subscribes to `(event types, entity filter, optional ABAC filter)`; the relay applies AuthZ so a subscriber receives events only for records/fields its principal may see (same per-client filtering as the SSE relay, §5.10.6) — a webhook can never exfiltrate fields its principal lacks.
+- **Replay:** a subscriber may request replay from a bookmark (`event_id`) within the retention window (§5.15), mirroring SSE `Last-Event-ID` (§5.10.5).
+
+### 5.22 Integration architecture
+
+Integration is a *capability* of the application platform: the platform syncs and orchestrates with external systems **because it is a participant with its own canonical model and business logic** — not a wire-level relay. Becoming a general-purpose stateless broker / iPaaS is an explicit **non-goal** (§1); that is a different product. Everything below is generic data-integration mechanics — it introduces no vendor or business noun (principle 8).
+
+**1. Topology: hub, not broker.** Every flow materializes data into the platform's canonical `biz.*` entities (§5.1); there is **no stateless A→B pass-through**. This is deliberate: it lets the hub apply AuthZ, audit, rules, workflows, and transformation *between* systems — a strength a bare broker lacks. Consequence: high-volume stateless brokering is out of scope; batch/eventual sync and orchestration are in. Two vendor systems (e.g. an ERP and an SCM) are integrated by each syncing to/from the platform's canonical model, with the platform's rules engine doing the mediation.
+
+**2. Flows, steps, mapping.** An `int_flow` is an inbound (external→internal) or outbound (internal→external) pipeline of `int_flow_step`s, scheduled by `int_schedule` or triggered by an event (outbox/webhook, §5.9.4/§5.21). `int_mapping` binds external fields to internal fields; **each step may run an expression-engine transform** (§5.2) — value translation (`int_value_map`, §4.6), conditional mapping, aggregation, enrichment (lookup from another entity), and **debatching** (one inbound message → N records) / batching (N records → one message). Transforms reuse the bounded DSL, inheriting its safety (§5.2/§5.16) — there is no second scripting surface to drift.
+
+**3. Correlation & idempotency — the external-ID registry.** Reliable bidirectional sync requires linking a platform record to an external system's natural key. `int_external_id(entity, record_id, system, external_key)` (§4.6) is that registry: it drives **upsert by external key**, **idempotent re-delivery** (a flow keyed on `external_key` won't double-apply), and **dedup** when the same business event arrives via two paths. Without it, sync silently duplicates or drops — this is the single most important reliability primitive for multi-system integration.
+
+**4. Conflict resolution (system of record).** When two sources update the same logical record, the platform applies a **declared policy**, never a guess. Each flow/mapping carries a conflict policy: `last_write_wins` (by comparable timestamp), `source_priority` (a named system wins per field-group), `field_level_sor` (per-field system-of-record), or `manual` (quarantine for a human). This is distinct from internal OCC (§5.9): OCC prevents lost updates *within* the platform; the conflict policy reconciles *across* systems. A failed reconciliation is a flow error (→ DLQ, §5.9.4), never silent corruption.
+
+**5. Reliability & delivery.** Inbound/outbound delivery is **at-least-once via the transactional outbox** (§5.9.4): retries with backoff + jitter, DLQ, idempotent consumers keyed on the external-ID registry. Flows are resumable (checkpointed, apalis) and observable (per-flow run history — tracked in §14). Secrets for outbound auth live in the SecretStore (§5.20).
+
+**6. The Connector boundary stays pluggable (domain-neutral).** Per §5.6: the core ships only universal transports/formats and a pluggable Format + Auth handler. EDI, IDoc, AS2/OFTP, and vendor protocols/auth are **extension connectors** — the platform parses a format's *envelope*; what a specific document *means* is a mapping (§5.22.2) authored on top. The core never names a vendor and never encodes a business document type.
+
 ---
 
 ## 6. Component Breakdown (crate / module level)
@@ -688,7 +760,7 @@ mda/
 │   ├── mda-rules/             # business rule engine (triggers/conditions/actions)
 │   ├── mda-reports/           # report dataset builder + renderers (pdf/xlsx/csv)
 │   ├── mda-integration/       # connectors, mappings, ETL flows
-│   ├── mda-audit/             # audit/event logging
+│   ├── mda-audit/             # write-path logging: sys_audit_log + sys_event_log + sys_outbox rows (all written together in the write txn, §5.9.3 step 7); the outbox-DRAIN worker itself runs in mda-server via apalis
 │   ├── mda-api/               # HTTP handlers (Axum) — the "edge"
 │   └── mda-server/            # binary: wires everything, config, bootstrap
 ├── migrations/                # SQLx migrations for meta schema
@@ -766,6 +838,8 @@ POST /api/graphql      # schema generated from metadata; authz + field-level sec
 ```
 The schema is derived from the active model and re-generated on publish (§5.8). **Prototype in Phase 2** alongside the dynamic data layer; enforce query depth/cost limits to deny expensive nested queries. Like reports (§5.17), GraphQL enforces **record-security at every relationship level** of a nested query and applies FLS per field — it shares REST's service layer, so the same predicates apply; there is no GraphQL-specific bypass.
 
+> **MVP scope (ADR-0010).** "First-class" means a supported, security-enforced runtime surface — not that every verb ships on day one. At MVP GraphQL is **query/traversal-first** (reads + nested fetches over relationships); **mutations** (create/update/delete, workflow actions) reach REST parity progressively in later phases. Until then, clients mutate via the REST data API (`/api/data/:entity/*`) and read/traverse via GraphQL — which is also why §5.10.1 routes SSE-client mutations through REST. Both surfaces share one service layer, so mutations land on GraphQL with no new authz path when added.
+
 > OpenAPI spec auto-generated; an external SDK (TypeScript/Rust/Python) can be derived from it. The dynamic data API is discoverable via `/api/schema/:entity` (JSON Schema derived from metadata).
 
 ---
@@ -796,7 +870,7 @@ The runtime UI is a **metadata interpreter**: fetch form/view JSON → render in
 
 Each phase is independently valuable and demoable. Aim for vertical slices.
 
-> **MVP milestone (the de-risk target).** The credible MVP is one vertical slice: *define an entity via the Studio API → publish → CRUD via the runtime API → a **basic** rendered form + list UI → login/auth.* It lands by the end of **Phase 3 + a thin UI slice pulled forward from Phase 6** (skip dashboards, fancy views, and real-time for the MVP). Everything heavier — full Studio designers, workflows, reporting, integrations, real-time, bulk import, attachments — is **post-MVP**. Ship the MVP to real users early to validate the model-driven core before committing to the long tail.
+> **MVP milestone (the de-risk target).** The credible MVP is one vertical slice: *define an entity via the Studio API → publish → CRUD via the runtime API → a **basic** rendered form + list UI → login/auth.* Its server-side prerequisites are Phases 1–3 (metadata engine, dynamic data layer, auth); on top of those, a **minimal** form+list UI is built (dashboards, fancy views, and real-time are skipped for the MVP). It lands around **week 26** — aligned with the re-estimate below, when a basic runtime UI exists — **not at week 55**. Everything heavier — full Studio designers, workflows, reporting, integrations, real-time, bulk import, attachments — is **post-MVP**. Ship the MVP to real users early to validate the model-driven core before committing to the long tail.
 
 ### Phase 0 — Foundation (Weeks 1–3)
 - Cargo workspace skeleton, CI, Docker, dev Postgres+Redis
@@ -818,9 +892,9 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Transforming ops: data casts with on-failure policy, batched for large tables
 - Two-phase destructive: retire now, purge after grace via scheduled job (`md_retirement`)
 - Generic CRUD + list with filter/sort/paging (query over hoisted columns + JSONB)
-- Field type registry: string, number, bool, date, enum, reference, json
+- Field type registry: string, text, integer, decimal(p,s), money (decimal + ISO currency), bool, date, datetime (timestamptz), enum, reference, json, **auto_number** (gapless, concurrency-safe sequence — generic, every app needs auditable IDs) — precision/scale are metadata-driven and participate in publish-time transforms (ADR-0011); richer domain types (FX money, tax amounts) are custom types via §5.6, not core
 - Reference fields → real typed columns with native `FOREIGN KEY` (per §5.7)
-- Validations + defaults
+- Validations (**declarative only**: type, required, defaults) — DSL/rule-based validations arrive in Phase 4
 - **Optimistic concurrency (§5.9):** `version` column + `If-Match`/ETag on PATCH → 409 on conflict
 - `/api/data/:entity/*` runtime routes
 - **GraphQL prototype (ADR-0010):** schema generated from the active model alongside the dynamic data layer; both REST and GraphQL sit on the same service layer; enforce query depth/cost limits to deny expensive nested queries. (Prototype scope in Phase 2 per ADR-0010; REST-parity mutations are added progressively in later phases — not MVP-blocking.)
@@ -874,10 +948,13 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - **Deliverable:** A business analyst can build a small CRM app entirely through the browser.
 
 ### Phase 9 — Integration Layer (Weeks 43–46)
-- `Connector` trait: REST, DB, file, (SOAP/GraphQL later)
-- `md_int_*`, field mapping, inbound/outbound flows, scheduling
-- Webhooks (outbound) + inbound webhook receiver
-- **Deliverable:** Sync Customer records to/from an external REST API on a schedule.
+- **Hub-model integration (§5.22):** `Connector` trait with universal transports (HTTP/DB/file/MQ/GraphQL/SOAP) + a pluggable **Format + Auth** boundary; niche formats / vendor protocols are *extension* connectors (§5.6), not core
+- `int_*` metadata: flows/steps, field mapping with **expression-engine transforms** (value maps, conditionals, debatching), scheduling (cron + event triggers)
+- **External-ID registry** (`int_external_id`) for upsert-by-external-key, idempotent re-delivery, and cross-path dedup
+- **Conflict policy** per flow/mapping (`last_write_wins` / `source_priority` / `field_level_sor` / `manual`) — cross-system reconciliation, distinct from internal OCC
+- Outbound webhooks via the §5.21 contract (signed, versioned, replayable) + inbound webhook receiver; connector secrets in the SecretStore (§5.20)
+- Reliable delivery via the transactional outbox (§5.9.4); flows run as resumable apalis jobs
+- **Deliverable:** Bidirectionally sync a platform entity with an external REST API on a schedule, keyed by external ID, with a declared conflict policy — no duplicates, no silent drops.
 
 ### Phase 10 — Bulk Data Import/Export & Attachments (Weeks 46–49)
 - **Bulk import/export (§5.13):** CSV/XLSX/JSON; field mapping; create/update/upsert by key; **dry-run** with validation report; all-or-nothing or best-effort; batched transactions for large files; runs as an `apalis` job with progress + resumable per-row results
@@ -901,6 +978,13 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 > - **U9 — high availability & replication** (Postgres HA, read replicas for reporting, logical replication / warm standby, connection-pool tuning). Single-node Postgres for v1; HA is a Phase 11 hardening activity when production scale demands it.
 > - **Search** — §3 lists "PostgreSQL FTS → OpenSearch later" but it is not yet designed: which fields are searchable, how results respect record/field security and tenancy, and the FTS→OpenSearch migration path. Scoped into a later phase once a concrete search need arrives; until then, list filters cover structured queries.
 > All are tracked here so they remain *visible*, not lost.
+
+> **Further platform capabilities — scoped (§5.18–5.21) or tracked, not yet scheduled to a phase.** Surfaced by a platform-capability review; all are *generic* (domain-neutral, principle 8):
+> - **Notifications & messaging (§5.18), templating (§5.19), secrets (§5.20), event/webhook contract (§5.21), integration architecture (§5.22)** — scoped as design sections now; implementation lands alongside the phases that need them (notifications with Phase 5/6, templating with Phase 7, secrets + webhook contract + integration with Phase 9).
+> - **Extension connectors (EDI / IDoc / vendor protocols & auth)** — niche formats and vendor protocols are **not** core features; they are extension connectors via the pluggable `Connector` boundary (§5.6/§5.22.6). Build the ones you need as adapters/`wasmtime` modules; the core stays vendor-neutral.
+> - **SSO / SAML / SCIM** — enterprise identity is larger than the OAuth2/OIDC in §3: SAML SSO, SCIM user provisioning/deprovisioning, and directory sync. Currently only an open question (§13 Q3); **elevate to a scoped phase** before enterprise adoption — it gates most enterprise sales.
+> - **Mass actions** — bulk update / delete / assign / transfer *by filter* (distinct from file import/export, §5.13); interacts with sharing recompute (ADR-0013) and cascade (ADR-0006), so it needs its own design rather than a retrofit.
+> - **API versioning** — REST + GraphQL versioning/deprecation strategy for generated SDK clients (§7): breaking-change management via path/header versioning, sunset headers, and parallel schema generations across publishes.
 
 ---
 
@@ -958,8 +1042,21 @@ The architecture no longer blocks on these, but they shape later phases and ops:
 3. **Must-have integrations on day one** (specific ERP, email provider, SSO/IdP) — shape Phase 9 (integration layer).
 4. **Licensing / commercial model** — open core vs proprietary; affects dependency choices.
 
-> Resolved during planning: storage/RI, metadata lifecycle & publish/migration execution, concurrency & workflow chaining, real-time, authorization (incl. sharing materialization & value-constraint composition), expression language, reporting query model, deletion/restoration lifecycle, and rollup-summary semantics are all decided (§5, ADRs 0001–0017).
+> Resolved during planning: storage/RI, metadata lifecycle & publish/migration execution, concurrency & workflow chaining, real-time, authorization (incl. sharing materialization & value-constraint composition), expression language, reporting query model, deletion/restoration lifecycle, and rollup-summary semantics are all decided (§5, ADRs 0001–0017). A platform-capability review added notifications, templating, secrets, the webhook contract (§5.18–5.21), and the integration architecture (§5.22).
 
 ---
 
-*This plan is v0.4 — decisions are recorded as ADRs 0001–0017 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Successive review passes refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17), then rollup-summary semantics and canonical write-path consistency — audit/event-log split and the per-record share-recompute step (ADR-0017). Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
+## 14. Tracked, not yet designed (platform)
+
+Acknowledged platform gaps that are real but lower-priority — visible here so they are not rediscovered mid-build. All are generic (domain-neutral).
+
+- **Modeler / tenant observability console** — a tenant-facing view of job / rule / workflow / integration run history and failures (beyond operator `tracing`/OpenTelemetry). Raw material exists (`md_migration_log`, `sys_event_log`); the *surface* is unbuilt.
+- **Scheduled-job management** for modeler-defined schedules (next-run / last-run / failure state) — scheduled rules and integration schedules exist conceptually but aren't managed as a user surface.
+- **Inbound webhook verification** — shared-secret / signature / replay protection for the Phase 9 inbound receiver (parallels the outbound contract in §5.21).
+- **Record / field history as a surfaced capability** — `sys_audit_log` stores before/after for compliance, but "timeline of this record" and "as-of" queries are not yet framed as a platform API.
+- **Error code taxonomy + localized error messages** — the platform emits 409s, validation errors, and publish failures with no coherent, i18n-able error model.
+- **Tenant-scoped backup / restore + data residency** — currently DB-level, single-region; granular tenant export/restore and regional placement tie to the deferred tenant lifecycle (§5.4) and HA (U9).
+
+---
+
+*This plan is v0.4 — decisions are recorded as ADRs 0001–0017 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Successive review passes refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17), then rollup-summary semantics and canonical write-path consistency — audit/event-log split and the per-record share-recompute step (ADR-0017); a platform-capability review then added notifications, templating, secrets, the webhook contract (§5.18–5.21), the formula-dependency DAG check (§5.8), and the hub-model integration architecture (§5.22). Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*

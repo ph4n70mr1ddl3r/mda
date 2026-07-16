@@ -67,6 +67,19 @@ Left unspecified, an implementer will guess, and the guess is usually wrong.
 6. **Security.** A rollup column is a field on the parent and inherits the parent's
    FLS and record-security (§5.11). No special path.
 
+7. **Interaction with record sharing (ADR-0013).** A sync rollup update mutates a
+   *parent* field inside the *child's* write transaction (§5.9.3 step 5), but the
+   per-record share-recompute in step 6 only touches **the record being written**
+   (the child). If a sharing rule keys off the parent's rollup (e.g. "share Account
+   where `total_invoices` > 10k with Finance"), the parent's `sec_record_share` rows
+   would otherwise go stale until the parent is next written or an admin recompute
+   runs. Therefore: **a sync rollup delta that lands on a sharing-rule-relevant
+   parent field must also trigger that parent's synchronous share recompute** in the
+   same transaction (extend step 6 to the affected parent(s)). An *async* rollup
+   (`rollup_mode = async`) is eventually consistent by definition, so its
+   share-recompute follows the same eventual path — acceptable for display rollups,
+   **not** for a rollup that drives a security decision (keep those `sync`).
+
 ## Consequences
 
 - **(+)** Rollups are consistent by default (sync, incremental, in-txn) without

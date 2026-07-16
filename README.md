@@ -20,7 +20,9 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
   - §5.15 — retention of high-volume append-only tables (audit/event/outbox)
   - §5.16 — threat model: untrusted metadata
   - §5.17 — reporting query model & security (structured metadata, runner-context AuthZ by construction)
-- [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved in v0.2; further refinements as ADRs 0011–0017 across v0.3/v0.4; reasoning trail).
+  - §5.18–5.22 — platform capabilities: notifications & messaging, templating, secrets management, event/webhook contract, integration architecture (hub model)
+  - §14 — tracked, not yet designed (platform gaps)
+- [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (17 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL).
 
