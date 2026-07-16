@@ -120,7 +120,7 @@ Salesforce/ServiceNow lean toward option 2 (their rows persist with a deleted fl
 
 **Adopt Pattern B with a JSONB escape hatch — i.e., make the plan's "hybrid D" the *default from day one*, not a future target:**
 
-- **Real table per entity** (`biz.<entity>`) created at publish time, with a stable core schema: `id, tenant_id, owner_id, state, created_at, updated_at, deleted_at` plus **hoisted columns** for relational fields.
+- **Real table per entity** (`biz.<entity>`) created at publish time, with a stable core schema: `id, tenant_id, owner_id, state, version, created_at, updated_at` (no `deleted_at` — deletion is hard-delete + archive, [ADR-0006](adr/0006-deletion-hard-delete-and-archive.md)) plus **hoisted columns** for relational fields.
 - **Reference fields are real typed columns with real `FOREIGN KEY` constraints** + `ON DELETE` from the relationship's declared behavior. Use `DEFERRABLE` where mutual references exist.
 - **Plain scalar fields**: choose per-field whether to hoist to a real column (for indexed/queried/unique fields) or keep in an `attributes JSONB` payload. Use **generated columns** to hoist cheaply and keep a single source of truth.
 - **Model relationship strength** in `md_relationship` (master-detail vs lookup + `on_delete`), mirroring Salesforce/Dataverse.

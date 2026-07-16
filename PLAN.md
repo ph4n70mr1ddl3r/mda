@@ -143,10 +143,11 @@ md_script        - sandboxed scripts for complex logic (optional)
 ### 4.4 Reporting
 ```
 md_report        - data source + layout
-  ├─ md_report_dataset   - query + params + joins
+  ├─ md_report_dataset   - STRUCTURED query (§5.17): base_entity + fields[ref traversals]
+  │                       + filters/having (DSL AST) + group_by + params + limit
   ├─ md_report_grouping
   └─ md_report_chart     - bar/line/pie/table params
-md_report_schedule - cron + recipients + format (pdf/xlsx/csv)
+md_report_schedule - cron + recipients + format (pdf/xlsx/csv) + running_user (§5.17)
 ```
 
 ### 4.5 Security
@@ -162,7 +163,7 @@ sec_owd(entity, default)                     -- org-wide default: private|team|p
 sec_role_hierarchy                           -- role tree (optional; "see records below me")
 sec_share(record, principal, access)         -- explicit/manual record share
 sec_share_rule(entity, cond, principal, access)  -- criteria-based auto-share (ABAC)
-sec_record_share(record, principal, access)  -- MATERIALIZED computed shares (recalc on write/rule change)
+sec_record_share(record, principal, access, rule_id, epoch)  -- MATERIALIZED computed shares; revoke-safe via epoch invalidation (ADR-0013). Per-record recompute is synchronous in the write txn; admin rule/hierarchy changes bump an epoch (instant revoke) + async batched recompute (progressive grant).
 sec_policy                                   -- general ABAC policies (expression engine)
 ```
 
@@ -234,7 +235,7 @@ This is the Odoo / Microsoft Dataverse model, chosen over Salesforce's universal
 
 | Column group | Columns | Notes |
 |---|---|---|
-| **Core (every table)** | `id ULID PK`, `tenant_id`, `owner_id`, `state`, `version BIGINT`, `created_at`, `updated_at` | Fixed across all entities; `tenant_id` in every composite index + RLS policy; `version` drives optimistic concurrency (§5.9); **no `deleted_at`** (deletion = hard-delete + archive, §5.7 / ADR-0006) |
+| **Core (every table)** | `id` ULID PK (stored as native `uuid`, 16 bytes — preserves ULID's b-tree-friendly monotonic sort order; never `text`/37 bytes, which would bloat every index and FK), `tenant_id`, `owner_id`, `state`, `version BIGINT`, `created_at`, `updated_at` | Fixed across all entities; `tenant_id` in every composite index + RLS policy; `version` drives optimistic concurrency (§5.9); **no `deleted_at`** (deletion = hard-delete + archive, §5.7 / ADR-0006) |
 | **Hoisted relational** | one real typed column per reference field, e.g. `ref_customer_id ULID` | Real `FOREIGN KEY ... ON DELETE <behavior>`; `DEFERRABLE INITIALLY DEFERRED` for mutual references |
 | **Hoisted scalar (optional)** | real columns for indexed/unique/hot fields, e.g. `email TEXT UNIQUE` | Hoist from JSONB automatically via **generated columns**: `email TEXT GENERATED ALWAYS AS (attributes->>'email') STORED` |
 | **Flexible payload** | `attributes JSONB` | Everything else; GIN-indexed for ad-hoc query |
@@ -256,7 +257,7 @@ Business rules, validations, workflow guards, report filters all need expression
 
 ### 5.3 Hot reload of metadata
 Metadata changes must take effect without restart:
-- Cache metadata in a read-through in-memory cache (`moka`).
+- Cache metadata in a read-through in-memory cache (`moka`), **keyed by `(tenant_id, entity_id)`** — never by entity id alone, or the cache is a cross-tenant leak (§5.4). All metadata cache keys are tenant-scoped to match the RLS isolation boundary.
 - Invalidate via PostgreSQL `LISTEN/NOTIFY` on a `meta_changed` channel (or Redis pub/sub). **`LISTEN/NOTIFY` is the fast path, not the only path** — it is lossy across reconnects/replicas, so each instance also runs a low-frequency **version-stamp poll** (compare the cached model version to `md_active_version`) as a self-healing fallback (REVIEW.md §5.3).
 - Every metadata read carries a version stamp so the runtime detects staleness and re-reads on mismatch.
 
@@ -319,7 +320,7 @@ md_relationship
 Consequences:
 - The core columns carry **no `deleted_at`** (§5.1) — `biz` tables hold live rows only.
 - This also resolves REVIEW.md **U3**: unique constraints need no `WHERE deleted_at IS NULL` partial-index gymnastics — a deleted value (e.g. email) can be re-created immediately, since the old row is gone from the live table.
-- Restore is an explicit operation that re-inserts from `biz_archive` (re-running FK/cascade checks), not a flag flip.
+- **Restore (ADR-0015)** is an explicit, **batch-scoped** operation, not a flag flip. Archive is trigger-driven: a `BEFORE DELETE` trigger on each `biz.<table>` copies the row to `biz_archive.<table>` with an `archive_batch_id`, and because every cascaded table has its own trigger, native `ON DELETE CASCADE` archives the **whole cascade tree** under one batch id. Restore re-inserts all rows of a batch in dependency order (parents before children) in one transaction, re-running FK/cascade checks; the restored row gets a **new, higher `version`** so any stale client hits a clean 409 (OCC, §5.9), and `SET NULL` refs are **not** auto-relinked (restore undeletes rows, not every side effect).
 
 ### 5.8 Metadata lifecycle: draft → validate → publish → activate
 
@@ -354,18 +355,19 @@ Consequences:
 - Reserved-name / duplicate-name collisions
 - Row-count estimate for transforming ops (warn on large tables)
 
-**Publish execution (transactional, one-at-a-time per tenant via `pg_advisory_lock`):**
-1. Re-validate (draft may have changed since dry-run)
-2. Begin transaction; run additive + transforming DDL + data migrations (batched; each step logged to `md_migration_log` for resume/revert)
-3. Apply the diff to `md_*` metadata tables
-4. Archive previous active model to `md_snapshot` (JSONB + manifest)
-5. Bump `md_active_version`
-6. Commit; broadcast `meta_changed` (LISTEN/NOTIFY + Redis) to invalidate caches
-7. On failure → rollback transaction; `md_migration_log` enables targeted resume
+**Publish execution — staged migration + atomic cutover (ADR-0011).** Atomicity and resumability cannot both live in one transaction: a single txn is all-or-nothing (nothing to resume), while resumability implies multiple txns (not atomic). The resolution is to split publish into a resumable staging phase that is *invisible to the runtime*, and a short atomic cutover that flips the model — using **expand/contract** so the expensive data movement happens before the flip:
+
+- **Phase A — Staging (resumable, not visible):** the draft enters `publishing` (one per tenant, enforced by partial unique index — this replaces a long-held advisory lock as the gate). A background job (apalis) runs the *large/transforming* ops only: `ADD COLUMN _v2_<name>`, batched backfill, `CHECK … NOT VALID` + `VALIDATE CONSTRAINT` for make-required, `CREATE INDEX CONCURRENTLY` for new indexes (CONCURRENTLY cannot run in a txn, so index builds are *always* staged). Each batch is its own transaction, checkpointed to `md_migration_log` → **resumable on failure, abortable with no user impact** (old model still served). A final delta backfill at cutover (or a temporary sync trigger for very-hot tables) closes the backfill race.
+- **Phase B — Cutover (atomic, short):** `pg_advisory_xact_lock` acquired *inside* a transaction kept to a **single-digit-second budget** — final delta backfill → contract (rename old → `_<name>_old`, rename `_v2_` into place, attach staged indexes `USING INDEX`, `SET NOT NULL` now metadata-only) → additive DDL → destructive *retire* (metadata only; purge stays deferred) → apply `md_*` diff → archive prior model to `md_snapshot` → bump `md_active_version` → commit → broadcast `meta_changed`. Failure rolls the txn back; `md_active_version` is unchanged; staged artifacts remain for retry or cleanup.
+- **Post-publish cleanup:** renamed `_<name>_old` columns are dropped after a short grace (default 24h) by a scheduled job — a bad cutover is recoverable within the grace window before resorting to snapshot rollback.
+
+> **Rule of thumb (ADR-0011):** the cutover transaction must complete in single-digit seconds. Any op that can't is staged in Phase A and reduced to metadata-only at cutover. This is what makes the model genuinely atomic (old-or-new, never half) while the expensive work is resumable.
+>
+> **Rollback caveat:** a reversing transform is not guaranteed lossless (e.g. `numeric → integer` truncates; rollback restores the *truncated* values). The migration plan flags lossy transforms at validate time so reduced rollback fidelity is explicit.
 
 **Two-phase destructive deletes:**
 - **Retire** — `status = retired`. Data preserved; runtime & UI hide it; queries exclude it. Fully reversible (un-retire).
-- **Purge** — scheduled job after grace drops the column/table for real. **Irreversible**; blocked if any non-retired dependency still references it.
+- **Purge** — scheduled job after grace. Before the irreversible drop, data is **exported to cold storage** (S3/Parquet) — a column's values, or the whole `biz.<table>` + its `biz_archive` for a dropped entity — keyed for compliance retention (ADR-0015, §5.15). Then the column/table is dropped. **Irreversible to the live schema** (the metadata definition is retired); a cold-storage export is for compliance reads, not one-click restore (undoing a purge = re-create via publish §5.8 + bulk-import §5.13). Blocked if any non-retired dependency still references it.
 
 **Rollback:** keep last N snapshots (default 10). Rollback loads the snapshot as a draft and re-publishes (reverse migration). **Caveat:** rollback cannot restore data already purged by a two-phase destructive op; retire-phase changes are fully reversible.
 
@@ -408,7 +410,10 @@ This yields a clean, answerable rule for "are rules/workflows trustworthy or eve
 - Rules fire **synchronously within the write transaction** for data effects; async-only side-effects go to the outbox.
 - Multiple rules matching one event are ordered **deterministically: `priority` then `id`**.
 - **Recursion budget:** a synchronous side-effect that re-triggers after-rules is capped (default depth 10); exceeding it aborts the transaction. Guards against rule loops (ties to expression-engine limits, REVIEW.md U6).
-- A workflow transition is a specialized update: guards evaluated → `state` set → on-transition actions run in-transaction → notifications to outbox. A transition that should trigger *another* transition emits a domain event to the outbox rather than chaining synchronously — keeping each transaction bounded and avoiding cascade locks.
+- A workflow transition is a specialized update: guards evaluated → `state` set → on-transition actions run in-transaction → notifications to outbox. A transition that triggers *another* transition chooses **sync or async** chaining (ADR-0016):
+  - **Sync (default for in-process chains)** — the next transition runs **in the same transaction**, atomic and all-or-nothing, bounded by the recursion budget above (extended to transitions) and the lock-ordering/deadlock-retry rules of §5.9.7. Use for immediate dependent state progressions (Approve → auto-Fulfill where Fulfill is pure data). A cycle aborts at the depth cap.
+  - **Async (for cross-system / long-running / external)** — emit a domain event to the outbox; the receiver runs later, timer-style, with `FOR UPDATE` + state re-check (§5.9.6), idempotently via that re-check (at-least-once, §5.9.4). These are **eventual and may partially complete**, so the modeler MUST declare failure handling — a `failure_state` (a designated workflow state, not new schema), retry policy, and optional compensation; on exhaustion the record moves to `failure_state` and alerts fire. The engine rejects an unhandled async chain at publish (§5.8). **No silent partial completion.**
+  - Either way, every transition attempt + outcome lands in `sys_event_log` (§5.10), so partial completions are always visible and auditable.
 
 **6. Workflow timers & concurrent transitions → pessimistic serialization.**
 - This is the one place hard row locking is required: a scheduled timer (SLA escalation, due transition) must not fire concurrently with a user-initiated transition. The worker loads the record `FOR UPDATE`, checks current state, then proceeds or aborts.
@@ -453,7 +458,7 @@ sys_event_log
 - Postgres NOTIFY fans out to all LISTENing instances across the cluster, so **no Redis is required for the core DB→app hop**.
 - Scale path: if NOTIFY volume becomes a bottleneck, front it with Redis Pub/Sub (or a stream) as the cross-instance bus; the SSE clients and `sys_event_log` contract stay unchanged.
 
-**5. Reliability: `Last-Event-ID` replay.** SSE clients send `Last-Event-ID` (= last `seq` seen) on (re)connect. The server replays `sys_event_log WHERE seq > $last AND matches-subscription`, then switches to live. Result: **at-least-once delivery to the client within the retention window** — no missed events across reconnects.
+**5. Reliability: `Last-Event-ID` replay.** SSE clients send `Last-Event-ID` (= last `seq` seen) on (re)connect. The server replays `sys_event_log WHERE seq > $last AND matches-subscription`, then switches to live. Result: **at-least-once delivery to the client within the retention window** — no missed events across reconnects. **Beyond the window** (a client offline longer than the `sys_event_log` retention, §5.15) replay is impossible by design — the client must do a **hard full re-sync** (refetch the active model and current record state on next page load). For the `metadata.published → UI reloads model` broadcast (the `tenant:<id>:broadcast` channel, §5.10.3) this full-refetch is the defined fallback rather than expecting a replayed event.
 
 **6. AuthZ on the channel (critical).** A client must only receive events for records/fields it is authorized to see:
 - Authenticate the SSE connection (JWT).
@@ -497,7 +502,14 @@ sys_event_log
 - **Postgres RLS = tenant isolation only** (cheap, simple, hard boundary). Do *not* encode the full sharing model in RLS — ABAC conditions, team membership, and recursive hierarchies make RLS policies brittle and slow.
 - **App layer (`mda-data`) = business row security.** The query builder injects a predicate derived from the user's effective context (owner / teams / shares / rules). This must be **query rewrite** (a WHERE clause), never post-filtering — post-filtering leaks counts and paginates wrong.
 
-**Performance — materialized sharing.** Computing "can U see R?" live is expensive (ownership + team + shares + rules + hierarchy). Maintain a denormalized **`sec_record_share(record_id, principal_id, access)`** table, recalculated when a record is written or a sharing rule changes (Salesforce's "sharing recalculation"). List queries join against it. Rule/hierarchy evaluation is pushed into this table asynchronously (via the outbox, §5.9) so writes stay fast.
+**Performance — materialized sharing, revoke-safe (ADR-0013).** Computing "can U see R?" live is expensive (ownership + team + shares + rules + hierarchy), so criteria-rules and hierarchy are denormalized into **`sec_record_share(record_id, principal_id, access, rule_id, epoch)`** and list queries join against it. The governing principle: **it is always safe to under-grant temporarily, never safe to over-grant** — so the table may lag on grants but must be instantly correct on revokes.
+
+- **Revoke by invalidation, not recomputation.** Each sharing rule (and the role hierarchy) carries a monotonic **`epoch`**; each share row records the epoch it was computed under. Enforcement honors a share **only if `share.epoch ≥ rule.current_epoch`**. Bumping a rule's epoch is a single O(1) update that instantly invalidates all stale shares — **there is no window in which a revoked share is honored.** A GC job later removes superseded rows.
+- **Split recompute by trigger.** A **record write** recomputes *that record's* shares **synchronously, in the write transaction** (O(rules) for one record — bounded), so a record's own shares are always fresh and per-record revocation has zero lag. An **admin change** (rule edit, hierarchy re-parent, OWD change) bumps the epoch (instant revoke) and enqueues a **batched, resumable** recompute job (apalis) — grant-side catch-up is progressive, revoke-side correctness already guaranteed.
+- **Additive grants don't invalidate.** Adding a rule/member/manual-share is purely additive (can never revoke), so it never bumps an epoch — only adds new shares. Editing an existing rule's condition is treated as revoke-conservative (bump + recompute), since "strictly broader" is undecidable in general.
+- **Thundering herd is bounded.** Bulk recomputes are batched, parallelized, idempotent, resumable, rate-limited per tenant, with Studio-visible progress/ETA. A failed reshare leaves partial-but-valid (under-grant) state — never over-grant.
+
+Ownership / team / manual-share layers are evaluated **live** from the cached effective context (cheap, no materialization); only criteria-rules and hierarchy are materialized and epoch-gated. Epoch bumps broadcast via `meta_changed` (§5.3/§5.10) to invalidate effective-context caches on all instances promptly (correctness holds regardless, but the broadcast keeps revoke latency low).
 
 **4. Field level (FLS).** `sec_field_permission(role, entity, field, access ∈ {none, read, write})`:
 - `none` → hidden: dropped from read responses, rejected on write.
@@ -507,9 +519,9 @@ sys_event_log
 
 **5. Action / transition level.** `sec_action_permission(role, action_id)` gates workflow transitions and custom actions — checked at the action invocation boundary. Modeling transitions as explicit actions (not just "update") is what lets you say "only the Approve role can run the Approve transition."
 
-**6. Value constraints (write ABAC).** `sec_field_constraint(entity, field, condition, message)` — per-role conditions evaluated by the expression engine at write time (e.g. "role=sales_rep ⇒ discount ≤ 0.05"). **Distinct from validations** (`md_rule` / field validations): validations are universal data-correctness rules; field constraints are authorization-scoped ("*who* may set *what*"). Both use the same engine.
+**6. Value constraints (write ABAC).** `sec_field_constraint(entity, field, condition, message)` — per-role conditions evaluated by the expression engine at write time (e.g. "role=sales_rep ⇒ discount ≤ 0.05"). **Distinct from validations** (`md_rule` / field validations): validations are universal data-correctness rules; field constraints are authorization-scoped ("*who* may set *what*"). Both use the same engine. **Composition (ADR-0012):** when a user holds several roles that grant write on a field, the applicable constraints *intersect* — all must hold — so a constraint cannot be bypassed by adding a permissive role. A role granting only `read` imposes no write constraint.
 
-**Effective-context caching.** At session start, compute the user's effective context — roles (direct + via teams/groups), teams, role-hierarchy ancestors, and compiled sharing-rule predicates — and cache it (Redis, TTL) keyed by `user_id`; invalidate on role/team/sharing-rule change. Every grain consults this context rather than re-querying the `sec_*` tables per request.
+**Effective-context caching.** At session start, compute the user's effective context — roles (direct + via teams/groups), teams, role-hierarchy ancestors, and compiled sharing-rule predicates — and cache it (Redis, TTL) keyed by `user_id`; invalidate on role/team/hierarchy/sharing-rule change. **Invalidation is a tenant-scoped broadcast** over the `meta_changed`/event channel (§5.3/§5.10), not a local call — a role/team change processed on instance A must invalidate sessions on instance B too. Correctness holds regardless (the next check re-reads from the `sec_*` tables), but the broadcast keeps authorization changes prompt across the cluster, and is load-bearing for sharing-rule/hierarchy *epoch* invalidation (ADR-0013). Every grain consults this cached context rather than re-querying the `sec_*` tables per request.
 
 **Enforcement map (the key artifact):**
 
@@ -525,7 +537,7 @@ sys_event_log
 | Action / transition | Action boundary | `sec_action_permission` |
 | Event channel (C5) | SSE relay | Per-client row filter + FLS on `sys_event_log` payloads |
 
-**No negative permissions.** The model is purely additive on top of a deny-by-default baseline (matches Salesforce; avoids deny-vs-grant precedence ambiguity). For an exception, narrow the role or add a more specific OWD/sharing rule.
+**No negative permissions.** The model is purely additive on top of a deny-by-default baseline (matches Salesforce; avoids deny-vs-grant precedence ambiguity) — *for binary capabilities* (object/field/action grants: union across assigned roles). Value constraints (grain 6) are **not** negative permissions: they do not revoke a write capability, they predicate it. Predicates compose by **intersection** (ADR-0012), which is the standard composition of conditional grants and the only rule that prevents a permissive role from overriding a restrictive one. For an exception on capability, narrow the role or add a more specific OWD/sharing rule.
 
 ### 5.12 Meta-model: fixed, not self-hosting
 
@@ -591,6 +603,7 @@ Impls: `LocalBlobStore` (dev/small), `S3BlobStore` (S3 / MinIO / GCS-via-S3). Co
 - **Time partitioning** (Postgres declarative partitioning, weekly/monthly) so old data is dropped via cheap `DROP TABLE` / `DETACH` instead of slow `DELETE`.
 - **Retention per table** (configurable per tenant): `sys_audit_log` → 1–7 yr (compliance); `sys_event_log` → 7–30 days (only needed for real-time replay, §5.10); `sys_outbox` → purge on successful delivery (keep DLQ entries longer).
 - **Archival:** expired audit partitions export to cold storage (S3 / Parquet) before drop, satisfying retention beyond the hot DB.
+- **Two archive tiers beyond `sys_*` (ADR-0015):** `biz_archive.<table>` (operational undo of record hard-deletes) carries a per-tenant **undo-TTL** (default 30–90 days); **cold-storage purge exports** (taken before a destructive metadata purge drops a column/table, §5.8) follow audit retention (1–7 yr). Both are managed by the same partition/lifecycle job.
 - **Sampling** (optional, per entity): full audit for sensitive entities, sampled for very-high-volume ones.
 - A partition-management **apalis** job (ADR-0007) pre-creates future partitions and drops/archives expired ones on schedule.
 
@@ -599,12 +612,49 @@ Impls: `LocalBlobStore` (dev/small), `S3BlobStore` (S3 / MinIO / GCS-via-S3). Co
 (Addresses REVIEW.md **§11** correction.) In this system, *metadata is user-authored logic* — Studio users write rules, expressions, field definitions, report queries, and workflow guards that the engine executes at runtime. That is a unique attack surface vs. a normal app, and it is treated explicitly.
 
 - **Governing principle:** the runtime only ever acts on metadata it **loaded from the DB after authz** — never on logic a client sends in a request payload. Clients send *data*; the server decides *logic* by reading trusted, published metadata (ties to the draft→publish gate, §5.8).
-- **Resource exhaustion** — a hostile expression/query → bounded evaluation (§5.2) + rule recursion budget (§5.9.5); list queries are paged and cost-limited.
-- **Data exfiltration** — expressions/queries run under the caller's AuthZ (object/field/record, §5.11) in *every* context (rule, report, workflow, API). No path bypasses field-level visibility.
+- **Resource exhaustion** — a hostile expression/query → bounded evaluation (§5.2) + rule recursion budget (§5.9.5); list queries are paged and cost-limited; report datasets carry a cost budget, result cap, timeout, and join-depth limit (§5.17).
+- **Data exfiltration** — expressions/queries run under the caller's AuthZ (object/field/record, §5.11) in *every* context (rule, report, workflow, API). No path bypasses field-level visibility: report queries are a structured model compiled by the engine, which projects only visible fields and injects record-security at every joined entity (§5.17).
 - **Privilege escalation via metadata** — editing/publishing metadata requires an elevated Studio role; runtime reads cannot mutate the model.
 - **Injection** — all SQL is parameterized; the query builder emits bound parameters, never string-interpolated values; the DSL cannot emit raw SQL.
 - **Cross-tenant leakage** — Postgres RLS (§5.4) + `tenant_id` in every index + automated isolation tests (§11).
 - **Sandboxed extensions** — `wasmtime` modules (§5.6) are capability-scoped and resource-limited; they reach the DB/network/filesystem only through explicitly granted, audited host functions.
+
+### 5.17 Reporting query model & security
+
+(ADR-0014 — resolves the report-query gap: the other place, besides expressions, where Studio users author logic the engine executes.) Left as "query + params + joins," `md_report_dataset` is an open surface: cartesian-product DoS, field/record leakage, and an unspecified author-vs-runner AuthZ question. The resolution: a report query is a **structured metadata model compiled by the engine**, never raw SQL — and because the engine builds the SQL, it enforces field- and record-level security **by construction** and bounds cost.
+
+**1. The query model is metadata, not SQL.** `md_report_dataset` is a structured declaration the engine compiles to parameterized SQL over the `biz` tables:
+
+```
+md_report_dataset
+  base_entity          -- root entity (FROM)
+  fields[]             -- (traversal, field, alias, aggregate?) — traversal hops references from base
+  filters              -- expression AST (the §5.2 DSL), parameterized — never raw SQL
+  group_by[]           -- grouping fields (each a traversal + field)
+  having               -- expression AST over aggregates
+  order_by[]           -- (field, dir)
+  parameters[]         -- named params bound at run time (:region, :as_of)
+  limit / offset       -- pagination / result cap
+```
+
+Reference traversals (e.g. `customer.region.name`) resolve to **real joins over hoisted FK columns** (§5.1/§5.7) — indexed, no string keys. `filters`/`having` use the **bounded expression DSL** (§5.2), so the whole query inherits the DSL's safety (no raw-SQL emission, bounded evaluation). **There is no raw-SQL report path in v1**; power users who need more get the structured model + DSL, with a `wasmtime` extension (§5.6) or a deferred raw-SQL-behind-a-capability-flag feature as the escape hatch.
+
+**2. AuthZ = the runner's, enforced by construction.** The author's permissions gate only *who may edit the report* (a Studio permission); at run time only the runner's effective context applies. Because the engine compiles the SQL, security is structural, not bolted on:
+- **Object** — runner needs `read` on every entity in the traversal, else the report errors for them.
+- **Field, projection** — a `select` field the runner lacks FLS `read` on is **dropped** (column omitted); the report degrades shape, never leaks.
+- **Field, semantic positions** — a field the runner can't read that appears in `filter`/`group_by`/`having`/`order_by` is a **run-time error** for that runner, *not* a silent drop: dropping a filter/group/order changes semantics (a dropped filter could reveal rows). The Studio previews this ("runner X cannot run this report: groups by `salary`").
+- **Record** — the runner's record-security predicate (OWD + shares + rules, §5.11 / ADR-0013) is injected as a WHERE — and critically **at every entity in the traversal, not only the base**: `FROM Invoice JOIN Customer` filters both the Invoices *and* the Customers the runner may see, so a join cannot leak a Customer the runner cannot read. Inner vs left join is the author's choice; the per-entity predicate applies regardless.
+- **Aggregates + FLS** — an aggregate over a field the runner can't read is as sensitive as the field; that column is dropped/errored per the rules above.
+
+**3. Cost control / DoS.** Reports can be expensive; they are cost-limited like list queries but more so:
+- **Cost estimate + budget** — before execution the engine estimates scan/join cardinality against a per-tenant budget; over budget → refuse, or (if the report is marked large-ok) run **async as an apalis job** with a download link (same pattern as bulk export, §5.13).
+- **Result cap + timeout** — synchronous runs are capped on rows and wall time; overruns are killed.
+- **Non-hoisted JSONB access** — a field still in `attributes JSONB` (not hoisted, §5.1) forces a seq scan; the estimator flags it. Remedy is to hoist at publish (§5.8) or mark the report async-only. Report authors don't control hoisting, so this guard is what keeps a naive report from full-scanning.
+- **Join-depth limit** — traversals are depth-capped (as GraphQL is, ADR-0010) to deny exponential nested joins.
+
+**4. Scheduled reports run under a configured running user.** `md_report_schedule` carries a **running user** (default: the schedule's owner). The job executes the dataset under *that* user's AuthZ; recipients receive that fixed, filtered output — not a per-recipient re-filtering (matches Salesforce). Per-recipient views require per-recipient schedules. Because the context is captured at run time, revoking the running user's access (ADR-0013) correctly stops the schedule from leaking.
+
+**5. Dashboards & exports reuse the same path.** Dashboard widgets (§4.2) run datasets under the *viewer's* context (interactive). Exporting a report's result set reuses the bulk-export field-read rules (§5.13) — you cannot export fields you can't read.
 
 ---
 
@@ -634,6 +684,8 @@ mda/
 ├── docs/
 └── tests/                     # end-to-end + integration
 ```
+
+> **Crate granularity vs. team size (§13 Q2).** This 12-crate split is the *target* decomposition for a real team; for a solo or small team it is heavy boundary overhead. Start with a smaller core set (e.g. `mda-core`, `mda-meta`, `mda-data`, and `mda-api`/`mda-server`) and split a crate out on demand as a module accrues distinct responsibilities. The boundaries above are logical contracts, not a mandate to pre-create every crate up front.
 
 ### Module responsibilities (detail)
 
@@ -680,7 +732,7 @@ GET    /api/data/:entity?filter=...&sort=...&page=...   # list
 GET    /api/data/:entity/:id                            # read
 POST   /api/data/:entity                                # create
 PATCH  /api/data/:entity/:id                            # update
-DELETE /api/data/:entity/:id                            # soft delete
+DELETE /api/data/:entity/:id                            # hard-delete + archive (ADR-0006)
 POST   /api/data/:entity/:id/:transition                # workflow action
 GET    /api/forms/:entity                               # form definition (for UI)
 GET    /api/views/:entity                               # list-view definition
@@ -758,7 +810,8 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Validations + defaults
 - **Optimistic concurrency (§5.9):** `version` column + `If-Match`/ETag on PATCH → 409 on conflict
 - `/api/data/:entity/*` runtime routes
-- **Deliverable:** Create/read/update Customer records via API, fully driven by metadata, with real FK-enforced relationships; adding/renaming/dropping a field runs a validated migration.
+- **GraphQL prototype (ADR-0010):** schema generated from the active model alongside the dynamic data layer; both REST and GraphQL sit on the same service layer; enforce query depth/cost limits to deny expensive nested queries. (Prototype scope in Phase 2 per ADR-0010; full parity with REST lands in later phases.)
+- **Deliverable:** Create/read/update Customer records via REST and a prototype GraphQL endpoint, fully driven by metadata, with real FK-enforced relationships; adding/renaming/dropping a field runs a validated migration.
 
 ### Phase 3 — Security & Auth (Weeks 9–11)
 - Users, teams, roles (`sec_*`); JWT auth + refresh tokens
@@ -871,7 +924,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 
 ## 12. Immediate Next Steps (Week 1)
 
-Architectural decisions are settled (§5, recorded as ADRs 0001–0010); the focus is now execution:
+Architectural decisions are settled (§5, recorded as ADRs 0001–0016); the focus is now execution:
 
 1. **Run the Phase 0 frontend spike** (ADR-0009) — a throwaway metadata-driven form renderer in both Leptos and React, to pick the Studio/Runtime UI stack on evidence.
 2. **Scaffold the Cargo workspace** (`crates/` layout in §6).
@@ -890,8 +943,8 @@ The architecture no longer blocks on these, but they shape later phases and ops:
 3. **Must-have integrations on day one** (specific ERP, email provider, SSO/IdP) — shape Phase 9 (integration layer).
 4. **Licensing / commercial model** — open core vs proprietary; affects dependency choices.
 
-> Resolved during planning: storage/RI, metadata lifecycle, concurrency, real-time, authorization, and expression language are all decided (§5, ADRs 0001–0010).
+> Resolved during planning: storage/RI, metadata lifecycle & publish/migration execution, concurrency & workflow chaining, real-time, authorization (incl. sharing materialization & value-constraint composition), expression language, reporting query model, and deletion/restoration lifecycle are all decided (§5, ADRs 0001–0016).
 
 ---
 
-*This plan is v0.2 — decisions are recorded as ADRs 0001–0010 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
+*This plan is v0.3 — decisions are recorded as ADRs 0001–0016 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone, and a second review pass refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17). Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*

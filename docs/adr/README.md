@@ -21,6 +21,12 @@ decision and links back.
 | [0008](0008-meta-model-fixed.md) | Meta-model: fixed, not self-hosting | Accepted |
 | [0009](0009-frontend-strategy-spike.md) | Frontend strategy: decide via Phase 0 spike | Accepted |
 | [0010](0010-graphql-first-class-runtime-api.md) | GraphQL as a first-class runtime data API | Accepted |
+| [0011](0011-publish-execution-staged-migration-and-atomic-cutover.md) | Publish execution: staged migration + atomic cutover | Accepted |
+| [0012](0012-value-constraint-composition-intersection.md) | Value-constraint composition across multiple roles (intersection) | Accepted |
+| [0013](0013-sharing-materialization-revoke-safe-epoch-invalidation.md) | Sharing materialization: revoke-safe via epoch invalidation | Accepted |
+| [0014](0014-reporting-query-model-structured-metadata.md) | Reporting query model: structured metadata, runner-context AuthZ by construction | Accepted |
+| [0015](0015-deletion-and-restoration-lifecycle.md) | Deletion & restoration lifecycle: trigger-driven archive, batch restore, cold-storage purge | Accepted |
+| [0016](0016-chained-workflow-transitions-sync-default-async-with-failure-handling.md) | Chained workflow transitions: sync-by-default (atomic) vs async (with required failure handling) | Accepted |
 
 ## Status legend
 `Proposed` → `Accepted` → `Deprecated` / `Superseded by ADR-NNNN`.
