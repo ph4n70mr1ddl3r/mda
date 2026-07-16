@@ -8,7 +8,7 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
 ## Documents
 
-- [`PLAN.md`](./PLAN.md) — the full architecture & build plan (v0.3).
+- [`PLAN.md`](./PLAN.md) — the full architecture & build plan (v0.4).
   Key sections:
   - §5.1 / §5.7 — storage model & referential integrity (real table per entity + native Postgres FKs)
   - §5.8 — draft → validate → publish → activate lifecycle
@@ -20,9 +20,9 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
   - §5.15 — retention of high-volume append-only tables (audit/event/outbox)
   - §5.16 — threat model: untrusted metadata
   - §5.17 — reporting query model & security (structured metadata, runner-context AuthZ by construction)
-- [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved in v0.2; further refinements as ADRs 0011–0016 in v0.3; reasoning trail).
+- [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved in v0.2; further refinements as ADRs 0011–0017 across v0.3/v0.4; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
-- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (16 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, job queue, meta-model, frontend, GraphQL).
+- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (17 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL).
 
 ## Roadmap (summary)
 

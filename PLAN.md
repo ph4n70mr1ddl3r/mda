@@ -103,7 +103,7 @@ SeaORM offers nicer ergonomics but obscures the dynamic SQL we need for runtime 
 
 ## 4. The Meta-Meta-Model (the heart of the system)
 
-This is the schema that *describes the descriptions*. Everything below is a table in the `meta` schema.
+This is the schema that *describes the descriptions*. Everything below is a table in the `meta` schema. **All `md_*`, `sec_*`, `sys_*`, and `biz.*` tables are tenant-scoped** — each carries `tenant_id`, is covered by RLS (§5.4), and is cached keyed by `(tenant_id, …)` (§5.3); a tenant's model (entities, fields, forms, …) is its own, never global. (The sketches below omit `tenant_id` for brevity.)
 
 > **Note — fixed meta-model (ADR-0008):** the platform's own definitions (`md_entity`, `md_field`, …) are **static Rust structs + SQL**, not first-class runtime entities. This is deliberate (avoids the bootstrapping / infinite-regress of self-hosting meta-metadata); the consequence is "no edit the editor." See §5.12.
 
@@ -160,9 +160,9 @@ sec_field_permission(role, entity, field, access)  -- field-level: none|read|wri
 sec_action_permission(role, action_id)       -- action-level: workflow transitions, custom actions
 sec_field_constraint(entity, field, cond, msg) -- per-role write value constraints (ABAC)
 sec_owd(entity, default)                     -- org-wide default: private|team|public_read|public_read_write
-sec_role_hierarchy                           -- role tree (optional; "see records below me")
+sec_role_hierarchy                           -- role tree (optional; "see records below me"); hierarchy-derived shares are epoch-gated by a per-tenant hierarchy_epoch (ADR-0013)
 sec_share(record, principal, access)         -- explicit/manual record share
-sec_share_rule(entity, cond, principal, access)  -- criteria-based auto-share (ABAC)
+sec_share_rule(entity, cond, principal, access, epoch)  -- criteria-based auto-share (ABAC); epoch = rule version for revoke-safe invalidation (ADR-0013)
 sec_record_share(record, principal, access, rule_id, epoch)  -- MATERIALIZED computed shares; revoke-safe via epoch invalidation (ADR-0013). Per-record recompute is synchronous in the write txn; admin rule/hierarchy changes bump an epoch (instant revoke) + async batched recompute (progressive grant).
 sec_policy                                   -- general ABAC policies (expression engine)
 ```
@@ -183,7 +183,11 @@ int_webhook      - outbound event subscriptions
 sys_audit_log    - every write, who/when/what (before/after JSONB)
 sys_outbox       - transactional outbox: durable pending side-effects (webhook/email/ETL/event),
                    inserted in the same txn as the data write; drained by workers (at-least-once). §5.9
-sys_event_log    - canonical sequence-numbered domain-event stream: real-time + audit + replay (§5.10)
+sys_event_log    - canonical sequence-numbered domain-event stream: real-time push + replay only (§5.10);
+                   compliance audit is the separate, heavier sys_audit_log (before/after JSONB)
+sys_notification - user-facing notifications: (id, tenant_id, user_id, type, entity, record_id,
+                   payload JSONB, read_at, created_at) — created by rules/workflows/system events,
+                   pushed over the user:<id>:notifications channel (§5.10); read/unread via read_at
 sys_lock         - soft advisory record checkout (owner, ttl, heartbeat) for UX coordination. §5.9
 sys_setting      - key/value config
 sys_translation  - i18n strings (metadata/UI only; data-level i18n deferred — U5)
@@ -306,9 +310,15 @@ md_relationship
   strength                -- master_detail | lookup
   on_delete               -- restrict | set_null | cascade   (lookup only)
   required                -- bool (master_detail always true)
-  reference_qualifier     -- optional expression restricting valid targets
+  reference_qualifier     -- optional expression restricting valid targets (hard-enforced at the referencing record's write; also filters the Studio lookup picker)
   rollup_summary          -- optional: aggregate children onto parent
                           --   (count/sum/avg/min/max of a field)
+                          --   computed incrementally & synchronously in the
+                          --   child's txn by default; async opt-out for hot
+                          --   parents (ADR-0017)
+                          --   NB: distinct from a *calculated field* (same-record
+                          --   formula via the DSL, §5.2) — a rollup aggregates
+                          --   *other* (child) records.
 ```
 
 **Many-to-many** is materialized as a real **join table** `biz.<a>_<b>` with a composite PK and FKs to both sides — real constraints, real integrity.
@@ -376,7 +386,7 @@ Consequences:
 (Resolves REVIEW.md **C4**.) The system must (a) prevent lost updates, (b) keep multi-step writes atomic, and (c) guarantee that external side-effects are delivered exactly without coupling request latency to external systems. The answers below are deliberately standard patterns — do not invent novel concurrency.
 
 **1. Record-level concurrency: optimistic by default.**
-- Every `biz.<table>` carries a `version BIGINT` (core column, §5.1). Updates are conditional:
+- Every `biz.<table>` carries a `version BIGINT` (core column, §5.1) — this is the **per-row OCC counter**, distinct from the model's `md_active_version` (§4.8) and a draft's `version_etag` (§5.8). Updates are conditional:
   `UPDATE … SET …, version = version + 1 WHERE id = $1 AND version = $expected`
 - 0 rows affected → another writer committed first → API returns **409 Conflict**; client re-reads and retries. Surfaced over HTTP via `ETag`/`If-Match` (and a `version` field in the body for non-browser clients).
 - List responses include per-row versions so clients can echo them back.
@@ -391,16 +401,17 @@ Consequences:
 2. AuthZ check (RBAC + ABAC)
 3. **Before-rules** (validate / mutate input) — may **reject** → rollback
 4. Apply field changes (incl. workflow `state`)
-5. **After-rules, synchronous** — data side-effects (set fields, update related rows) within the same txn; failure rolls back the whole write
-6. Insert `sys_event_log` rows (canonical domain events — §5.10) and `sys_outbox` rows (async side-effects: email, webhook, ETL kick)
-7. `UPDATE … version + 1` (OCC)
-8. Commit
-9. *(Workers drain `sys_outbox` — see §5.9.4)*
+5. **After-rules, synchronous** — data side-effects (set fields, update related rows, incl. parent rollup deltas — ADR-0017) within the same txn; failure rolls back the whole write
+6. **Recompute this record's `sec_record_share` rows synchronously** — only if owner or a sharing-rule-relevant field changed; O(rules) for one record (ADR-0013). Keeps record-level security fresh with zero per-record revoke lag.
+7. **Write the three logs** (all in the same txn): `sys_audit_log` (full before/after JSONB — the **compliance** record, §4.7), `sys_event_log` (lightweight domain events for **real-time/replay**, §5.10), and `sys_outbox` rows (**async side-effects**: email, webhook, ETL kick — §5.9.4). Audit and event are **distinct tables** — different schema and retention (§5.15) — not one.
+8. `UPDATE … version + 1` (OCC)
+9. Commit
+10. *(Workers drain `sys_outbox` — see §5.9.4)*
 
 **4. Transactional Outbox pattern (the key decision).** External/integration side-effects (webhook, email, pub/sub, scheduled kicks) are **never** called inside the data transaction. Instead:
 - The data change and an `sys_outbox` row are inserted in the **same transaction** → the dual-write problem is eliminated: *if the data committed, the side-effect is durably queued.*
 - A worker claims rows with `SELECT … FOR UPDATE SKIP LOCKED`, performs the external call, retries with exponential backoff + jitter, and routes persistent failures to a **dead-letter** set for manual replay.
-- Delivery is **at-least-once**; therefore all consumers must be **idempotent** (stable message id; webhooks carry an idempotency header; internal processors dedupe via a processed-id log).
+- Delivery is **at-least-once**; therefore all consumers must be **idempotent** (stable message id; webhooks carry an idempotency header; internal processors dedupe via the outbox row's own idempotency key + `status=processed` — the processed outbox rows *are* the dedupe log, retained past the re-delivery window).
 
 This yields a clean, answerable rule for "are rules/workflows trustworthy or eventual?":
 - **Data-affecting logic = trustworthy** (synchronous, in-transaction, atomic with the write).
@@ -431,7 +442,7 @@ This yields a clean, answerable rule for "are rules/workflows trustworthy or eve
 
 **1. Transport: SSE first.** Server-Sent Events for the server→client push that is ~90% of our traffic (record/task/workflow notifications, list refresh). Client→server (mutations, presence heartbeats) goes through the normal REST API. SSE auto-reconnects, is HTTP-friendly behind load balancers, and is far simpler to scale than WebSocket. Reserve WebSocket for a future collaborative-co-editing feature that needs low-latency bidirectional ops.
 
-**2. Event source: `sys_event_log`.** The canonical, sequence-numbered, transactional domain-event stream (written in the same txn as the data change, §5.9.3 step 6). Real-time, audit, and replay all read from one place. Reconciling with §5.9.4: `sys_event_log` = the **facts** (what happened); `sys_outbox` = the **work items** (async delivery that needs a worker — webhook/email/ETL), referencing event-log rows. The relay reads `sys_event_log`; workers drain `sys_outbox`.
+**2. Event source: `sys_event_log`.** The canonical, sequence-numbered, transactional domain-event stream (written in the same txn as the data change, §5.9.3 step 7). **Real-time and replay read from here**; the heavier **compliance audit** (full before/after JSONB) is a *separate* table, `sys_audit_log` (§4.7) — different schema, different retention (§5.15: event 7–30 d for replay, audit 1–7 yr for compliance). Reconciling the three write-path logs: `sys_event_log` = the lightweight **facts** (what happened, for push/replay); `sys_audit_log` = the heavy **compliance record** (before/after, for audit queries); `sys_outbox` = the **work items** (async delivery needing a worker — webhook/email/ETL). The relay reads `sys_event_log`; audit queries read `sys_audit_log`; workers drain `sys_outbox`.
 
 ```
 sys_event_log
@@ -450,7 +461,7 @@ sys_event_log
 - `entity:<name>` — all changes to an entity (live lists / kanban / counts)
 - `record:<entity>:<id>` — a specific record (detail views, conflict detection)
 - `user:<id>:tasks` — task assignments/completions (inbox badge)
-- `user:<id>:notifications` — personal notifications
+- `user:<id>:notifications` — personal notifications (persisted in `sys_notification`, §4.7; read/unread state)
 - `tenant:<id>:broadcast` — system-wide (incl. `metadata.published` → UI reloads model, tying into cache invalidation §5.3)
 
 **4. Relay & fan-out.** Each app instance runs a relay holding its locally-connected SSE clients. On a new `sys_event_log` row:
@@ -469,7 +480,7 @@ sys_event_log
 - Not editing → refresh the view.
 - Editing (unsaved changes) and `to_version` advanced → show a conflict banner ("changed by someone else — Review / Overwrite / Refresh") *before* the user wastes effort. The 409-on-save remains the backstop. This is the UX payoff of combining OCC + real-time.
 
-**8. Presence (lightweight).** "Who else is viewing/editing this?" — clients heartbeat `POST /api/presence/:entity/:id` (~15s); the server tracks in Redis (TTL) keyed by (record, user) and broadcasts `record.checked_out`/presence deltas over the channel. This is the view-level complement to the explicit edit-level soft checkout (`sys_lock`, §5.9.2).
+**8. Presence (lightweight).** "Who else is viewing/editing this?" — clients heartbeat `POST /api/presence/:entity/:id` (~15s); the server tracks viewers in Redis (TTL) keyed by (record, user) and broadcasts **presence deltas** (who joined/left the view). This is distinct from the explicit edit-level **soft checkout** (`sys_lock`, §5.9.2): presence = passive "who's looking" (no correctness effect); `sys_lock` = active "I'm editing" claim (advisory banner) whose acquire/release emit the `record.checked_out`/`record.released` events (§5.10.2). Presence does not emit those events.
 
 **9. v1 scope.** In Phase 6 (with the Runtime UI): SSE channel + reliable replay + conflict banner — the minimum to avoid stale-data UX. Deferred: live list/kanban/count streaming, presence, and collaborative co-editing (the last needs WebSocket + OT/CRDT → v2).
 
@@ -536,6 +547,8 @@ Ownership / team / manual-share layers are evaluated **live** from the cached ef
 | Field value | Write validation | Expression engine (ABAC) |
 | Action / transition | Action boundary | `sec_action_permission` |
 | Event channel (C5) | SSE relay | Per-client row filter + FLS on `sys_event_log` payloads |
+| Report dataset | Report engine (compile time) | Structured model compiled by the engine — FLS projection + per-entity record predicate by construction (§5.17) |
+| GraphQL | Service layer (shared with REST) | Per-field FLS + record predicate at every relationship level; depth/cost limits (§7, ADR-0010) |
 
 **No negative permissions.** The model is purely additive on top of a deny-by-default baseline (matches Salesforce; avoids deny-vs-grant precedence ambiguity) — *for binary capabilities* (object/field/action grants: union across assigned roles). Value constraints (grain 6) are **not** negative permissions: they do not revoke a write capability, they predicate it. Predicates compose by **intersection** (ADR-0012), which is the standard composition of conditional grants and the only rule that prevents a permissive role from overriding a restrictive one. For an exception on capability, narrow the role or add a more specific OWD/sharing rule.
 
@@ -668,7 +681,7 @@ mda/
 ├── crates/
 │   ├── mda-core/              # shared types, errors, Result, ids, traits
 │   ├── mda-meta/              # metadata model structs + loader + cache
-│   ├── mda-data/              # dynamic data access (query builder, CRUD over JSONB)
+│   ├── mda-data/              # dynamic data access (query builder, CRUD over biz tables: hoisted cols + JSONB)
 │   ├── mda-expression/        # DSL AST + evaluator + functions registry
 │   ├── mda-security/          # authN, authZ (RBAC+ABAC), data filters
 │   ├── mda-workflow/          # state machine engine + timers
@@ -690,7 +703,7 @@ mda/
 ### Module responsibilities (detail)
 
 - **mda-meta** — Load `md_*` tables into typed structs; expose `MetadataCache` (query by entity id, invalidate on change). Defines the canonical `Entity`, `Field`, `Form`, `View`, etc. types used everywhere.
-- **mda-data** — Given an `Entity` and an operation (create/read/update/delete/list), produce the correct SQL against `biz.<table>`. Query builder for list views (filters/sort/paging over JSONB). Handles validation, defaults, computed fields.
+- **mda-data** — Given an `Entity` and an operation (create/read/update/delete/list), produce the correct SQL against `biz.<table>` (real tables with hoisted relational/scalar columns + a JSONB `attributes` payload — ADR-0001). Query builder for list views (filters/sort/paging over hoisted columns + JSONB). Handles validation, defaults, computed fields, rollup deltas (ADR-0017).
 - **mda-expression** — Parse/evaluate the DSL. Inputs: expression AST (JSON), record context, function registry. Returns typed values. Used by rules, workflows, validations, reports.
 - **mda-security** — `Identity` (user/tenant/roles/teams); multi-grained `check` (object / field / record / action, §5.11); ABAC via the expression engine; injects record-level predicates into `mda-data` queries; tenant isolation via Postgres RLS (§5.4).
 - **mda-workflow** — State machine: given entity + current state + transition request, evaluate guards (expressions), execute actions, persist new state, enqueue tasks/notifications.
@@ -751,7 +764,7 @@ For a dynamic, relationship-rich data model, GraphQL is a strong fit — clients
 ```
 POST /api/graphql      # schema generated from metadata; authz + field-level security apply per field
 ```
-The schema is derived from the active model and re-generated on publish (§5.8). **Prototype in Phase 2** alongside the dynamic data layer; enforce query depth/cost limits to deny expensive nested queries.
+The schema is derived from the active model and re-generated on publish (§5.8). **Prototype in Phase 2** alongside the dynamic data layer; enforce query depth/cost limits to deny expensive nested queries. Like reports (§5.17), GraphQL enforces **record-security at every relationship level** of a nested query and applies FLS per field — it shares REST's service layer, so the same predicates apply; there is no GraphQL-specific bypass.
 
 > OpenAPI spec auto-generated; an external SDK (TypeScript/Rust/Python) can be derived from it. The dynamic data API is discoverable via `/api/schema/:entity` (JSON Schema derived from metadata).
 
@@ -810,7 +823,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Validations + defaults
 - **Optimistic concurrency (§5.9):** `version` column + `If-Match`/ETag on PATCH → 409 on conflict
 - `/api/data/:entity/*` runtime routes
-- **GraphQL prototype (ADR-0010):** schema generated from the active model alongside the dynamic data layer; both REST and GraphQL sit on the same service layer; enforce query depth/cost limits to deny expensive nested queries. (Prototype scope in Phase 2 per ADR-0010; full parity with REST lands in later phases.)
+- **GraphQL prototype (ADR-0010):** schema generated from the active model alongside the dynamic data layer; both REST and GraphQL sit on the same service layer; enforce query depth/cost limits to deny expensive nested queries. (Prototype scope in Phase 2 per ADR-0010; REST-parity mutations are added progressively in later phases — not MVP-blocking.)
 - **Deliverable:** Create/read/update Customer records via REST and a prototype GraphQL endpoint, fully driven by metadata, with real FK-enforced relationships; adding/renaming/dropping a field runs a validated migration.
 
 ### Phase 3 — Security & Auth (Weeks 9–11)
@@ -820,7 +833,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - **Record-level**: ownership + team baseline (`sec_owd`), app-layer predicate injection in `mda-data`; tenant isolation via Postgres RLS (§5.4)
 - Effective-context caching (roles/teams) per session
 - Audit logging (`sys_audit_log`) on all writes
-- *Deferred within v1:* criteria-based sharing rules, role hierarchy, materialized `sec_record_share` (§5.11.3)
+- *Deferred to Phase 6:* criteria-based sharing rules, role hierarchy, materialized `sec_record_share` (§5.11 / ADR-0013) — full record-level security for the runtime UI's list views
 - **Deliverable:** Login; role-gated object + field + record access; tenant isolation; full audit trail.
 
 ### Phase 4 — Expression Engine & Rules (Weeks 11–14)
@@ -844,6 +857,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - `/api/forms/:entity`, `/api/views/:entity` return renderable JSON
 - **Build the Runtime UI** (Leptos): dynamic form renderer, list/grid renderer, dashboard, navigation shell
 - **Real-time channel (§5.10):** SSE over `sys_event_log` with `Last-Event-ID` replay; conflict banner when a viewed record is changed by another user
+- **Advanced record security (deferred from Phase 3):** criteria-based sharing rules, role hierarchy, and materialized `sec_record_share` with epoch invalidation (§5.11 / ADR-0013) — full record-level security behind list/detail views
 - **Deliverable:** A user logs in, sees a menu, opens a list of Customers, creates/edits via a rendered form, and is alerted in real time when another user edits the same record — all from metadata, zero hardcoded pages.
 
 ### Phase 7 — Reporting (Weeks 26–29)
@@ -882,10 +896,11 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 
 > Timelines are rough planning anchors for a small team; **Phases 6 and 8 were re-estimated honestly** (REVIEW.md Timeline Reality Check): Phase 6 ≈ 9 weeks for a from-scratch metadata-driven UI renderer + real-time; Phase 8 ≈ 14 weeks for the full drag-and-drop Studio (parallelizable only with a real team). The full sequence is now ~55 weeks; a solo developer should ~double it — which is why the **MVP milestone above exists** (ship value around week 26, not week 55).
 
-> **Deferred (explicitly, not omitted — closes REVIEW.md U5 / U9).** Two items are deliberately out of v1 scope:
+> **Deferred (explicitly, not omitted — closes REVIEW.md U5 / U9).** Deliberately out of v1 scope:
 > - **U5 — data-level i18n** (translatable enum/reference data; record-level multi-language fields). `sys_translation` covers **metadata/UI strings only** for v1; data i18n is a later, opt-in feature once a real multi-locale tenant needs it.
 > - **U9 — high availability & replication** (Postgres HA, read replicas for reporting, logical replication / warm standby, connection-pool tuning). Single-node Postgres for v1; HA is a Phase 11 hardening activity when production scale demands it.
-> Both are tracked here so they remain *visible*, not lost.
+> - **Search** — §3 lists "PostgreSQL FTS → OpenSearch later" but it is not yet designed: which fields are searchable, how results respect record/field security and tenancy, and the FTS→OpenSearch migration path. Scoped into a later phase once a concrete search need arrives; until then, list filters cover structured queries.
+> All are tracked here so they remain *visible*, not lost.
 
 ---
 
@@ -924,7 +939,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 
 ## 12. Immediate Next Steps (Week 1)
 
-Architectural decisions are settled (§5, recorded as ADRs 0001–0016); the focus is now execution:
+Architectural decisions are settled (§5, recorded as ADRs 0001–0017); the focus is now execution:
 
 1. **Run the Phase 0 frontend spike** (ADR-0009) — a throwaway metadata-driven form renderer in both Leptos and React, to pick the Studio/Runtime UI stack on evidence.
 2. **Scaffold the Cargo workspace** (`crates/` layout in §6).
@@ -943,8 +958,8 @@ The architecture no longer blocks on these, but they shape later phases and ops:
 3. **Must-have integrations on day one** (specific ERP, email provider, SSO/IdP) — shape Phase 9 (integration layer).
 4. **Licensing / commercial model** — open core vs proprietary; affects dependency choices.
 
-> Resolved during planning: storage/RI, metadata lifecycle & publish/migration execution, concurrency & workflow chaining, real-time, authorization (incl. sharing materialization & value-constraint composition), expression language, reporting query model, and deletion/restoration lifecycle are all decided (§5, ADRs 0001–0016).
+> Resolved during planning: storage/RI, metadata lifecycle & publish/migration execution, concurrency & workflow chaining, real-time, authorization (incl. sharing materialization & value-constraint composition), expression language, reporting query model, deletion/restoration lifecycle, and rollup-summary semantics are all decided (§5, ADRs 0001–0017).
 
 ---
 
-*This plan is v0.3 — decisions are recorded as ADRs 0001–0016 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone, and a second review pass refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17). Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
+*This plan is v0.4 — decisions are recorded as ADRs 0001–0017 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Successive review passes refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17), then rollup-summary semantics and canonical write-path consistency — audit/event-log split and the per-record share-recompute step (ADR-0017). Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
