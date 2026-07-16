@@ -731,6 +731,8 @@ The runtime UI is a **metadata interpreter**: fetch form/view JSON → render in
 
 Each phase is independently valuable and demoable. Aim for vertical slices.
 
+> **MVP milestone (the de-risk target).** The credible MVP is one vertical slice: *define an entity via the Studio API → publish → CRUD via the runtime API → a **basic** rendered form + list UI → login/auth.* It lands by the end of **Phase 3 + a thin UI slice pulled forward from Phase 6** (skip dashboards, fancy views, and real-time for the MVP). Everything heavier — full Studio designers, workflows, reporting, integrations, real-time, bulk import, attachments — is **post-MVP**. Ship the MVP to real users early to validate the model-driven core before committing to the long tail.
+
 ### Phase 0 — Foundation (Weeks 1–3)
 - Cargo workspace skeleton, CI, Docker, dev Postgres+Redis
 - `mda-core`: error types, IDs (`ulid`), traits
@@ -784,39 +786,39 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Notifications (email/webhook) on state changes via the transactional outbox
 - **Deliverable:** An approval workflow on an "Invoice" entity with state, tasks, and email.
 
-### Phase 6 — Form & View Definitions + Runtime UI (Weeks 17–22)
+### Phase 6 — Form & View Definitions + Runtime UI (Weeks 17–26)
 - `md_form`, `md_view`, `md_dashboard`, `md_navigation`
 - `/api/forms/:entity`, `/api/views/:entity` return renderable JSON
 - **Build the Runtime UI** (Leptos): dynamic form renderer, list/grid renderer, dashboard, navigation shell
 - **Real-time channel (§5.10):** SSE over `sys_event_log` with `Last-Event-ID` replay; conflict banner when a viewed record is changed by another user
 - **Deliverable:** A user logs in, sees a menu, opens a list of Customers, creates/edits via a rendered form, and is alerted in real time when another user edits the same record — all from metadata, zero hardcoded pages.
 
-### Phase 7 — Reporting (Weeks 22–25)
+### Phase 7 — Reporting (Weeks 26–29)
 - `md_report`, datasets, grouping, charts
 - Renderers: HTML table, XLSX, PDF, CSV
 - Scheduled reports via job queue + email delivery
 - Dashboards consume report datasets
 - **Deliverable:** Build a "Sales by Month" report in Studio, run it, export to PDF, schedule daily email.
 
-### Phase 8 — Studio UI (Weeks 25–31)
+### Phase 8 — Studio UI (Weeks 29–43)
 - Entity/field designer, form designer (drag-drop), view designer, report designer, workflow designer, rule editor, security admin
 - Metadata import/export/promote UI
 - This is large; consider parallelizing across designers
 - **Deliverable:** A business analyst can build a small CRM app entirely through the browser.
 
-### Phase 9 — Integration Layer (Weeks 31–34)
+### Phase 9 — Integration Layer (Weeks 43–46)
 - `Connector` trait: REST, DB, file, (SOAP/GraphQL later)
 - `md_int_*`, field mapping, inbound/outbound flows, scheduling
 - Webhooks (outbound) + inbound webhook receiver
 - **Deliverable:** Sync Customer records to/from an external REST API on a schedule.
 
-### Phase 10 — Bulk Data Import/Export & Attachments (Weeks 34–37)
+### Phase 10 — Bulk Data Import/Export & Attachments (Weeks 46–49)
 - **Bulk import/export (§5.13):** CSV/XLSX/JSON; field mapping; create/update/upsert by key; **dry-run** with validation report; all-or-nothing or best-effort; batched transactions for large files; runs as an `apalis` job with progress + resumable per-row results
 - **Security:** reuses the full write pipeline (object + field + record authz, §5.11) — can't import into fields/rows you can't write; export respects field-level read
 - **Attachments (§5.14):** `attachment` field type; `BlobStore` trait (local + S3); `sys_blob` metadata; presigned upload/download URLs; async virus-scan hook; checksum dedup; thumbnails; cleanup on record delete (ADR-0006)
 - **Deliverable:** Upload a CSV of Customers → map fields → dry-run → commit (with an error report); attach a PDF to a Customer and download it via a short-TTL signed URL.
 
-### Phase 11 — Hardening, Scale, Polish (Weeks 37–43)
+### Phase 11 — Hardening, Scale, Polish (Weeks 49–55)
 - Observability (tracing/OpenTelemetry dashboards), load testing
 - Metadata cache tuning, query optimization, materialized views for reports
 - i18n (`sys_translation`), theming
@@ -825,7 +827,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Documentation, SDK generation, sample apps
 - **Deliverable:** Production-ready v1.0.
 
-> Timelines are rough planning anchors for a small team; adjust to reality. A solo dev should ~double these.
+> Timelines are rough planning anchors for a small team; **Phases 6 and 8 were re-estimated honestly** (REVIEW.md Timeline Reality Check): Phase 6 ≈ 9 weeks for a from-scratch metadata-driven UI renderer + real-time; Phase 8 ≈ 14 weeks for the full drag-and-drop Studio (parallelizable only with a real team). The full sequence is now ~55 weeks; a solo developer should ~double it — which is why the **MVP milestone above exists** (ship value around week 26, not week 55).
 
 ---
 

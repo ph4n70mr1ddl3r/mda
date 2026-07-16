@@ -2,7 +2,7 @@
 
 A critical, self-imposed architectural review. Verdict up front, then strengths, then the gaps that will actually hurt.
 
-> **Status:** All six critical gaps (C1–C6) identified below are now resolved in `PLAN.md` v0.2 (§5.7–§5.11). This review is retained as the reasoning trail.
+> **Status (v0.2):** All critical gaps (C1–C6) and underspecified items (U1–U4, U6–U8) are now resolved in `PLAN.md`; the timeline re-estimate and MVP milestone are addressed in §9. Only **U5 (data i18n)** and **U9 (HA/replication)** remain — deliberately deferred to later phases. This review is retained as the reasoning trail. See `docs/adr/` for the recorded decisions.
 
 ---
 
