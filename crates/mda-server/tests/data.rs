@@ -717,3 +717,92 @@ async fn workflow_state_machine_runs() {
         "guard amount>0 should reject approve"
     );
 }
+
+#[tokio::test]
+async fn report_runs_with_grouping_and_export() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    // Customer with tier + amount
+    let model = json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null,
+            "name": "Customer", "table_name": format!("cust_{}", Uuid::new_v4().simple()),
+            "label": "Customer", "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(), "name":"tier","label":"Tier","field_type":"enum","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"options":["Bronze","Silver","Gold"]}},
+                {"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}}
+            ],
+            "relationships": []
+        }]
+    });
+    publish(&ctx, model).await;
+
+    // create rows: 2 Bronze (10, 20), 1 Silver (5)
+    for (tier, amt) in [("Bronze", 10.0), ("Bronze", 20.0), ("Silver", 5.0)] {
+        let _ = call(
+            &ctx.app,
+            "POST",
+            "/api/data/Customer",
+            &ctx.token,
+            Some(json!({"tier":tier,"amount":amt}).to_string()),
+            None,
+        )
+        .await;
+    }
+
+    // author a report: count + sum(amount) grouped by tier
+    let dataset = json!({
+        "base_entity":"Customer",
+        "fields":[
+            {"field":"tier"},
+            {"field":"*","aggregate":"count","alias":"n"},
+            {"field":"amount","aggregate":"sum","alias":"total"}
+        ],
+        "group_by":["tier"],
+        "order_by":[{"field":"tier","asc":true}],
+        "limit":10
+    });
+    let (rep_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO meta.md_report (tenant_id, name, dataset) VALUES ($1,'by_tier',$2) RETURNING id",
+    )
+    .bind(ctx.tenant)
+    .bind(&dataset)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+
+    let (st, res) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/reports/{rep_id}/run"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "run: {res}");
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "two tiers: {res}");
+    let by_tier: std::collections::HashMap<String, Value> = rows
+        .iter()
+        .map(|r| (r["tier"].as_str().unwrap().to_string(), r.clone()))
+        .collect();
+    assert_eq!(by_tier["Bronze"]["n"].as_i64().unwrap(), 2);
+    assert_eq!(by_tier["Bronze"]["total"].as_f64().unwrap(), 30.0);
+    assert_eq!(by_tier["Silver"]["n"].as_i64().unwrap(), 1);
+
+    // CSV export (text/csv — assert status; the run above validated the data)
+    let (st, _csv) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/reports/{rep_id}/export"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "export status");
+}

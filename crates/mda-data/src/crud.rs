@@ -41,14 +41,14 @@ impl RecordScope {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Filter {
     pub field: String,
     pub op: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Sort {
     pub field: String,
     pub asc: bool,

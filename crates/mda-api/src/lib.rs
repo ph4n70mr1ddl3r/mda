@@ -15,6 +15,7 @@ pub mod auth;
 pub mod data;
 pub mod error;
 pub mod extract;
+pub mod reports;
 pub mod studio;
 
 use mda_meta::MetadataCache;
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .merge(auth::routes())
         .merge(studio::routes())
         .merge(data::routes())
+        .merge(reports::routes())
         .with_state(state)
 }
 

@@ -80,7 +80,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (17 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL).
-- [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE5.md`](./docs/PHASE5.md) — phase status & handoffs.
+- [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE7.md`](./docs/PHASE7.md) — phase status & handoffs.
 
 ## Roadmap (summary)
 

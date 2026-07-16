@@ -8,6 +8,7 @@ members = [
     "crates/mda-expression",
     "crates/mda-rules",
     "crates/mda-workflow",
+    "crates/mda-reports",
     "crates/mda-api",
     "crates/mda-server",
 ]
@@ -26,6 +27,7 @@ mda-security = { path = "crates/mda-security" }
 mda-expression = { path = "crates/mda-expression" }
 mda-rules = { path = "crates/mda-rules" }
 mda-workflow = { path = "crates/mda-workflow" }
+mda-reports = { path = "crates/mda-reports" }
 mda-api = { path = "crates/mda-api" }
 
 # external

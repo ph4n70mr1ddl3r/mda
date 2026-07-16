@@ -994,6 +994,7 @@ dependencies = [
  "mda-core",
  "mda-data",
  "mda-meta",
+ "mda-reports",
  "mda-rules",
  "mda-security",
  "mda-workflow",
@@ -1053,6 +1054,20 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "mda-reports"
+version = "0.1.0"
+dependencies = [
+ "mda-core",
+ "mda-data",
+ "mda-meta",
+ "mda-security",
+ "serde",
+ "serde_json",
+ "sqlx",
  "uuid",
 ]
 
