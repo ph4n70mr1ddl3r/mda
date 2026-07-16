@@ -15,6 +15,7 @@ pub mod auth;
 pub mod data;
 pub mod error;
 pub mod extract;
+pub mod notifications;
 pub mod reports;
 pub mod studio;
 
@@ -37,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .merge(studio::routes())
         .merge(data::routes())
         .merge(reports::routes())
+        .merge(notifications::routes())
         .with_state(state)
 }
 

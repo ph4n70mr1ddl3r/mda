@@ -3,6 +3,7 @@
 pub mod bootstrap;
 pub mod config;
 pub mod migrate;
+pub mod outbox;
 
 use anyhow::Context;
 use axum::Router;
@@ -31,6 +32,7 @@ pub async fn run() -> anyhow::Result<()> {
     let cache = mda_meta::MetadataCache::new();
     mda_meta::cache::spawn_listen(pool.clone(), cache.clone());
     mda_meta::cache::spawn_poll(pool.clone(), cache.clone());
+    outbox::spawn_drain(pool.clone());
 
     let app: Router = mda_api::router(AppState {
         pool: pool.clone(),

@@ -20,6 +20,7 @@ struct Ctx {
     jwt: JwtConfig,
     pool: PgPool,
     tenant: Uuid,
+    user_id: Uuid,
 }
 
 fn customer_model() -> Value {
@@ -100,6 +101,7 @@ async fn setup() -> Option<Ctx> {
         jwt,
         pool,
         tenant,
+        user_id,
     })
 }
 
@@ -858,4 +860,76 @@ async fn bulk_import_and_export() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "export status");
+}
+
+#[tokio::test]
+async fn outbox_drains_into_notifications() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    // enqueue a workflow.transitioned event addressed to the acting user
+    sqlx::query(
+        "INSERT INTO sys_outbox (tenant_id, kind, payload)
+         VALUES ($1, 'workflow.transitioned', $2)",
+    )
+    .bind(ctx.tenant)
+    .bind(serde_json::json!({
+        "actor": ctx.user_id,
+        "entity": "Invoice",
+        "record_id": Uuid::new_v4(),
+        "transition": "approve",
+        "from": "Submitted",
+        "to": "Approved",
+    }))
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    // start the drain worker and wait for it to process
+    mda_server::outbox::spawn_drain(ctx.pool.clone());
+    let mut done = false;
+    for _ in 0..20 {
+        let notified: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sys_notification WHERE tenant_id=$1 AND user_id=$2",
+        )
+        .bind(ctx.tenant)
+        .bind(ctx.user_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+        if notified > 0 {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(done, "drain worker should have created a notification");
+
+    // outbox row marked done
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_outbox WHERE tenant_id=$1 AND status='pending'",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, 0, "outbox should be drained");
+
+    // the user sees it in their inbox
+    let (st, list) = call(
+        &ctx.app,
+        "GET",
+        "/api/notifications",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "inbox: {list}");
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["type"] == "workflow.transitioned"));
 }
