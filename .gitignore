@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+# Un comment the next line if building a binary; keep for libraries
+# !Cargo.lock
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build / runtime artifacts
+dist/
+node_modules/
