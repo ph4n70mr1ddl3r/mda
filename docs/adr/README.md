@@ -20,6 +20,7 @@ decision and links back.
 | [0007](0007-job-queue-apalis.md) | Job queue: apalis (Postgres-backed) | Accepted |
 | [0008](0008-meta-model-fixed.md) | Meta-model: fixed, not self-hosting | Accepted |
 | [0009](0009-frontend-strategy-spike.md) | Frontend strategy: decide via Phase 0 spike | Accepted |
+| [0010](0010-graphql-first-class-runtime-api.md) | GraphQL as a first-class runtime data API | Accepted |
 
 ## Status legend
 `Proposed` → `Accepted` → `Deprecated` / `Superseded by ADR-NNNN`.

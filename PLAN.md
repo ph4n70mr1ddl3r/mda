@@ -252,12 +252,13 @@ Business rules, validations, workflow guards, report filters all need expression
 - **Option 1:** Embed a scripting language (`rhai` / Rune / Boa) — powerful, slower, sandbox risk.
 - **Option 2:** Build a small typed expression AST evaluator in Rust (like `eval` crates or custom).
 - **Recommendation:** **Custom JSON AST evaluator** stored as JSONB, evaluated by a Rust interpreter. Safe, serializable, fast, testable. Add a `rune` escape hatch later for power users behind a capability flag.
+- **Safety (bounded evaluation — REVIEW.md U6):** every evaluation is capped — max AST depth, max node count, max function-call budget, and a step counter; exceeding any returns a bounded error (never a panic/hang). Pure functions by default; any I/O-capable function is individually allowlisted and timeout-bounded. Together with the rule-recursion budget (§5.9.5) this prevents a pathological or malicious expression from DoSing the system.
 
 ### 5.3 Hot reload of metadata
 Metadata changes must take effect without restart:
 - Cache metadata in a read-through in-memory cache (`moka`).
-- Invalidate via PostgreSQL `LISTEN/NOTIFY` on a `meta_changed` channel, or Redis pub/sub.
-- Version-stamp every metadata read so runtime can detect staleness.
+- Invalidate via PostgreSQL `LISTEN/NOTIFY` on a `meta_changed` channel (or Redis pub/sub). **`LISTEN/NOTIFY` is the fast path, not the only path** — it is lossy across reconnects/replicas, so each instance also runs a low-frequency **version-stamp poll** (compare the cached model version to `md_active_version`) as a self-healing fallback (REVIEW.md §5.3).
+- Every metadata read carries a version stamp so the runtime detects staleness and re-reads on mismatch.
 
 ### 5.4 Multi-tenancy
 - **Strategy A:** `tenant_id` column on every table + app-enforced filter. Simple, shared-everything.
@@ -268,8 +269,8 @@ Metadata changes must take effect without restart:
 Fully specified in **§5.8** (draft → validate → publish → activate lifecycle) and **§4.8** (lifecycle tables). In short: metadata is deployable as JSON bundles (Studio export/import) across dev → staging → prod; publish classifies changes as additive / transforming / two-phase destructive and runs a validated migration against live data.
 
 ### 5.6 Extensibility model
-- **Field types:** registry of built-in types + a Rust trait `FieldType` that plugins implement (compiled into the binary via a registry pattern; dynamic loading via `wasmtime` later).
-- **Functions:** the expression DSL calls registered Rust functions (e.g., `now()`, `sum()`, custom).
+- **Field types:** registry of built-in types + a Rust trait `FieldType`; built-ins compile into the binary, and **custom / tenant-specific field types, expression functions, and rule actions run as sandboxed `wasmtime` modules** — a first-class extensibility boundary that lets customers ship logic safely without forking the platform (REVIEW.md §5.6).
+- **Functions:** the expression DSL calls registered Rust functions (e.g., `now()`, `sum()`, custom); custom functions are also deliverable as `wasmtime` modules.
 - **Connectors:** trait `Connector` with HTTP/DB/file/generic implementations.
 - **Webhooks:** outbound HTTP on domain events.
 
@@ -583,6 +584,28 @@ Impls: `LocalBlobStore` (dev/small), `S3BlobStore` (S3 / MinIO / GCS-via-S3). Co
 - **Thumbnails/previews** generated async for images/PDFs.
 - **Cleanup:** when an attachment field is cleared or the record is hard-deleted (ADR-0006), `sys_blob_ref` back-references drive an orphan-cleanup job that deletes blobs with zero refs. MIME allowlist + per-file/per-record size limits enforced on upload.
 
+### 5.15 Retention of high-volume append-only tables
+
+(Resolves REVIEW.md **U4**.) `sys_audit_log`, `sys_event_log`, and `sys_outbox` are append-only and grow unbounded; without a strategy the DB balloons and queries slow.
+
+- **Time partitioning** (Postgres declarative partitioning, weekly/monthly) so old data is dropped via cheap `DROP TABLE` / `DETACH` instead of slow `DELETE`.
+- **Retention per table** (configurable per tenant): `sys_audit_log` → 1–7 yr (compliance); `sys_event_log` → 7–30 days (only needed for real-time replay, §5.10); `sys_outbox` → purge on successful delivery (keep DLQ entries longer).
+- **Archival:** expired audit partitions export to cold storage (S3 / Parquet) before drop, satisfying retention beyond the hot DB.
+- **Sampling** (optional, per entity): full audit for sensitive entities, sampled for very-high-volume ones.
+- A partition-management **apalis** job (ADR-0007) pre-creates future partitions and drops/archives expired ones on schedule.
+
+### 5.16 Threat model: untrusted metadata
+
+(Addresses REVIEW.md **§11** correction.) In this system, *metadata is user-authored logic* — Studio users write rules, expressions, field definitions, report queries, and workflow guards that the engine executes at runtime. That is a unique attack surface vs. a normal app, and it is treated explicitly.
+
+- **Governing principle:** the runtime only ever acts on metadata it **loaded from the DB after authz** — never on logic a client sends in a request payload. Clients send *data*; the server decides *logic* by reading trusted, published metadata (ties to the draft→publish gate, §5.8).
+- **Resource exhaustion** — a hostile expression/query → bounded evaluation (§5.2) + rule recursion budget (§5.9.5); list queries are paged and cost-limited.
+- **Data exfiltration** — expressions/queries run under the caller's AuthZ (object/field/record, §5.11) in *every* context (rule, report, workflow, API). No path bypasses field-level visibility.
+- **Privilege escalation via metadata** — editing/publishing metadata requires an elevated Studio role; runtime reads cannot mutate the model.
+- **Injection** — all SQL is parameterized; the query builder emits bound parameters, never string-interpolated values; the DSL cannot emit raw SQL.
+- **Cross-tenant leakage** — Postgres RLS (§5.4) + `tenant_id` in every index + automated isolation tests (§11).
+- **Sandboxed extensions** — `wasmtime` modules (§5.6) are capability-scoped and resource-limited; they reach the DB/network/filesystem only through explicitly granted, audited host functions.
+
 ---
 
 ## 6. Component Breakdown (crate / module level)
@@ -622,7 +645,7 @@ mda/
 - **mda-rules** — Triggers: before/after CRUD, on-event, on-schedule. Sequence: match → condition → action. Actions: set field, call function, fire event, send webhook, enqueue.
 - **mda-reports** — Build dataset (run parameterized query against data layer), apply grouping/aggregation, render to table/chart/pdf/xlsx.
 - **mda-integration** — `Connector` trait; flows pull/push records with field mapping; scheduled via job queue; idempotency keys.
-- **mda-api** — REST (OpenAPI via `utoipa`) + optional GraphQL (async-graphql). Routes map to service layer. Studio API (CRUD on metadata) vs Runtime API (CRUD on business data) — same engine, different authz.
+- **mda-api** — **REST** (OpenAPI via `utoipa`) for Studio, auth, and simple CRUD; **GraphQL** (`async-graphql`) as a first-class runtime data API (ADR-0010) for relationship traversal. Routes map to the service layer; same engine, different authz per surface.
 - **mda-server** — `main.rs`: load config, init DB pool, warm metadata cache, mount routers, start workers, graceful shutdown.
 
 ---
@@ -670,6 +693,13 @@ GET    /api/dashboards/:id                              # dashboard widgets + da
 POST   /api/auth/login      POST /api/auth/refresh
 GET    /api/auth/me
 ```
+
+### GraphQL (first-class runtime API, ADR-0010)
+For a dynamic, relationship-rich data model, GraphQL is a strong fit — clients traverse references (`customer { invoices { lineItems { } } }`) and fetch exactly what they need. It runs alongside REST (which stays for Studio, auth, and SSE):
+```
+POST /api/graphql      # schema generated from metadata; authz + field-level security apply per field
+```
+The schema is derived from the active model and re-generated on publish (§5.8). **Prototype in Phase 2** alongside the dynamic data layer; enforce query depth/cost limits to deny expensive nested queries.
 
 > OpenAPI spec auto-generated; an external SDK (TypeScript/Rust/Python) can be derived from it. The dynamic data API is discoverable via `/api/schema/:entity` (JSON Schema derived from metadata).
 
@@ -806,7 +836,8 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 | Unit | `cargo test` | Expression evaluator, query builder, state machine |
 | Integration | `cargo test` + testcontainers (real Postgres/Redis) | Metadata CRUD, dynamic data, rules, workflows |
 | E2E | `cargo test` HTTP + (optional) Playwright for UI | Full vertical: define model → use it |
-| Property | `proptest` | Expression eval invariants, query builder |
+| Property | `proptest` + **golden corpus** | Expression-eval + query-builder invariants; a curated corpus of golden expressions/queries (REVIEW.md §10) |
+| Fuzz | `cargo-fuzz` | **Expression evaluator + dynamic query builder** — the two highest-blast-radius components (a bug affects every entity) |
 | Load | `k6`/`oha`/`wrk`/`vegeta` | API throughput, metadata cache |
 | Metadata regression | Snapshot golden tests | Model export format stability |
 
@@ -820,10 +851,12 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 |---|---|---|
 | Expression DSL becomes a Turing-tarpit | High | Keep it minimal & declarative; Rune escape hatch for real scripting |
 | Dynamic data query performance | High | JSONB GIN indexes early; promote hot fields to columns (hybrid); benchmark in Phase 2 |
+| Audit/event-log growth | Medium | Time-partitioned append-only tables + per-table retention + cold-storage archival (§5.15) |
 | Metadata schema churn breaks stored models | High | Strict additive versioning; migration jobs; golden export tests |
 | Studio UI scope explosion | High | Ship Phase 8 in slices; allow JSON import as the "power user" fallback |
 | All-Rust frontend ecosystem gaps | Medium | Keep Runtime UI logic-focused; fall back to React for Studio if needed |
 | Security holes in dynamic API | High | RLS + layered authz + audit + pen-test; never trust client-supplied metadata |
+| Untrusted metadata (client-authored logic) | High | Runtime executes only DB-loaded, authz-gated metadata (§5.16); bounded eval (§5.2); parameterized SQL; sandboxed `wasmtime` extensions |
 | Multi-tenant data leak | Critical | Tenant_id in every index + RLS + automated tenant-isolation tests |
 | Scope creep ("build Salesforce") | Critical | Ruthless MVP per phase; defer everything not in the roadmap |
 
