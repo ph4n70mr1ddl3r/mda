@@ -5,8 +5,8 @@ Everything — entities, forms, screens, reports, workflows, rules, integrations
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
 > **Status:** Architecture & planning → **Phases 0–3 implemented** (foundation +
-> metadata engine + dynamic data layer + security/auth: JWT login, object/field/
-> record security, audit).
+> metadata engine + dynamic data layer + security/auth + rules: bounded expression
+> DSL, set-field rules, calculated fields).
 
 ## Quick start (Phase 0)
 
@@ -80,7 +80,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (17 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL).
-- [`docs/PHASE0.md`](./docs/PHASE0.md) · [`docs/PHASE1.md`](./docs/PHASE1.md) · [`docs/PHASE2.md`](./docs/PHASE2.md) · [`docs/PHASE3.md`](./docs/PHASE3.md) — phase status & handoffs.
+- [`docs/PHASE0.md`](./docs/PHASE0.md) · [`docs/PHASE1.md`](./docs/PHASE1.md) · [`docs/PHASE2.md`](./docs/PHASE2.md) · [`docs/PHASE3.md`](./docs/PHASE3.md) · [`docs/PHASE4.md`](./docs/PHASE4.md) — phase status & handoffs.
 
 ## Roadmap (summary)
 

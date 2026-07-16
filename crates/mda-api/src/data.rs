@@ -64,9 +64,14 @@ async fn create_record(
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     authorize(&user, &entity, "create")?;
     let def = entity_def(&st, user.tenant_id, &entity).await?;
-    let map = into_object(body)?;
-    assert_writable(&user, &entity, &def, &map)?;
-    let rec = mda_data::create(&st.pool, user.tenant_id, &def, map, user.user_id).await?;
+    let mut ctx = into_object(body)?;
+    assert_writable(&user, &entity, &def, &ctx)?;
+    // Phase 4: fire set-field rules + calculated fields (synchronous, in-write).
+    let reg = mda_rules::Registry::new();
+    let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
+    mda_rules::fire(&rules, "after_create", &mut ctx, &reg)?;
+    mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
+    let rec = mda_data::create(&st.pool, user.tenant_id, &def, ctx, user.user_id).await?;
     audit(
         &st,
         user.tenant_id,
@@ -106,10 +111,10 @@ async fn update_record(
     authorize(&user, &entity, "update")?;
     let expected = version_from_headers(&headers)?;
     let def = entity_def(&st, user.tenant_id, &entity).await?;
-    let map = into_object(body)?;
-    assert_writable(&user, &entity, &def, &map)?;
+    let mut ctx = into_object(body)?;
+    assert_writable(&user, &entity, &def, &ctx)?;
     let scope = scope_for(&st, &user, &entity).await?;
-    // before-image for audit (write was authorized above via RBAC + write scope below)
+    // before-image for audit + condition context (existing merged with the patch).
     let before = mda_data::read(
         &st.pool,
         user.tenant_id,
@@ -119,7 +124,25 @@ async fn update_record(
     )
     .await
     .ok();
-    let after = mda_data::update(&st.pool, user.tenant_id, &def, id, expected, map, &scope).await?;
+    if let Some(b) = &before {
+        if let Some(obj) = b.as_object() {
+            for (k, v) in obj {
+                if matches!(
+                    k.as_str(),
+                    "id" | "version" | "owner_id" | "state" | "created_at" | "updated_at"
+                ) {
+                    continue;
+                }
+                ctx.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    // Phase 4: fire set-field rules + calculated fields.
+    let reg = mda_rules::Registry::new();
+    let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
+    mda_rules::fire(&rules, "after_update", &mut ctx, &reg)?;
+    mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
+    let after = mda_data::update(&st.pool, user.tenant_id, &def, id, expected, ctx, &scope).await?;
     audit(
         &st,
         user.tenant_id,

@@ -994,6 +994,7 @@ dependencies = [
  "mda-core",
  "mda-data",
  "mda-meta",
+ "mda-rules",
  "mda-security",
  "serde",
  "serde_json",
@@ -1029,6 +1030,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mda-expression"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "mda-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mda-meta"
 version = "0.1.0"
 dependencies = [
@@ -1041,6 +1052,19 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "mda-rules"
+version = "0.1.0"
+dependencies = [
+ "mda-core",
+ "mda-expression",
+ "mda-meta",
+ "serde",
+ "serde_json",
+ "sqlx",
  "uuid",
 ]
 

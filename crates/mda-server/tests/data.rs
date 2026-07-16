@@ -498,3 +498,76 @@ async fn auth_rbac_and_record_level_enforced() {
         "private record invisible to non-owner: {got}"
     );
 }
+
+#[tokio::test]
+async fn rules_and_calculated_fields_fire() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    // Ticket: qty, price, total(formula = qty*price), status, closed_at
+    let model = json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null,
+            "name": "Ticket", "table_name": format!("ticket_{}", Uuid::new_v4().simple()),
+            "label": "Ticket", "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(), "name":"status","label":"Status","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"closed_at","label":"Closed At","field_type":"datetime","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"qty","label":"Qty","field_type":"integer","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"price","label":"Price","field_type":"decimal","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}},
+                {"id": Uuid::new_v4(), "name":"total","label":"Total","field_type":"decimal","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,
+                 "config":{"precision":12,"scale":2,"formula":{"op":"Arith","kind":"mul","lhs":{"op":"Field","name":"qty"},"rhs":{"op":"Field","name":"price"}}}}
+            ],
+            "relationships": []
+        }]
+    });
+    publish(&ctx, model).await;
+
+    // create -> calculated field total = qty*price
+    let (st, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Ticket",
+        &ctx.token,
+        Some(json!({"status":"Open","qty":2,"price":10.0}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{rec}");
+    assert_eq!(
+        rec["total"].as_f64().unwrap(),
+        20.0,
+        "calculated field: {rec}"
+    );
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // install a rule: when status becomes Closed, set closed_at = now()
+    sqlx::query(
+        "INSERT INTO meta.md_rule (tenant_id, entity, event, condition, action_type, action_field, action_value)
+         VALUES ($1,'Ticket','after_update',
+            '{\"op\":\"Cmp\",\"kind\":\"eq\",\"lhs\":{\"op\":\"Field\",\"name\":\"status\"},\"rhs\":{\"op\":\"Lit\",\"value\":\"Closed\"}}'::jsonb,
+            'set_field','closed_at','{\"op\":\"Call\",\"name\":\"now\",\"args\":[]}'::jsonb)",
+    )
+    .bind(ctx.tenant)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+
+    // update status -> Closed => rule fires, closed_at set
+    let (st, upd) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Ticket/{id}"),
+        &ctx.token,
+        Some(json!({"status":"Closed"}).to_string()),
+        Some(1),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{upd}");
+    assert!(
+        upd["closed_at"].as_str().is_some_and(|s| !s.is_empty()),
+        "closed_at should be set: {upd}"
+    );
+}
