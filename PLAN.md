@@ -187,6 +187,12 @@ sys_lock         - soft advisory record checkout (owner, ttl, heartbeat) for UX 
 sys_setting      - key/value config
 sys_translation  - i18n strings (metadata & data)
 sys_version      - metadata versioning / migration tracking
+sys_impex_job    - bulk import/export job: (type, entity, format, mode, mapping JSONB,
+                   status, stats JSONB, source/result blob refs, created_by, timestamps) §5.13
+sys_impex_row    - per-row import result (resumability + error report): (job_id, row_no, status, action, record_id, errors)
+sys_blob         - attachment storage metadata: (id, storage, storage_key, filename, mime, size, checksum,
+                   owner_id, scan_status, created_at) — bytes live in the BlobStore, not here. §5.14
+sys_blob_ref     - back-references for orphan cleanup / dedup: (blob_id, entity, record_id, field)
 ```
 
 ### 4.8 Model lifecycle & versioning
@@ -528,6 +534,55 @@ sys_event_log
 
 **Consequence:** "no edit the editor" — the Studio cannot redefine the platform's own definition tables. Custom entity/field types remain extensible via the registry + `wasmtime` (§5.6). Revisit only if a use case demands user-defined meta-types.
 
+### 5.13 Bulk data import/export (record level)
+
+(Resolves REVIEW.md **U1**.) A day-one enterprise need: move many records in/out via CSV/XLSX/JSON, validated and safe. The engine **reuses the runtime write pipeline** — an import is just batched, mapped writes, so an imported row is indistinguishable from one typed by hand (no second set of rules to drift).
+
+**Import flow:**
+1. **Upload** the source file → stored as a blob (§5.14); create a `sys_impex_job` (status=pending).
+2. **Map** source columns → entity fields (auto-match by name; manual override). For reference fields, choose the **lookup field** on the target entity (e.g. resolve Customer by `name`). Specify the **key field** for update/upsert matching (must be unique).
+3. **Validate (dry-run):** parse + validate every row against field types, required, uniqueness, **FK existence** (resolved via the lookup), and **authz** (object / field / record — can the user create/update this row and write these fields, §5.11). Produce a report: N to create, N to update, N errors (row + field + message). **Nothing is written.**
+4. **Commit** — two policies: *all-or-nothing* (one transaction; any error aborts) or *best-effort* (batched transactions, e.g. 500 rows; valid rows commit, errors reported per row in `sys_impex_row`).
+5. **Result:** downloadable error report (CSV) + summary stats; successful rows are audited like any write (§4.7) and appear immediately (real-time, §5.10).
+
+**Modes:** `create` | `update` | `upsert` (match by key field). Owner/team default to the importing user (or a mapped column).
+
+**Scale & reliability:** large files run as an **apalis job** (ADR-0007), streaming + batched, with progress and **resumable** per-row results. Idempotent on job id; re-running a failed import resumes from the last committed batch.
+
+**Export:** from any list/view (current filter) or ad-hoc query → CSV/XLSX/JSON, field-selectable, streaming; respects **field-level read** security (can't export fields you can't read); reference fields export display value or id (configurable). Large exports run as a job with a download link.
+
+### 5.14 Attachments & blob storage
+
+(Resolves REVIEW.md **U2**.) Records carry file attachments (a signed PDF on a Customer). Bytes never live in Postgres; a storage abstraction holds them and metadata is tracked in `sys_blob`.
+
+**Field type:** `attachment` — value is a single `blob_id`, or a JSONB array for multi-file. Registered like any field type (§5.6); the `biz` column holds the id(s), the bytes are external.
+
+**Storage abstraction:**
+
+```
+trait BlobStore: Send + Sync {
+    async fn put(&self, key, stream, meta) -> Result<()>;
+    async fn get(&self, key) -> Result<ByteStream>;
+    async fn signed_upload_url(&self, key, ttl) -> Result<Url>;   // S3 presign
+    async fn signed_download_url(&self, key, ttl) -> Result<Url>;
+    async fn delete(&self, key) -> Result<()>;
+}
+```
+
+Impls: `LocalBlobStore` (dev/small), `S3BlobStore` (S3 / MinIO / GCS-via-S3). Configurable per deployment.
+
+**Upload:** client requests a **presigned upload URL** (or proxies via the API for local) → uploads bytes directly to the store → the API records `sys_blob` (mime, size, **sha256 checksum**, owner) → the attachment field stores the blob id. Multipart/resumable for large files.
+
+**Download:** the API issues a **short-TTL signed URL** (or streams bytes with an authz check). The signed URL is bound to the user/record so a leaked URL can't bypass authz.
+
+**Security:** an attachment inherits its record's access — read/download only if the user can read the record **and** the field (field-level security, §5.11); upload requires write on the field.
+
+**Integrity & lifecycle:**
+- **Dedup** by checksum (two references to one file share a single blob).
+- **Virus scan** hook (async, e.g. ClamAV): block download until `scan_status=clean`; quarantine infected.
+- **Thumbnails/previews** generated async for images/PDFs.
+- **Cleanup:** when an attachment field is cleared or the record is hard-deleted (ADR-0006), `sys_blob_ref` back-references drive an orphan-cleanup job that deletes blobs with zero refs. MIME allowlist + per-file/per-record size limits enforced on upload.
+
 ---
 
 ## 6. Component Breakdown (crate / module level)
@@ -725,7 +780,13 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Webhooks (outbound) + inbound webhook receiver
 - **Deliverable:** Sync Customer records to/from an external REST API on a schedule.
 
-### Phase 10 — Hardening, Scale, Polish (Weeks 34–40)
+### Phase 10 — Bulk Data Import/Export & Attachments (Weeks 34–37)
+- **Bulk import/export (§5.13):** CSV/XLSX/JSON; field mapping; create/update/upsert by key; **dry-run** with validation report; all-or-nothing or best-effort; batched transactions for large files; runs as an `apalis` job with progress + resumable per-row results
+- **Security:** reuses the full write pipeline (object + field + record authz, §5.11) — can't import into fields/rows you can't write; export respects field-level read
+- **Attachments (§5.14):** `attachment` field type; `BlobStore` trait (local + S3); `sys_blob` metadata; presigned upload/download URLs; async virus-scan hook; checksum dedup; thumbnails; cleanup on record delete (ADR-0006)
+- **Deliverable:** Upload a CSV of Customers → map fields → dry-run → commit (with an error report); attach a PDF to a Customer and download it via a short-TTL signed URL.
+
+### Phase 11 — Hardening, Scale, Polish (Weeks 37–43)
 - Observability (tracing/OpenTelemetry dashboards), load testing
 - Metadata cache tuning, query optimization, materialized views for reports
 - i18n (`sys_translation`), theming

@@ -15,6 +15,8 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
   - §5.9 — concurrency & transactional semantics (OCC + transactional outbox)
   - §5.10 — real-time UI channel (SSE over the event log)
   - §5.11 — multi-grained authorization (tenant / object / record / field / action / value)
+  - §5.13 — bulk data import/export (record level)
+  - §5.14 — attachments & blob storage
 - [`REVIEW.md`](./REVIEW.md) — critical review of the plan (gaps resolved in v0.2).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (storage, lifecycle, concurrency, real-time, authz, deletion, job queue, meta-model, frontend).
