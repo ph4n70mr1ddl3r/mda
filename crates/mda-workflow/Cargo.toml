@@ -1,5 +1,5 @@
 [package]
-name = "mda-api"
+name = "mda-workflow"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -8,14 +8,11 @@ version.workspace = true
 mda-core = { workspace = true }
 mda-meta = { workspace = true }
 mda-data = { workspace = true }
-mda-security = { workspace = true }
+mda-expression = { workspace = true }
 mda-rules = { workspace = true }
-mda-workflow = { workspace = true }
 sqlx = { workspace = true }
-axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-async-trait = { workspace = true }
+anyhow = { workspace = true }

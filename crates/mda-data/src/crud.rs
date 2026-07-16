@@ -73,6 +73,7 @@ pub struct ListResult {
 enum Bind {
     Json(Value),
     Uuid(Option<Uuid>),
+    Text(String),
 }
 
 enum ListBind {
@@ -211,6 +212,7 @@ pub async fn read(
 
 // ===== update (OCC + write scope) =====
 
+#[allow(clippy::too_many_arguments)]
 pub async fn update(
     pool: &PgPool,
     tenant: Uuid,
@@ -219,6 +221,7 @@ pub async fn update(
     expected_version: i64,
     body: Map<String, Value>,
     scope: &RecordScope,
+    new_state: Option<String>,
 ) -> Result<Value> {
     ensure_active(def)?;
     validate_known_keys(def, &body)?;
@@ -236,6 +239,10 @@ pub async fn update(
 
     let mut binds: Vec<Bind> = Vec::new();
     let mut sets: Vec<String> = vec!["version = version + 1".into(), "updated_at = now()".into()];
+    if let Some(st) = new_state {
+        sets.push(format!("state = ${}", binds.len() + 1));
+        binds.push(Bind::Text(st));
+    }
     if !attributes_merge.is_empty() {
         sets.push(format!("attributes = attributes || ${}", binds.len() + 1));
         binds.push(Bind::Json(Value::Object(attributes_merge)));
@@ -268,6 +275,7 @@ pub async fn update(
         q = match b {
             Bind::Json(v) => q.bind(v),
             Bind::Uuid(v) => q.bind(v),
+            Bind::Text(v) => q.bind(v),
         };
     }
     q = q.bind(id).bind(tenant).bind(expected_version);

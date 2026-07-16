@@ -25,6 +25,10 @@ pub fn routes() -> Router<AppState> {
             "/api/data/:entity/:id",
             get(read_record).patch(update_record).delete(delete_record),
         )
+        .route(
+            "/api/data/:entity/:id/:transition",
+            axum::routing::post(transition_record),
+        )
 }
 
 #[derive(Deserialize, Default)]
@@ -142,7 +146,17 @@ async fn update_record(
     let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
     mda_rules::fire(&rules, "after_update", &mut ctx, &reg)?;
     mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
-    let after = mda_data::update(&st.pool, user.tenant_id, &def, id, expected, ctx, &scope).await?;
+    let after = mda_data::update(
+        &st.pool,
+        user.tenant_id,
+        &def,
+        id,
+        expected,
+        ctx,
+        &scope,
+        None,
+    )
+    .await?;
     audit(
         &st,
         user.tenant_id,
@@ -187,6 +201,44 @@ async fn delete_record(
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /api/data/:entity/:id/:transition` — run a workflow transition
+/// (PLAN §7). `If-Match` carries the record version (OCC).
+async fn transition_record(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((entity, id, transition)): Path<(String, Uuid, String)>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    authorize(&user, &entity, "update")?;
+    let expected = version_from_headers(&headers)?;
+    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    let scope = scope_for(&st, &user, &entity).await?;
+    let after = mda_workflow::run_transition(
+        &st.pool,
+        user.tenant_id,
+        user.user_id,
+        &def,
+        &entity,
+        id,
+        &transition,
+        expected,
+        &scope,
+    )
+    .await?;
+    audit(
+        &st,
+        user.tenant_id,
+        user.user_id,
+        &entity,
+        Some(id),
+        "update",
+        None,
+        Some(after.clone()),
+    )
+    .await;
+    Ok(Json(project(&user, &entity, &def, after)))
 }
 
 // ===== security helpers =====

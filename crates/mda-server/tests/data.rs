@@ -571,3 +571,149 @@ async fn rules_and_calculated_fields_fire() {
         "closed_at should be set: {upd}"
     );
 }
+
+#[tokio::test]
+async fn workflow_state_machine_runs() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    let model = json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null,
+            "name": "Invoice", "table_name": format!("inv_{}", Uuid::new_v4().simple()),
+            "label": "Invoice", "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}},
+                {"id": Uuid::new_v4(), "name":"approved_at","label":"Approved At","field_type":"datetime","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+            ],
+            "relationships": []
+        }]
+    });
+    publish(&ctx, model).await;
+
+    // author the workflow via metadata (Studio is Phase 8)
+    let (wf_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO meta.md_workflow (tenant_id, entity, name) VALUES ($1,'Invoice','approval') RETURNING id",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    for s in ["active", "Submitted", "Approved"] {
+        sqlx::query("INSERT INTO meta.md_workflow_state (workflow_id, name) VALUES ($1,$2)")
+            .bind(wf_id)
+            .bind(s)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+    }
+    // submit: active -> Submitted (creates an approval task)
+    sqlx::query("INSERT INTO meta.md_workflow_transition (workflow_id, name, from_state, to_state, creates_task) VALUES ($1,'submit','active','Submitted',TRUE)")
+        .bind(wf_id).execute(&ctx.pool).await.unwrap();
+    // approve: Submitted -> Approved (guard amount>0; action approved_at=now())
+    sqlx::query(
+        "INSERT INTO meta.md_workflow_transition (workflow_id, name, from_state, to_state, guard, actions)
+         VALUES ($1,'approve','Submitted','Approved',
+            '{\"op\":\"Cmp\",\"kind\":\"gt\",\"lhs\":{\"op\":\"Field\",\"name\":\"amount\"},\"rhs\":{\"op\":\"Lit\",\"value\":0}}'::jsonb,
+            '[{\"field\":\"approved_at\",\"value\":{\"op\":\"Call\",\"name\":\"now\",\"args\":[]}}]'::jsonb)",
+    )
+    .bind(wf_id).execute(&ctx.pool).await.unwrap();
+
+    // create an Invoice (state defaults to 'active', version 1)
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Invoice",
+        &ctx.token,
+        Some(json!({"amount":100.0}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(rec["state"], "active");
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // submit -> Submitted, an approval task is created
+    let (st, rec) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/data/Invoice/{id}/submit"),
+        &ctx.token,
+        None,
+        Some(1),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "submit: {rec}");
+    assert_eq!(rec["state"], "Submitted");
+    assert_eq!(rec["version"], 2);
+    let tasks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM meta.md_workflow_task WHERE tenant_id=$1 AND record_id=$2",
+    )
+    .bind(ctx.tenant)
+    .bind(Uuid::parse_str(&id).unwrap())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(tasks, 1, "approval task should be created");
+
+    // approve -> Approved, approved_at set, outbox row written
+    let (st, rec) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/data/Invoice/{id}/approve"),
+        &ctx.token,
+        None,
+        Some(2),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "approve: {rec}");
+    assert_eq!(rec["state"], "Approved");
+    assert!(rec["approved_at"].as_str().is_some_and(|s| !s.is_empty()));
+    let outbox: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_outbox WHERE tenant_id=$1 AND kind='workflow.transitioned'",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert!(
+        outbox >= 2,
+        "expected outbox events for submit+approve, got {outbox}"
+    );
+
+    // guard rejection: a zero-amount invoice cannot be approved (guard amount>0)
+    let (_, rec2) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Invoice",
+        &ctx.token,
+        Some(json!({"amount":0.0}).to_string()),
+        None,
+    )
+    .await;
+    let id2 = rec2["id"].as_str().unwrap().to_string();
+    call(
+        &ctx.app,
+        "POST",
+        &format!("/api/data/Invoice/{id2}/submit"),
+        &ctx.token,
+        None,
+        Some(1),
+    )
+    .await;
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/data/Invoice/{id2}/approve"),
+        &ctx.token,
+        None,
+        Some(2),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "guard amount>0 should reject approve"
+    );
+}
