@@ -933,3 +933,66 @@ async fn outbox_drains_into_notifications() {
         .iter()
         .any(|n| n["type"] == "workflow.transitioned"));
 }
+
+#[tokio::test]
+async fn attachments_upload_download_and_field() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    // upload (raw bytes + x-filename)
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/attachments")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", ctx.token),
+        )
+        .header("x-filename", "note.txt")
+        .header("content-type", "text/plain")
+        .body(Body::from("hello attachment"))
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let blob_id: Uuid = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // download (owner = actor)
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/attachments/{blob_id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "download");
+
+    // an attachment field can store the blob id
+    let model = json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null, "name": "Doc",
+            "table_name": format!("doc_{}", Uuid::new_v4().simple()), "label": "Doc", "description": null,
+            "fields": [{"id": Uuid::new_v4(), "name":"file","label":"File","field_type":"attachment","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}],
+            "relationships": []
+        }]
+    });
+    publish(&ctx, model).await;
+    let (st, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Doc",
+        &ctx.token,
+        Some(json!({"file": blob_id.to_string()}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "create with attachment: {rec}");
+    assert_eq!(rec["file"], blob_id.to_string());
+}

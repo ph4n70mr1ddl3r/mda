@@ -11,7 +11,7 @@ use serde_json::Value;
 /// Map a metadata field type to its SQL column type.
 pub fn sql_type(field_type: &str, config: &Value) -> Result<String> {
     Ok(match field_type {
-        "string" | "text" | "enum" => "TEXT".to_string(),
+        "string" | "text" | "enum" | "attachment" => "TEXT".to_string(),
         "integer" | "auto_number" => "BIGINT".to_string(),
         "decimal" => {
             let p = config

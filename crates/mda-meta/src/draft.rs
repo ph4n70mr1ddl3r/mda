@@ -25,6 +25,7 @@ pub const KNOWN_FIELD_TYPES: &[&str] = &[
     "reference",
     "json",
     "auto_number",
+    "attachment",
 ];
 
 /// The whole draft model — the unit a draft stores and a bundle transports.

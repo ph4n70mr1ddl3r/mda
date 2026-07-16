@@ -15,7 +15,7 @@ pub fn coerce(field_type: &str, value: Option<Value>) -> Result<Option<Value>> {
         return Ok(None);
     }
     Ok(Some(match field_type {
-        "string" | "text" | "enum" => as_string(&v)?,
+        "string" | "text" | "enum" | "attachment" => as_string(&v)?,
         "integer" | "auto_number" => Value::from(as_i64(&v)?),
         "decimal" | "money" => as_f64(&v)?.into(),
         "bool" => Value::Bool(as_bool(&v)?),

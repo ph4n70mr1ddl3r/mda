@@ -12,6 +12,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 
 pub mod auth;
+pub mod blobs;
 pub mod data;
 pub mod error;
 pub mod extract;
@@ -39,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .merge(data::routes())
         .merge(reports::routes())
         .merge(notifications::routes())
+        .merge(blobs::routes())
         .with_state(state)
 }
 
