@@ -90,7 +90,7 @@ The database holds **two distinct models**:
 | AuthN | `jsonwebtoken`, `argon2`, OAuth2 (`openidconnect`) | JWT + refresh tokens |
 | Serialization | `serde` + `serde_json` | Everywhere |
 | Validation | `validator` + custom expression engine | |
-| Async jobs | **`apalis`** (Postgres-backed) | Cron, retries, delayed, DLQ; drives scheduled reports, workflow timers, two-phase purge, and the outbox-drain worker (§5.9.4) |
+| Async jobs | **`apalis`** (Postgres-backed) | Cron, retries, delayed, DLQ; drives scheduled reports, workflow timers, two-phase purge, integration flows (§5.22), notification digests (§5.18), sharing reshare jobs (ADR-0013), and the outbox-drain worker (§5.9.4) |
 | Search | PostgreSQL FTS → OpenSearch later | Start simple |
 | Frontend | **Leptos** (CSR/SSR, WASM) *or* React + TypeScript | See §8 |
 | Frontend build | Trunk (WASM) / Vite | |
@@ -781,9 +781,11 @@ mda/
 - **mda-workflow** — State machine: given entity + current state + transition request, evaluate guards (expressions), execute actions, persist new state, enqueue tasks/notifications.
 - **mda-rules** — Triggers: before/after CRUD, on-event, on-schedule. Sequence: match → condition → action. Actions: set field, call function, fire event, send webhook, enqueue.
 - **mda-reports** — Build dataset (run parameterized query against data layer), apply grouping/aggregation, render to table/chart/pdf/xlsx.
-- **mda-integration** — `Connector` trait; flows pull/push records with field mapping; scheduled via job queue; idempotency keys.
+- **mda-integration** — `Connector` trait (pluggable Format + Auth boundary, §5.6); hub-model inbound/outbound flows with expression-engine transform steps, the external-ID registry, and per-flow conflict policy (§5.22); scheduled via apalis; idempotent via external key + at-least-once outbox delivery.
 - **mda-api** — **REST** (OpenAPI via `utoipa`) for Studio, auth, and simple CRUD; **GraphQL** (`async-graphql`) as a first-class runtime data API (ADR-0010) for relationship traversal. Routes map to the service layer; same engine, different authz per surface.
 - **mda-server** — `main.rs`: load config, init DB pool, warm metadata cache, mount routers, start workers, graceful shutdown.
+
+> **The §5.18–5.22 subsystems are logical modules, crated on demand** (per the granularity note above), not new crates on day one: templating (§5.19) lives alongside the renderers in `mda-reports`; secrets (§5.20) are a `SecretStore` trait in `mda-core` with impls wired in `mda-server`; notification fan-out/digest workers (§5.18) and integration/webhook delivery workers (§5.21/§5.22) run in `mda-server`, with the in-app push path through `mda-api`'s SSE relay (§5.10).
 
 ---
 
@@ -1017,7 +1019,9 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 | Security holes in dynamic API | High | RLS + layered authz + audit + pen-test; never trust client-supplied metadata |
 | Untrusted metadata (client-authored logic) | High | Runtime executes only DB-loaded, authz-gated metadata (§5.16); bounded eval (§5.2); parameterized SQL; sandboxed `wasmtime` extensions |
 | Multi-tenant data leak | Critical | Tenant_id in every index + RLS + automated tenant-isolation tests |
-| Scope creep ("build Salesforce") | Critical | Ruthless MVP per phase; defer everything not in the roadmap |
+| Integration sync correctness / data drift | High | Hub-only model (no stateless brokering, §1/§5.22); external-ID registry for upsert/dedup (§5.22.3); declared conflict policy (§5.22.4); idempotent at-least-once delivery via outbox (§5.9.4) |
+| Secret leakage (connector credentials) | High | `SecretStore` keeps values out of Postgres, logs, events, and API responses (§5.20); server-side-only resolution under connector authz; rotation + access audit |
+| Scope creep ("build Salesforce") | Critical | Ruthless MVP per phase; defer everything not in the roadmap; iPaaS/broker is an explicit non-goal (§1) |
 
 ---
 
