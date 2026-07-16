@@ -105,8 +105,8 @@ async fn setup() -> Option<Ctx> {
     })
 }
 
-/// Create a user with the given permissions; return a bearer token.
-async fn limited_user(ctx: &Ctx, perms: &[(&str, &str)]) -> String {
+/// Create a user with the given permissions; return (token, user_id).
+async fn limited_user(ctx: &Ctx, perms: &[(&str, &str)]) -> (String, Uuid) {
     let (role_id,): (Uuid,) =
         sqlx::query_as("INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, $2) RETURNING id")
             .bind(ctx.tenant)
@@ -140,7 +140,7 @@ async fn limited_user(ctx: &Ctx, perms: &[(&str, &str)]) -> String {
         .execute(&ctx.pool)
         .await
         .unwrap();
-    ctx.jwt.issue_access(user_id, ctx.tenant).unwrap()
+    (ctx.jwt.issue_access(user_id, ctx.tenant).unwrap(), user_id)
 }
 
 async fn call(
@@ -440,7 +440,7 @@ async fn auth_rbac_and_record_level_enforced() {
     assert_eq!(st, StatusCode::UNAUTHORIZED);
 
     // a user with NO permissions -> 403 on create (RBAC)
-    let none_token = limited_user(&ctx, &[]).await;
+    let (none_token, _) = limited_user(&ctx, &[]).await;
     let (st, _) = call(
         &ctx.app,
         "POST",
@@ -453,7 +453,7 @@ async fn auth_rbac_and_record_level_enforced() {
     assert_eq!(st, StatusCode::FORBIDDEN, "RBAC should deny create");
 
     // a user with read+create but no delete -> 403 on delete (RBAC)
-    let rw_token = limited_user(&ctx, &[("Customer", "read"), ("Customer", "create")]).await;
+    let (rw_token, _) = limited_user(&ctx, &[("Customer", "read"), ("Customer", "create")]).await;
     let (st, rec) = call(
         &ctx.app,
         "POST",
@@ -484,7 +484,7 @@ async fn auth_rbac_and_record_level_enforced() {
     );
 
     // record-level ownership: another reader (read perm) cannot see rw_token's private record
-    let reader_token = limited_user(&ctx, &[("Customer", "read")]).await;
+    let (reader_token, _) = limited_user(&ctx, &[("Customer", "read")]).await;
     let (st, got) = call(
         &ctx.app,
         "GET",
@@ -995,4 +995,91 @@ async fn attachments_upload_download_and_field() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "create with attachment: {rec}");
     assert_eq!(rec["file"], blob_id.to_string());
+}
+
+#[tokio::test]
+async fn record_sharing_makes_private_visible() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+
+    // admin creates a private record (OWD default = private)
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Secret"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // a reader (read perm) cannot see it (404)
+    let (reader_token, reader_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &reader_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "private record invisible before share"
+    );
+    let (_, list) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer",
+        &reader_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list["total"], 0, "list should be empty for non-owner");
+
+    // admin shares with the reader
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"principal_id": reader_id, "access": "read"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "share");
+
+    // reader can now read + list it
+    let (st, got) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &reader_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "shared record visible after share: {got}"
+    );
+    assert_eq!(got["name"], "Secret");
+    let (_, list) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer",
+        &reader_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list["total"], 1, "shared record appears in list");
 }

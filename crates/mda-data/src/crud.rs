@@ -81,22 +81,33 @@ enum ListBind {
     Text(String),
 }
 
-/// When the scope does not grant broad read, restrict to the owner (returns the
-/// user to bind, or None for no filter).
-fn read_user(s: &RecordScope) -> Option<Uuid> {
+/// Read-visibility predicate (with a `{u}` placeholder for the user bind).
+/// owner OR public already handled by caller; here: owner OR shared-with-me.
+/// Returns None when the scope grants broad read (bypass / public_read).
+fn read_predicate(s: &RecordScope) -> Option<String> {
     if s.bypass || s.public_read {
         None
     } else {
-        Some(s.user_id)
+        Some(
+            "(t.owner_id = ${u} OR EXISTS (SELECT 1 FROM sec.sec_record_share rs \
+              WHERE rs.tenant_id = t.tenant_id AND rs.record_id = t.id \
+                AND rs.principal_id = ${u} AND rs.access IN ('read','write')))"
+                .to_string(),
+        )
     }
 }
 
-/// Owner unless public write / bypass.
-fn write_user(s: &RecordScope) -> Option<Uuid> {
+/// Write predicate: owner OR shared-with-write-access.
+fn write_predicate(s: &RecordScope) -> Option<String> {
     if s.bypass || s.public_write {
         None
     } else {
-        Some(s.user_id)
+        Some(
+            "(t.owner_id = ${u} OR EXISTS (SELECT 1 FROM sec.sec_record_share rs \
+              WHERE rs.tenant_id = t.tenant_id AND rs.record_id = t.id \
+                AND rs.principal_id = ${u} AND rs.access = 'write'))"
+                .to_string(),
+        )
     }
 }
 
@@ -189,19 +200,19 @@ pub async fn read(
     scope: &RecordScope,
 ) -> Result<Value> {
     ensure_active(def)?;
-    let ou = read_user(scope);
+    let rp = read_predicate(scope);
     let mut sql = format!(
         "SELECT to_jsonb(t.*) AS doc FROM biz.{} t WHERE id = $1 AND tenant_id = $2",
         def.entity.table_name
     );
-    if ou.is_some() {
-        sql.push_str(" AND owner_id = $3");
+    if let Some(ref p) = &rp {
+        sql.push_str(&format!(" AND {}", p.replace("{u}", "3")));
     }
     let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str())
         .bind(id)
         .bind(tenant);
-    if let Some(u) = ou {
-        q = q.bind(u);
+    if rp.is_some() {
+        q = q.bind(scope.user_id);
     }
     q.fetch_optional(pool)
         .await
@@ -254,14 +265,15 @@ pub async fn update(
             binds.push(Bind::Uuid(u));
         }
     }
-    let ou = write_user(scope);
+    let rp = write_predicate(scope);
     let mut where_parts = vec![
         format!("t.id = ${}", binds.len() + 1),
         format!("t.tenant_id = ${}", binds.len() + 2),
         format!("t.version = ${}", binds.len() + 3),
     ];
-    if ou.is_some() {
-        where_parts.push(format!("t.owner_id = ${}", binds.len() + 4));
+    if let Some(ref p) = &rp {
+        let idx = binds.len() + 4;
+        where_parts.push(p.replace("{u}", &idx.to_string()));
     }
     let sql = format!(
         "UPDATE biz.{} AS t SET {} WHERE {} RETURNING to_jsonb(t.*) AS doc",
@@ -279,8 +291,8 @@ pub async fn update(
         };
     }
     q = q.bind(id).bind(tenant).bind(expected_version);
-    if let Some(u) = ou {
-        q = q.bind(u);
+    if rp.is_some() {
+        q = q.bind(scope.user_id);
     }
 
     match q.fetch_optional(pool).await.map_err(Error::internal)? {
@@ -309,19 +321,19 @@ async fn distinguish_not_found_or_conflict(
     match exists {
         None => Err(Error::NotFound(format!("record {id}"))),
         Some(_) => {
-            let ou = write_user(scope);
+            let rp = write_predicate(scope);
             let mut sql = format!(
                 "SELECT 1 FROM biz.{} WHERE id = $1 AND tenant_id = $2",
                 def.entity.table_name
             );
-            if ou.is_some() {
-                sql.push_str(" AND owner_id = $3");
+            if let Some(ref p) = &rp {
+                sql.push_str(&format!(" AND {}", p.replace("{u}", "3")));
             }
             let mut q = sqlx::query_as::<_, (i32,)>(sql.as_str())
                 .bind(id)
                 .bind(tenant);
-            if let Some(u) = ou {
-                q = q.bind(u);
+            if rp.is_some() {
+                q = q.bind(scope.user_id);
             }
             let writable: Option<(i32,)> = q.fetch_optional(pool).await.map_err(Error::internal)?;
             if writable.is_none() {
@@ -345,17 +357,17 @@ pub async fn delete(
     scope: &RecordScope,
 ) -> Result<()> {
     ensure_active(def)?;
-    let ou = write_user(scope);
+    let rp = write_predicate(scope);
     let mut sql = format!(
         "DELETE FROM biz.{} WHERE id = $1 AND tenant_id = $2",
         def.entity.table_name
     );
-    if ou.is_some() {
-        sql.push_str(" AND owner_id = $3");
+    if let Some(ref p) = &rp {
+        sql.push_str(&format!(" AND {}", p.replace("{u}", "3")));
     }
     let mut q = sqlx::query(&sql).bind(id).bind(tenant);
-    if let Some(u) = ou {
-        q = q.bind(u);
+    if rp.is_some() {
+        q = q.bind(scope.user_id);
     }
     let res = q.execute(pool).await.map_err(Error::internal)?;
     if res.rows_affected() == 0 {
@@ -383,12 +395,12 @@ pub async fn list(
     let offset = (page - 1) * page_size;
 
     let (where_sql, mut binds) = build_list_where(def, tenant, &params.filters)?;
-    let ou = read_user(scope);
+    let rp = read_predicate(scope);
     let mut where_sql = where_sql;
-    if let Some(u) = ou {
+    if let Some(p) = rp {
         let n = binds.len() + 1;
-        where_sql.push_str(&format!(" AND owner_id = ${n}"));
-        binds.push(ListBind::Uuid(u));
+        where_sql.push_str(&format!(" AND {}", p.replace("{u}", &n.to_string())));
+        binds.push(ListBind::Uuid(scope.user_id));
     }
     let order_sql = build_order(def, &params.sort);
     let table = &def.entity.table_name;

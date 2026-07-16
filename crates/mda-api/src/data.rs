@@ -34,6 +34,7 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(import_records),
         )
         .route("/api/impex/:entity/export", get(export_records))
+        .route("/api/shares/:entity/:id", axum::routing::post(create_share))
 }
 
 #[derive(Deserialize, Default)]
@@ -514,4 +515,49 @@ async fn export_records(
         body,
     )
         .into_response())
+}
+
+/// `POST /api/shares/:entity/:id` — share a record with a user (manual share).
+/// Only the record owner (or superuser) may share.
+#[derive(serde::Deserialize)]
+struct ShareReq {
+    principal_id: Uuid,
+    access: String, // read | write
+}
+
+async fn create_share(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((entity, id)): Path<(String, Uuid)>,
+    Json(req): Json<ShareReq>,
+) -> ApiResult<StatusCode> {
+    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    let rec = mda_data::read(
+        &st.pool,
+        user.tenant_id,
+        &def,
+        id,
+        &mda_data::RecordScope::superuser(user.user_id),
+    )
+    .await?;
+    let owner = rec["owner_id"]
+        .as_str()
+        .and_then(|s| s.parse::<Uuid>().ok());
+    if !user.is_superuser && owner != Some(user.user_id) {
+        return Err(Error::Forbidden("only the owner can share".into()).into());
+    }
+    sqlx::query(
+        "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (tenant_id, record_id, principal_id) DO UPDATE SET access = $5",
+    )
+    .bind(user.tenant_id)
+    .bind(&entity)
+    .bind(id)
+    .bind(req.principal_id)
+    .bind(&req.access)
+    .execute(&st.pool)
+    .await
+    .map_err(Error::internal)?;
+    Ok(StatusCode::CREATED)
 }
