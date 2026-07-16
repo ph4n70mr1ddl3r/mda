@@ -18,6 +18,12 @@ impl From<Error> for ApiError {
     }
 }
 
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Convenience alias for handler return types.
 pub type ApiResult<T> = Result<T, ApiError>;
 

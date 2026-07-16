@@ -11,7 +11,7 @@ use mda_data::{self, ListParams, RecordScope};
 use mda_meta::{loader, EntityDefinition};
 use mda_security::{Access, Identity, Owd};
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -29,6 +29,11 @@ pub fn routes() -> Router<AppState> {
             "/api/data/:entity/:id/:transition",
             axum::routing::post(transition_record),
         )
+        .route(
+            "/api/impex/:entity/import",
+            axum::routing::post(import_records),
+        )
+        .route("/api/impex/:entity/export", get(export_records))
 }
 
 #[derive(Deserialize, Default)]
@@ -403,4 +408,110 @@ where
         }
     }
     de.deserialize_any(V)
+}
+
+// ===== bulk import / export (PLAN §5.13) =====
+
+/// `POST /api/impex/:entity/import` — best-effort import of a JSON array of
+/// records. Each row runs through the same pipeline as a hand-typed create
+/// (RBAC + FLS + rules + calculated fields + audit), so an imported row is
+/// indistinguishable from one typed by hand. Returns `{ imported, errors[] }`.
+async fn import_records(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(entity): Path<String>,
+    Json(rows): Json<Vec<Value>>,
+) -> ApiResult<Json<Value>> {
+    authorize(&user, &entity, "create")?;
+    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    let reg = mda_rules::Registry::new();
+    let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
+    let mut imported = 0u64;
+    let mut errors: Vec<Value> = Vec::new();
+    for (i, row) in rows.into_iter().enumerate() {
+        let map = match into_object(row) {
+            Ok(m) => m,
+            Err(e) => {
+                errors.push(json!({"row": i, "error": e.to_string()}));
+                continue;
+            }
+        };
+        if let Err(e) = assert_writable(&user, &entity, &def, &map) {
+            errors.push(json!({"row": i, "error": e.to_string()}));
+            continue;
+        }
+        let mut ctx = map;
+        if let Err(e) = mda_rules::fire(&rules, "after_create", &mut ctx, &reg) {
+            errors.push(json!({"row": i, "error": e.to_string()}));
+            continue;
+        }
+        if let Err(e) = mda_rules::compute_calculated(&def, &mut ctx, &reg) {
+            errors.push(json!({"row": i, "error": e.to_string()}));
+            continue;
+        }
+        match mda_data::create(&st.pool, user.tenant_id, &def, ctx, user.user_id).await {
+            Ok(rec) => {
+                audit(
+                    &st,
+                    user.tenant_id,
+                    user.user_id,
+                    &entity,
+                    rec["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()),
+                    "create",
+                    None,
+                    Some(rec),
+                )
+                .await;
+                imported += 1;
+            }
+            Err(e) => errors.push(json!({"row": i, "error": e.to_string()})),
+        }
+    }
+    Ok(Json(json!({"imported": imported, "errors": errors})))
+}
+
+/// `GET /api/impex/:entity/export` — list (filtered) as CSV, respecting field
+/// read security.
+async fn export_records(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(entity): Path<String>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<Response> {
+    authorize(&user, &entity, "read")?;
+    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    let scope = scope_for(&st, &user, &entity).await?;
+    let params = parse_list_params(q)?;
+    let mut res = mda_data::list(&st.pool, user.tenant_id, &def, &params, &scope).await?;
+    for item in res.items.iter_mut() {
+        *item = project(&user, &entity, &def, item.clone());
+    }
+    // columns: id + readable data fields + relationship columns
+    let mut columns = vec!["id".to_string()];
+    for f in &def.fields {
+        if user.field_access(&entity, &f.name) != Access::None {
+            columns.push(f.name.clone());
+        }
+    }
+    for r in &def.relationships {
+        columns.push(r.source_field_name.clone());
+    }
+    let rows: Vec<Map<String, Value>> = res
+        .items
+        .into_iter()
+        .map(|v| match v {
+            Value::Object(m) => m,
+            other => {
+                let mut m = Map::new();
+                m.insert("value".into(), other);
+                m
+            }
+        })
+        .collect();
+    let body = mda_reports::to_csv(&mda_reports::ReportResult { columns, rows });
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")],
+        body,
+    )
+        .into_response())
 }

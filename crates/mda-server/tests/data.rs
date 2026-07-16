@@ -806,3 +806,56 @@ async fn report_runs_with_grouping_and_export() {
     .await;
     assert_eq!(st, StatusCode::OK, "export status");
 }
+
+#[tokio::test]
+async fn bulk_import_and_export() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    let model = json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null,
+            "name": "Customer", "table_name": format!("imp_{}", Uuid::new_v4().simple()),
+            "label": "Customer", "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(), "name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"email","label":"Email","field_type":"string","required":false,"is_unique":true,"is_indexed":false,"default_expr":null,"config":{}}
+            ],
+            "relationships": []
+        }]
+    });
+    publish(&ctx, model).await;
+
+    // import 3 rows: 2 valid, 1 missing required 'name'
+    let rows = json!([
+        {"name":"Alice","email":"a@x.com"},
+        {"name":"Bob","email":"b@x.com"},
+        {"email":"no-name@x.com"}
+    ]);
+    let (st, res) = call(
+        &ctx.app,
+        "POST",
+        "/api/impex/Customer/import",
+        &ctx.token,
+        Some(rows.to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "import: {res}");
+    assert_eq!(res["imported"], 2, "imported: {res}");
+    assert_eq!(res["errors"].as_array().unwrap().len(), 1);
+
+    // export as CSV (text/csv -> status check via JSON-parsing call)
+    let (st, _csv) = call(
+        &ctx.app,
+        "GET",
+        "/api/impex/Customer/export",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "export status");
+}
