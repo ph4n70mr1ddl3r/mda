@@ -1,0 +1,12 @@
+[package]
+name = "mda-data"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+mda-core = { workspace = true }
+mda-meta = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

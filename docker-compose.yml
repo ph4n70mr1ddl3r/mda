@@ -1,0 +1,57 @@
+# Dev environment for MDA (PLAN §3 / Phase 0).
+#
+#   docker compose up -d postgres redis     # start the deps
+#   cargo run                                # run the server against them
+#   docker compose up -d --build app         # run the server itself (optional)
+#
+# The `app` service builds the Rust workspace from ./Dockerfile.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mda
+      POSTGRES_PASSWORD: mda
+      POSTGRES_DB: mda
+    ports:
+      - "5433:5432"
+    volumes:
+      - mda-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mda -d mda"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["app"]
+    environment:
+      DATABASE_URL: postgres://mda:mda@postgres:5432/mda
+      REDIS_URL: redis://redis:6379
+      MDA_HOST: 0.0.0.0
+      MDA_PORT: 8080
+      LOG_FORMAT: json
+      RUST_LOG: info,mda=debug,sqlx=warn
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mda-pgdata:

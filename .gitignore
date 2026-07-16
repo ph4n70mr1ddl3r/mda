@@ -1,9 +1,9 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
-# Un comment the next line if building a binary; keep for libraries
-# !Cargo.lock
+
+# Workspace lockfile IS committed (this is a binary/application workspace).
+!Cargo.lock
 
 # Environment / secrets
 .env
@@ -21,3 +21,10 @@ Thumbs.db
 # Build / runtime artifacts
 dist/
 node_modules/
+
+# Frontend spike build output
+web/**/target
+web/**/dist
+
+# TypeScript incremental build info
+*.tsbuildinfo

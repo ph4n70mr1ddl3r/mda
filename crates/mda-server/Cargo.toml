@@ -1,0 +1,20 @@
+[package]
+name = "mda-server"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+mda-core = { workspace = true }
+mda-api = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+sqlx = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "mda-api"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+mda-core = { workspace = true }
+sqlx = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

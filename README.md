@@ -4,7 +4,39 @@ A declarative, data-driven, model-driven **no-code enterprise system** built in 
 Everything — entities, forms, screens, reports, workflows, rules, integrations — is
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
-> **Status:** Architecture & planning. No code yet.
+> **Status:** Architecture & planning → **Phase 0 (foundation) implemented**. No code
+> beyond the foundation yet.
+
+## Quick start (Phase 0)
+
+```bash
+# 1. dependencies (Postgres 16 + Redis)
+docker compose up -d postgres redis
+
+# 2. run the server (boots, runs migrations, serves /health)
+cp .env.example .env            # adjust if needed
+DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable cargo run
+```
+
+Health check:
+
+```bash
+curl localhost:8080/health
+# {"status":"ok","database":"up","version":"0.1.0"}
+```
+
+> Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
+> host-installed Postgres during local development.
+
+Tests:
+
+```bash
+cargo test --lib --bins                     # unit tests (no DB needed)
+DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
+  cargo test --test integration             # applies migrations + checks schema
+```
+
+Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 
 ## Documents
 
@@ -31,3 +63,13 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 Phased from foundation → metadata engine → dynamic data → security → rules →
 workflow → UI → reporting → Studio → integrations → bulk data & attachments → hardening.
 See §9 of `PLAN.md` (MVP milestone lands ~week 26).
+
+## Layout
+
+```
+crates/        Rust workspace: mda-core, mda-meta, mda-data, mda-api, mda-server
+migrations/    SQLx migrations (Phase 0: meta schema skeleton)
+web/           Phase 0 frontend spike (Leptos + React) — throwaway
+docker/ (in repo root: docker-compose.yml, Dockerfile)
+.github/       CI
+```

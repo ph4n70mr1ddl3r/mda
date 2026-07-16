@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mda-core",
+    "crates/mda-meta",
+    "crates/mda-data",
+    "crates/mda-api",
+    "crates/mda-server",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.80"
+version = "0.1.0"
+
+[workspace.dependencies]
+# internal crates
+mda-core = { path = "crates/mda-core" }
+mda-meta = { path = "crates/mda-meta" }
+mda-data = { path = "crates/mda-data" }
+mda-api = { path = "crates/mda-api" }
+
+# external
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+sqlx = { version = "0.8", default-features = false, features = [
+    "postgres",
+    "runtime-tokio-rustls",
+    "chrono",
+    "uuid",
+    "json",
+    "macros",
+    "migrate",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+ulid = { version = "1", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
