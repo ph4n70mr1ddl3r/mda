@@ -185,7 +185,7 @@ sys_outbox       - transactional outbox: durable pending side-effects (webhook/e
 sys_event_log    - canonical sequence-numbered domain-event stream: real-time + audit + replay (§5.10)
 sys_lock         - soft advisory record checkout (owner, ttl, heartbeat) for UX coordination. §5.9
 sys_setting      - key/value config
-sys_translation  - i18n strings (metadata & data)
+sys_translation  - i18n strings (metadata/UI only; data-level i18n deferred — U5)
 sys_version      - metadata versioning / migration tracking
 sys_impex_job    - bulk import/export job: (type, entity, format, mode, mapping JSONB,
                    status, stats JSONB, source/result blob refs, created_by, timestamps) §5.13
@@ -828,6 +828,11 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - **Deliverable:** Production-ready v1.0.
 
 > Timelines are rough planning anchors for a small team; **Phases 6 and 8 were re-estimated honestly** (REVIEW.md Timeline Reality Check): Phase 6 ≈ 9 weeks for a from-scratch metadata-driven UI renderer + real-time; Phase 8 ≈ 14 weeks for the full drag-and-drop Studio (parallelizable only with a real team). The full sequence is now ~55 weeks; a solo developer should ~double it — which is why the **MVP milestone above exists** (ship value around week 26, not week 55).
+
+> **Deferred (explicitly, not omitted — closes REVIEW.md U5 / U9).** Two items are deliberately out of v1 scope:
+> - **U5 — data-level i18n** (translatable enum/reference data; record-level multi-language fields). `sys_translation` covers **metadata/UI strings only** for v1; data i18n is a later, opt-in feature once a real multi-locale tenant needs it.
+> - **U9 — high availability & replication** (Postgres HA, read replicas for reporting, logical replication / warm standby, connection-pool tuning). Single-node Postgres for v1; HA is a Phase 11 hardening activity when production scale demands it.
+> Both are tracked here so they remain *visible*, not lost.
 
 ---
 

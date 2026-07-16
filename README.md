@@ -19,7 +19,7 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
   - §5.14 — attachments & blob storage
   - §5.15 — retention of high-volume append-only tables (audit/event/outbox)
   - §5.16 — threat model: untrusted metadata
-- [`REVIEW.md`](./REVIEW.md) — critical review of the plan (gaps resolved in v0.2).
+- [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (gaps resolved in v0.2; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (storage, lifecycle, concurrency, real-time, authz, deletion, job queue, meta-model, frontend).
 
