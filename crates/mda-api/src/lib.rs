@@ -8,6 +8,7 @@ use axum::Router;
 use serde::Serialize;
 use sqlx::PgPool;
 
+pub mod data;
 pub mod error;
 pub mod extract;
 pub mod studio;
@@ -26,6 +27,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(studio::routes())
+        .merge(data::routes())
         .with_state(state)
 }
 

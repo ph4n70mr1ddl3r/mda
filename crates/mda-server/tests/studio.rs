@@ -22,7 +22,7 @@ fn customer_model() -> Value {
             "id": Uuid::new_v4(),
             "module_id": null,
             "name": "Customer",
-            "table_name": "customer",
+            "table_name": format!("customer_{}", Uuid::new_v4().simple()),
             "label": "Customer",
             "description": null,
             "fields": [
@@ -191,7 +191,7 @@ async fn branch_validate_publish_reflects_in_model_and_cache() {
 }
 
 #[tokio::test]
-async fn additive_only_rejects_removal() {
+async fn transform_is_rejected() {
     let (app,) = match setup().await {
         Some(x) => x,
         None => return,
@@ -233,7 +233,11 @@ async fn additive_only_rejects_removal() {
     )
     .await;
 
-    // branch a new draft (branched from active = Customer), put an EMPTY model (removes Customer)
+    // read the active model, then mutate a field's type (a transform)
+    let (_, active) = call(&app, "GET", "/api/studio/model", tenant, None, None).await;
+    let mut mutated = active.clone();
+    mutated["entities"][0]["fields"][0]["field_type"] = json!("integer");
+
     let (_, draft2) = call(
         &app,
         "POST",
@@ -254,13 +258,13 @@ async fn additive_only_rejects_removal() {
         "PUT",
         &format!("/api/studio/drafts/{d2}/model"),
         tenant,
-        Some(json!({"modules":[],"entities":[]}).to_string()),
+        Some(mutated.to_string()),
         Some(e2),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
 
-    // validate flags the removal as a Phase-2 violation
+    // validate flags the type change as a Phase-2 transform (not yet supported)
     let (st, report) = call(
         &app,
         "POST",
@@ -276,9 +280,9 @@ async fn additive_only_rejects_removal() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|v| { v.as_str().unwrap().contains("removed") }));
+        .any(|v| { v.as_str().unwrap().contains("modified") }));
 
-    // publish is rejected (422)
+    // publish is rejected (422) — ADR-0011 staged migration not yet implemented
     let (st, _) = call(
         &app,
         "POST",

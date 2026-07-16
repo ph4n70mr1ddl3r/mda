@@ -120,10 +120,21 @@ pub struct DiffReport {
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub additions: AdditionSummary,
+    pub retirements: RetirementSummary,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AdditionSummary {
+    pub modules: usize,
+    pub entities: usize,
+    pub fields: usize,
+    pub relationships: usize,
+}
+
+/// Artifacts the draft retires (Phase 2 two-phase destructive: retire now,
+/// purge after grace). Retirements are *allowed* — the data is kept until purge.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RetirementSummary {
     pub modules: usize,
     pub entities: usize,
     pub fields: usize,
@@ -167,10 +178,7 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
     for m in &active.modules {
         match draft_mods.get(&m.id) {
             None => {
-                report.violations.push(format!(
-                    "module {} was removed (destructive — Phase 2)",
-                    m.name
-                ));
+                report.retirements.modules += 1;
             }
             Some(d) if canon_module(d) != canon_module(m) => {
                 report.violations.push(format!(
@@ -183,10 +191,7 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
     }
     for e in &active.entities {
         match draft_ents.get(&e.id) {
-            None => report.violations.push(format!(
-                "entity {} was removed (destructive — Phase 2)",
-                e.name
-            )),
+            None => report.retirements.entities += 1,
             Some((parent, d)) if *parent != e.module_id || canon_entity(d) != canon_entity(e) => {
                 report.violations.push(format!(
                     "entity {} was modified (transform — Phase 2)",
@@ -197,10 +202,7 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
         }
         for f in &e.fields {
             match draft_fields.get(&f.id) {
-                None => report.violations.push(format!(
-                    "field {}.{} was removed (destructive — Phase 2)",
-                    e.name, f.name
-                )),
+                None => report.retirements.fields += 1,
                 Some((parent, d)) if *parent != e.id || canon_field(d) != canon_field(f) => {
                     report.violations.push(format!(
                         "field {}.{} was modified (transform — Phase 2)",
@@ -212,10 +214,7 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
         }
         for r in &e.relationships {
             match draft_rels.get(&r.id) {
-                None => report.violations.push(format!(
-                    "relationship {} on {} was removed (destructive — Phase 2)",
-                    r.source_field_name, e.name
-                )),
+                None => report.retirements.relationships += 1,
                 Some((parent, d)) if *parent != e.id || canon_rel(d) != canon_rel(r) => {
                     report.violations.push(format!(
                         "relationship {} on {} was modified (transform — Phase 2)",
@@ -498,14 +497,15 @@ mod tests {
     }
 
     #[test]
-    fn removing_active_is_violation() {
+    fn removing_active_is_retirement() {
         let active = DraftModel {
             modules: vec![],
             entities: vec![ent(1, "Customer")],
         };
         let r = diff(&active, &DraftModel::empty());
-        assert!(!r.valid);
-        assert!(r.violations.iter().any(|v| v.contains("removed")));
+        assert!(r.valid, "retirements are allowed: {r:?}");
+        assert_eq!(r.retirements.entities, 1);
+        assert!(r.violations.is_empty());
     }
 
     #[test]

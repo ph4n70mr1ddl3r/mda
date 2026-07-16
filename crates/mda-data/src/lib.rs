@@ -1,6 +1,18 @@
-//! `mda-data` — dynamic data access: the query builder + CRUD over the
-//! generated `biz.<table>` tables (hoisted columns + JSONB `attributes`).
+//! `mda-data` — dynamic data access (PLAN §5.1 / §5.7 / §5.9).
 //!
-//! **Not built in Phase 0.** This crate exists to fix the workspace boundary
-//! early; the DDL/migration engine + generic CRUD + list/query land in Phase 2
-//! (PLAN §9).
+//! Storage model realized:
+//! - every entity publishes to a real table `biz.<table>`;
+//! - **reference fields are real typed columns with native `FOREIGN KEY`s**
+//!   (always hoisted — the whole point of Pattern B);
+//! - **unique/indexed scalar fields are GENERATED columns** derived from the
+//!   `attributes JSONB` payload (single source of truth — no dual-write);
+//! - all other scalar fields live in `attributes JSONB`.
+//!
+//! CRUD therefore writes only `attributes` + the FK columns; the generated
+//! columns populate themselves and carry the `UNIQUE`/index constraints.
+
+pub mod coerce;
+pub mod crud;
+pub mod ddl;
+
+pub use crud::{create, delete, list, read, update, Filter, ListParams, ListResult, Sort};

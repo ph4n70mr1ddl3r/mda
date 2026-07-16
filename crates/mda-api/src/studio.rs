@@ -17,7 +17,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use mda_core::{Error, Result};
-use mda_meta::draft::{diff, AdditionSummary, DiffReport, DraftModel};
+use mda_data::ddl;
+use mda_meta::draft::{diff, AdditionSummary, DiffReport, DraftModel, RetirementSummary};
 use mda_meta::loader;
 
 use crate::error::ApiResult;
@@ -76,6 +77,7 @@ struct PublishResult {
     version: i64,
     snapshot_id: Uuid,
     additions: AdditionSummary,
+    retirements: RetirementSummary,
 }
 
 #[derive(sqlx::FromRow, Serialize)]
@@ -446,7 +448,76 @@ async fn apply_additive_publish(
         }
     }
 
-    // 6) bump the active version (create-or-increment)
+    // 6) biz DDL + retire (Phase 2): materialize `biz.<table>` for new entities,
+    //    add columns/FKs for new fields/relationships, and retire removed
+    //    entities/fields (two-phase: status='retired' + md_retirement; live data
+    //    is kept until a purge job drops it). All DDL is transactional in PG.
+    let mut retirements = RetirementSummary::default();
+    let draft_entity_ids: HashSet<Uuid> = draft.entities.iter().map(|e| e.id).collect();
+    let draft_field_ids: HashSet<Uuid> = draft
+        .entities
+        .iter()
+        .flat_map(|e| e.fields.iter().map(|f| f.id))
+        .collect();
+    // entity_id -> table_name (active + draft) for FK target resolution
+    let mut table_of: std::collections::HashMap<Uuid, &str> = std::collections::HashMap::new();
+    for e in &active.entities {
+        table_of.insert(e.id, e.table_name.as_str());
+    }
+    for e in &draft.entities {
+        table_of.insert(e.id, e.table_name.as_str());
+    }
+
+    exec_stmts(&mut tx, &ddl::ensure_schema()).await?;
+    // new entities -> CREATE TABLE (their fields are included as columns)
+    for e in &draft.entities {
+        if active_entity_ids.contains(&e.id) {
+            continue;
+        }
+        exec_stmts(&mut tx, &ddl::create_table(&e.table_name, e)?).await?;
+    }
+    // added fields on EXISTING entities -> ALTER ADD COLUMN
+    for e in &draft.entities {
+        if !active_entity_ids.contains(&e.id) {
+            continue;
+        }
+        for f in &e.fields {
+            if active_field_ids.contains(&f.id) {
+                continue;
+            }
+            exec_stmts(&mut tx, &ddl::add_field(&e.table_name, f)?).await?;
+        }
+    }
+    // added relationships -> ALTER ADD FK column + constraint (after tables exist)
+    for e in &draft.entities {
+        for r in &e.relationships {
+            if active_rel_ids.contains(&r.id) {
+                continue;
+            }
+            let target = table_of.get(&r.target_entity_id).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "relationship {} targets unknown entity {}",
+                    r.source_field_name, r.target_entity_id
+                ))
+            })?;
+            exec_stmts(&mut tx, &ddl::add_relationship(&e.table_name, r, target)?).await?;
+        }
+    }
+    // retire removed entities / fields (two-phase)
+    for ae in &active.entities {
+        if !draft_entity_ids.contains(&ae.id) {
+            retirements.entities += 1;
+            retire_entity(&mut tx, tenant, ae.id).await?;
+        }
+        for af in &ae.fields {
+            if !draft_field_ids.contains(&af.id) {
+                retirements.fields += 1;
+                retire_field(&mut tx, tenant, af.id).await?;
+            }
+        }
+    }
+
+    // 7) bump the active version (create-or-increment)
     sqlx::query(
         "INSERT INTO meta.md_active_version (tenant_id, version, snapshot_id, updated_at)
          VALUES ($1, 1, $2, now())
@@ -476,5 +547,73 @@ async fn apply_additive_publish(
         version,
         snapshot_id,
         additions,
+        retirements,
     })
+}
+
+/// Execute a batch of (identifier-only) DDL statements inside the publish txn.
+async fn exec_stmts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    stmts: &[String],
+) -> Result<()> {
+    for s in stmts {
+        sqlx::query(s)
+            .execute(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+    }
+    Ok(())
+}
+
+const RETIRE_GRACE: &str = "14 days";
+
+/// Two-phase retire of an entity: status -> retired + a pending-purge row.
+/// Live `biz.<table>` data is kept until a purge job drops it (PLAN §5.8).
+async fn retire_entity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    entity_id: Uuid,
+) -> Result<()> {
+    sqlx::query("UPDATE meta.md_entity SET status = 'retired', updated_at = now() WHERE id = $1 AND tenant_id = $2")
+        .bind(entity_id)
+        .bind(tenant)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    sqlx::query(
+        "INSERT INTO meta.md_retirement (tenant_id, kind, target_id, purge_after)
+         VALUES ($1, 'entity', $2, now() + ($3)::interval)",
+    )
+    .bind(tenant)
+    .bind(entity_id)
+    .bind(RETIRE_GRACE)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
+}
+
+/// Two-phase retire of a field (its biz column stays until purge).
+async fn retire_field(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    field_id: Uuid,
+) -> Result<()> {
+    sqlx::query("UPDATE meta.md_field SET status = 'retired', updated_at = now() WHERE id = $1 AND tenant_id = $2")
+        .bind(field_id)
+        .bind(tenant)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    sqlx::query(
+        "INSERT INTO meta.md_retirement (tenant_id, kind, target_id, purge_after)
+         VALUES ($1, 'field', $2, now() + ($3)::interval)",
+    )
+    .bind(tenant)
+    .bind(field_id)
+    .bind(RETIRE_GRACE)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
 }

@@ -109,6 +109,21 @@ pub async fn active_version(pool: &sqlx::PgPool, tenant: Uuid) -> Result<i64> {
     Ok(v.map(|(v,)| v).unwrap_or(0))
 }
 
+/// Resolve an active entity's id by (tenant, name) — the runtime data API
+/// (`/api/data/:entity`) addresses entities by name.
+pub async fn entity_id_by_name(pool: &sqlx::PgPool, tenant: Uuid, name: &str) -> Result<Uuid> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM meta.md_entity WHERE tenant_id = $1 AND name = $2 AND status = 'active'",
+    )
+    .bind(tenant)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+    .map_err(Error::internal)?;
+    row.map(|(id,)| id)
+        .ok_or_else(|| Error::NotFound(format!("entity {name}")))
+}
+
 /// All active entity ids for a tenant (for cache invalidation / enumeration).
 pub async fn entity_ids_for_tenant(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Vec<Uuid>> {
     let rows: Vec<(Uuid,)> =

@@ -948,6 +948,7 @@ dependencies = [
  "axum",
  "chrono",
  "mda-core",
+ "mda-data",
  "mda-meta",
  "serde",
  "serde_json",
@@ -972,11 +973,14 @@ dependencies = [
 name = "mda-data"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "mda-core",
  "mda-meta",
  "serde",
  "serde_json",
  "sqlx",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

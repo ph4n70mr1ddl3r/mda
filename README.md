@@ -4,8 +4,9 @@ A declarative, data-driven, model-driven **no-code enterprise system** built in 
 Everything — entities, forms, screens, reports, workflows, rules, integrations — is
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
-> **Status:** Architecture & planning → **Phases 0–1 implemented** (foundation +
-> metadata engine: draft → validate → publish lifecycle, metadata cache).
+> **Status:** Architecture & planning → **Phases 0–2 implemented** (foundation +
+> metadata engine + dynamic data layer: publish generates `biz.<table>` with
+> native FKs; CRUD via `/api/data/:entity` with OCC).
 
 ## Quick start (Phase 0)
 
@@ -33,8 +34,18 @@ curl -s -X POST localhost:8080/api/studio/drafts -H "x-tenant-id: $TENANT" \
      -H "content-type: application/json" -d '{"name":"v1"}'
 # PUT  /api/studio/drafts/:id/model   (If-Match: <version_etag>)  — edit
 # POST /api/studio/drafts/:id/validate                          — dry-run diff
-# POST /api/studio/drafts/:id/publish                           — additive-only
+# POST /api/studio/drafts/:id/publish                           — additive + retire
 # GET  /api/studio/model                                        — active model
+```
+
+Runtime data API (Phase 2) — CRUD over generated `biz.<table>`:
+
+```bash
+TENANT=00000000-0000-0000-0000-000000000000
+curl -X POST localhost:8080/api/data/Customer -H "x-tenant-id: $TENANT" \
+     -H "content-type: application/json" -d '{"name":"Acme"}'
+curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TENANT"
+# PATCH /api/data/:entity/:id  (If-Match: <version>)  — OCC update (409 on conflict)
 ```
 
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
@@ -69,7 +80,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (17 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL).
-- [`docs/PHASE0.md`](./docs/PHASE0.md) · [`docs/PHASE1.md`](./docs/PHASE1.md) — phase status & handoffs.
+- [`docs/PHASE0.md`](./docs/PHASE0.md) · [`docs/PHASE1.md`](./docs/PHASE1.md) · [`docs/PHASE2.md`](./docs/PHASE2.md) — phase status & handoffs.
 
 ## Roadmap (summary)
 
