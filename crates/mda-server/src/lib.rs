@@ -1,7 +1,6 @@
-//! `mda-server` — wiring & bootstrap. Constructs config, tracing, the DB pool,
-//! the metadata cache (+ invalidation tasks), runs migrations, and serves the
-//! API with graceful shutdown.
+//! `mda-server` — wiring & bootstrap.
 
+pub mod bootstrap;
 pub mod config;
 pub mod migrate;
 
@@ -10,7 +9,7 @@ use axum::Router;
 use mda_api::AppState;
 use sqlx::postgres::PgPoolOptions;
 
-/// Run the server to completion: connect, migrate, bind, serve, shut down.
+/// Run the server to completion: connect, migrate, bootstrap, bind, serve.
 pub async fn run() -> anyhow::Result<()> {
     let cfg = config::Settings::load()?;
     init_tracing(&cfg);
@@ -25,7 +24,10 @@ pub async fn run() -> anyhow::Result<()> {
     migrate::run(&pool).await?;
     tracing::info!("database migrated");
 
-    // Metadata cache + invalidation (PLAN §5.3): LISTEN fast path + version poll.
+    // Ensure a bootstrap admin exists (idempotent) for the bootstrap tenant.
+    bootstrap::ensure_admin(&pool).await?;
+
+    // Metadata cache + invalidation (PLAN §5.3).
     let cache = mda_meta::MetadataCache::new();
     mda_meta::cache::spawn_listen(pool.clone(), cache.clone());
     mda_meta::cache::spawn_poll(pool.clone(), cache.clone());
@@ -33,6 +35,7 @@ pub async fn run() -> anyhow::Result<()> {
     let app: Router = mda_api::router(AppState {
         pool: pool.clone(),
         cache,
+        jwt: mda_security::JwtConfig::from_env(),
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);

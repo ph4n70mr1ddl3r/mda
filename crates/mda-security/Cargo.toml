@@ -1,19 +1,17 @@
 [package]
-name = "mda-api"
+name = "mda-security"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
 mda-core = { workspace = true }
-mda-meta = { workspace = true }
-mda-data = { workspace = true }
-mda-security = { workspace = true }
 sqlx = { workspace = true }
-axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
 chrono = { workspace = true }
-async-trait = { workspace = true }
+uuid = { workspace = true }
+jsonwebtoken = { workspace = true }
+argon2 = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

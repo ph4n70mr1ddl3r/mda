@@ -1,10 +1,12 @@
-//! Generic CRUD + list over the generated `biz.<table>` tables (PLAN §5.9 OCC,
-//! §5.16 parameterized dynamic SQL).
+//! Generic CRUD + list over the generated `biz.<table>` tables.
+//!
+//! Record-level security (Phase 3): a [`RecordScope`] injects an ownership/OWD
+//! predicate into every query (never post-filtering — §5.11). Team-OWD and
+//! criteria-based sharing arrive in Phase 6 (ADR-0013); here: owner + public OWD.
 //!
 //! Writes go to `attributes JSONB` (scalars) + the hoisted reference (FK)
-//! columns; GENERATED columns (unique/indexed scalars) populate themselves.
-//! Reads use `to_jsonb(t.*)` and reconstruct the record from `attributes` + FK
-//! columns (generated columns are derived, not echoed).
+//! columns; GENERATED columns (unique/indexed) populate themselves. Reads use
+//! `to_jsonb(t.*)` and reconstruct the record.
 
 use std::collections::HashSet;
 
@@ -17,6 +19,27 @@ use uuid::Uuid;
 
 const MAX_PAGE_SIZE: u64 = 200;
 const DEFAULT_PAGE_SIZE: u64 = 50;
+
+/// Resolved record-level scope for one request on one entity.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordScope {
+    pub user_id: Uuid,
+    pub public_read: bool,
+    pub public_write: bool,
+    pub bypass: bool,
+}
+
+impl RecordScope {
+    /// A superuser scope (no owner filter).
+    pub fn superuser(user_id: Uuid) -> Self {
+        Self {
+            user_id,
+            public_read: true,
+            public_write: true,
+            bypass: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
@@ -47,16 +70,33 @@ pub struct ListResult {
     pub page_size: u64,
 }
 
-// Either a JSONB value or a (nullable) UUID column value, for dynamic binds.
 enum Bind {
     Json(Value),
     Uuid(Option<Uuid>),
 }
 
-// Either a UUID or a text value, for list WHERE binds.
 enum ListBind {
     Uuid(Uuid),
     Text(String),
+}
+
+/// When the scope does not grant broad read, restrict to the owner (returns the
+/// user to bind, or None for no filter).
+fn read_user(s: &RecordScope) -> Option<Uuid> {
+    if s.bypass || s.public_read {
+        None
+    } else {
+        Some(s.user_id)
+    }
+}
+
+/// Owner unless public write / bypass.
+fn write_user(s: &RecordScope) -> Option<Uuid> {
+    if s.bypass || s.public_write {
+        None
+    } else {
+        Some(s.user_id)
+    }
 }
 
 // ===== create =====
@@ -66,6 +106,7 @@ pub async fn create(
     tenant: Uuid,
     def: &EntityDefinition,
     body: Map<String, Value>,
+    owner: Uuid,
 ) -> Result<Value> {
     ensure_active(def)?;
     validate_known_keys(def, &body)?;
@@ -73,7 +114,6 @@ pub async fn create(
     let mut attributes = Map::new();
     for f in &def.fields {
         let raw = body.get(&f.name).cloned();
-        // literal default only (DSL-expression defaults arrive in Phase 4)
         let raw = match (raw, &f.default_expr) {
             (Some(v), _) => Some(v),
             (None, Some(d)) if !is_expr_marker(d) => Some(d.clone()),
@@ -128,35 +168,48 @@ pub async fn create(
     let mut q = sqlx::query(&sql)
         .bind(id)
         .bind(tenant)
-        .bind::<Option<Uuid>>(None)
+        .bind(owner)
         .bind(attrs_json);
     for v in fk_values {
         q = q.bind(v);
     }
     q.execute(pool).await.map_err(Error::internal)?;
 
-    read(pool, tenant, def, id).await
+    read(pool, tenant, def, id, &RecordScope::superuser(owner)).await
 }
 
 // ===== read =====
 
-pub async fn read(pool: &PgPool, tenant: Uuid, def: &EntityDefinition, id: Uuid) -> Result<Value> {
+pub async fn read(
+    pool: &PgPool,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    id: Uuid,
+    scope: &RecordScope,
+) -> Result<Value> {
     ensure_active(def)?;
-    let sql = format!(
+    let ou = read_user(scope);
+    let mut sql = format!(
         "SELECT to_jsonb(t.*) AS doc FROM biz.{} t WHERE id = $1 AND tenant_id = $2",
         def.entity.table_name
     );
-    let row: Option<(Value,)> = sqlx::query_as(&sql)
+    if ou.is_some() {
+        sql.push_str(" AND owner_id = $3");
+    }
+    let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str())
         .bind(id)
-        .bind(tenant)
-        .fetch_optional(pool)
+        .bind(tenant);
+    if let Some(u) = ou {
+        q = q.bind(u);
+    }
+    q.fetch_optional(pool)
         .await
-        .map_err(Error::internal)?;
-    row.map(|(v,)| reconstruct(def, v))
+        .map_err(Error::internal)?
+        .map(|(v,)| reconstruct(def, v))
         .ok_or_else(|| Error::NotFound(format!("record {id}")))
 }
 
-// ===== update (OCC) =====
+// ===== update (OCC + write scope) =====
 
 pub async fn update(
     pool: &PgPool,
@@ -165,6 +218,7 @@ pub async fn update(
     id: Uuid,
     expected_version: i64,
     body: Map<String, Value>,
+    scope: &RecordScope,
 ) -> Result<Value> {
     ensure_active(def)?;
     validate_known_keys(def, &body)?;
@@ -193,15 +247,20 @@ pub async fn update(
             binds.push(Bind::Uuid(u));
         }
     }
-    let n = binds.len();
+    let ou = write_user(scope);
+    let mut where_parts = vec![
+        format!("t.id = ${}", binds.len() + 1),
+        format!("t.tenant_id = ${}", binds.len() + 2),
+        format!("t.version = ${}", binds.len() + 3),
+    ];
+    if ou.is_some() {
+        where_parts.push(format!("t.owner_id = ${}", binds.len() + 4));
+    }
     let sql = format!(
-        "UPDATE biz.{} AS t SET {} WHERE t.id = ${} AND t.tenant_id = ${} AND t.version = ${} \
-         RETURNING to_jsonb(t.*) AS doc",
+        "UPDATE biz.{} AS t SET {} WHERE {} RETURNING to_jsonb(t.*) AS doc",
         def.entity.table_name,
         sets.join(", "),
-        n + 1,
-        n + 2,
-        n + 3
+        where_parts.join(" AND ")
     );
 
     let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str());
@@ -212,10 +271,13 @@ pub async fn update(
         };
     }
     q = q.bind(id).bind(tenant).bind(expected_version);
+    if let Some(u) = ou {
+        q = q.bind(u);
+    }
 
     match q.fetch_optional(pool).await.map_err(Error::internal)? {
         Some((doc,)) => Ok(reconstruct(def, doc)),
-        None => distinguish_not_found_or_conflict(pool, def, tenant, id).await,
+        None => distinguish_not_found_or_conflict(pool, def, tenant, id, scope).await,
     }
 }
 
@@ -224,7 +286,9 @@ async fn distinguish_not_found_or_conflict(
     def: &EntityDefinition,
     tenant: Uuid,
     id: Uuid,
+    scope: &RecordScope,
 ) -> Result<Value> {
+    // exists at all (ignoring scope)?
     let exists: Option<(i32,)> = sqlx::query_as(&format!(
         "SELECT 1 FROM biz.{} WHERE id = $1 AND tenant_id = $2",
         def.entity.table_name
@@ -236,38 +300,70 @@ async fn distinguish_not_found_or_conflict(
     .map_err(Error::internal)?;
     match exists {
         None => Err(Error::NotFound(format!("record {id}"))),
-        Some(_) => Err(Error::Conflict(
-            "version mismatch — record was modified by another writer".into(),
-        )),
+        Some(_) => {
+            let ou = write_user(scope);
+            let mut sql = format!(
+                "SELECT 1 FROM biz.{} WHERE id = $1 AND tenant_id = $2",
+                def.entity.table_name
+            );
+            if ou.is_some() {
+                sql.push_str(" AND owner_id = $3");
+            }
+            let mut q = sqlx::query_as::<_, (i32,)>(sql.as_str())
+                .bind(id)
+                .bind(tenant);
+            if let Some(u) = ou {
+                q = q.bind(u);
+            }
+            let writable: Option<(i32,)> = q.fetch_optional(pool).await.map_err(Error::internal)?;
+            if writable.is_none() {
+                Err(Error::NotFound(format!("record {id}"))) // not visible/writable -> 404 (no leak)
+            } else {
+                Err(Error::Conflict(
+                    "version mismatch — record was modified by another writer".into(),
+                ))
+            }
+        }
     }
 }
 
-// ===== delete (hard delete; archive is ADR-0015, a follow-up) =====
+// ===== delete (write scope) =====
 
-pub async fn delete(pool: &PgPool, tenant: Uuid, def: &EntityDefinition, id: Uuid) -> Result<()> {
+pub async fn delete(
+    pool: &PgPool,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    id: Uuid,
+    scope: &RecordScope,
+) -> Result<()> {
     ensure_active(def)?;
-    let res = sqlx::query(&format!(
+    let ou = write_user(scope);
+    let mut sql = format!(
         "DELETE FROM biz.{} WHERE id = $1 AND tenant_id = $2",
         def.entity.table_name
-    ))
-    .bind(id)
-    .bind(tenant)
-    .execute(pool)
-    .await
-    .map_err(Error::internal)?;
+    );
+    if ou.is_some() {
+        sql.push_str(" AND owner_id = $3");
+    }
+    let mut q = sqlx::query(&sql).bind(id).bind(tenant);
+    if let Some(u) = ou {
+        q = q.bind(u);
+    }
+    let res = q.execute(pool).await.map_err(Error::internal)?;
     if res.rows_affected() == 0 {
         return Err(Error::NotFound(format!("record {id}")));
     }
     Ok(())
 }
 
-// ===== list =====
+// ===== list (read scope) =====
 
 pub async fn list(
     pool: &PgPool,
     tenant: Uuid,
     def: &EntityDefinition,
     params: &ListParams,
+    scope: &RecordScope,
 ) -> Result<ListResult> {
     ensure_active(def)?;
     let page = params.page.max(1);
@@ -278,7 +374,14 @@ pub async fn list(
     };
     let offset = (page - 1) * page_size;
 
-    let (where_sql, binds) = build_list_where(def, tenant, &params.filters)?;
+    let (where_sql, mut binds) = build_list_where(def, tenant, &params.filters)?;
+    let ou = read_user(scope);
+    let mut where_sql = where_sql;
+    if let Some(u) = ou {
+        let n = binds.len() + 1;
+        where_sql.push_str(&format!(" AND owner_id = ${n}"));
+        binds.push(ListBind::Uuid(u));
+    }
     let order_sql = build_order(def, &params.sort);
     let table = &def.entity.table_name;
 
@@ -477,7 +580,6 @@ fn reconstruct(def: &EntityDefinition, doc: Value) -> Value {
 }
 
 fn is_expr_marker(v: &Value) -> bool {
-    // Phase 4: {"$expr": ...} marks a DSL default; treat as no literal for now.
     matches!(v, Value::Object(m) if m.contains_key("$expr"))
 }
 

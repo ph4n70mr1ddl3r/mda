@@ -17,6 +17,9 @@ pub enum Error {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }

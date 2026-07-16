@@ -21,12 +21,13 @@ use mda_data::ddl;
 use mda_meta::draft::{diff, AdditionSummary, DiffReport, DraftModel, RetirementSummary};
 use mda_meta::loader;
 
+use crate::auth::AuthUser;
 use crate::error::ApiResult;
+use mda_security::Identity;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::extract::TenantId;
 use crate::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -44,6 +45,13 @@ pub fn routes() -> Router<AppState> {
         .route("/api/studio/import", post(import_model))
         .route("/api/studio/snapshots", get(list_snapshots))
         .route("/api/studio/entities/:id", get(get_entity_definition))
+}
+
+fn require_studio(id: &Identity) -> ApiResult<()> {
+    if !id.is_superuser {
+        return Err(Error::Forbidden("studio access requires an admin role".into()).into());
+    }
+    Ok(())
 }
 
 // ===== DTOs =====
@@ -91,9 +99,11 @@ struct SnapshotRow {
 
 async fn create_draft(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
     Json(req): Json<CreateDraftReq>,
 ) -> ApiResult<Json<Draft>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     let name = req.name.unwrap_or_else(|| "draft".to_string());
     let active = loader::load_active_model(&st.pool, tenant).await?;
     let model_json = serde_json::to_value(&active).map_err(Error::internal)?;
@@ -113,20 +123,23 @@ async fn create_draft(
 
 async fn get_draft(
     State(st): State<AppState>,
-    TenantId(_tenant): TenantId,
+    AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Draft>> {
+    require_studio(&user)?;
     let draft = fetch_draft(&st.pool, id).await?;
     Ok(Json(draft))
 }
 
 async fn put_model(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(model): Json<DraftModel>,
 ) -> ApiResult<Json<EtagResp>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     let if_match = etag_from_headers(&headers)?;
     let model_json = serde_json::to_value(&model).map_err(Error::internal)?;
 
@@ -163,9 +176,11 @@ async fn put_model(
 
 async fn validate_draft(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<DiffReport>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     let draft = fetch_draft(&st.pool, id).await?;
     ensure_tenant(&draft, tenant)?;
     let model: DraftModel = serde_json::from_value(draft.model.clone()).map_err(Error::internal)?;
@@ -175,9 +190,11 @@ async fn validate_draft(
 
 async fn publish_draft(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<PublishResult>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     let draft = fetch_draft(&st.pool, id).await?;
     ensure_tenant(&draft, tenant)?;
     if draft.status == "published" {
@@ -212,17 +229,21 @@ async fn publish_draft(
 
 async fn get_active_model(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
 ) -> ApiResult<Json<DraftModel>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     let model = loader::load_active_model(&st.pool, tenant).await?;
     Ok(Json(model))
 }
 
 async fn import_model(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
     Json(model): Json<DraftModel>,
 ) -> ApiResult<Json<Draft>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     // Branch from active, then overlay the imported model as the draft content.
     let active = loader::load_active_model(&st.pool, tenant).await?;
     let _ = active; // branched model is the starting point; we replace with imported
@@ -242,8 +263,10 @@ async fn import_model(
 
 async fn list_snapshots(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
 ) -> ApiResult<Json<Vec<SnapshotRow>>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     let rows: Vec<SnapshotRow> = sqlx::query_as::<_, SnapshotRow>(
         "SELECT id, version, created_at FROM meta.md_snapshot
           WHERE tenant_id = $1 ORDER BY version DESC",
@@ -259,9 +282,11 @@ async fn list_snapshots(
 /// invalidation; the runtime data layer in Phase 2 will use the same path).
 async fn get_entity_definition(
     State(st): State<AppState>,
-    TenantId(tenant): TenantId,
+    AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<mda_meta::EntityDefinition>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
     let def = st.cache.get_entity(&st.pool, tenant, id).await?;
     Ok(Json((*def).clone()))
 }

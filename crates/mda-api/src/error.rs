@@ -27,6 +27,7 @@ impl IntoResponse for ApiError {
             Error::Invalid(_) => (StatusCode::UNPROCESSABLE_ENTITY, "invalid"),
             Error::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            Error::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             Error::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "config_error"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };

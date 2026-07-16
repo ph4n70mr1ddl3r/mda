@@ -15,4 +15,6 @@ pub mod coerce;
 pub mod crud;
 pub mod ddl;
 
-pub use crud::{create, delete, list, read, update, Filter, ListParams, ListResult, Sort};
+pub use crud::{
+    create, delete, list, read, update, Filter, ListParams, ListResult, RecordScope, Sort,
+};
