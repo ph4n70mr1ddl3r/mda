@@ -1,0 +1,4 @@
+# Shared Podman network for the MDA stack. Containers resolve each other by
+# ContainerName (mda-postgres, mda-redis) on this network.
+[Network]
+NetworkName=mda

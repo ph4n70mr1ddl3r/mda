@@ -1,0 +1,3 @@
+# Named volume for the Postgres data dir (survives container recreation).
+[Volume]
+VolumeName=mda-pgdata

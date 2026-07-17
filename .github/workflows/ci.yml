@@ -25,6 +25,9 @@ jobs:
           --health-timeout 3s
           --health-retries 10
     env:
+      # `mda` is the service superuser; the RLS migration creates the
+      # non-superuser `mda_app` role, so the DB-backed tests actually exercise
+      # RLS (superusers bypass it). SQLX_OFFLINE avoids any compile-time DB use.
       DATABASE_URL: postgres://mda:mda@localhost:5432/mda
       SQLX_OFFLINE: "true"
 
@@ -46,5 +49,10 @@ jobs:
       - name: unit + doc tests (no DB needed)
         run: cargo test --lib --bins --doc
 
-      - name: integration tests (against postgres service)
-        run: cargo test --test integration
+      # The DB-backed suites (data + studio + integration) MUST run for the
+      # tests to mean anything — earlier they were omitted, so DB-dependent
+      # bugs slipped through. They share one database and are not parallel-safe,
+      # hence --test-threads=1. Run as one cargo invocation so the binaries also
+      # serialize (cargo runs test binaries sequentially within an invocation).
+      - name: DB-backed tests (RLS, CRUD, publish, SSE, archive/restore, …)
+        run: cargo test --test data --test studio --test integration -- --test-threads=1

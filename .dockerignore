@@ -1,0 +1,16 @@
+# Keep the build context small (faster podman/docker builds).
+# The server image only needs: Cargo.toml, Cargo.lock, crates/, migrations/.
+target/
+**/target/
+.git/
+.github/
+web/
+node_modules/
+**/node_modules/
+.env
+**/.env
+*.log
+docs/
+PLAN.md
+README.md
+deploy/

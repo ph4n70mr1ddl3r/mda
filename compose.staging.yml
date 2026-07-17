@@ -1,0 +1,32 @@
+# Staging override — prod-like run of the compose stack.
+#
+#   docker compose -f docker-compose.yml -f compose.staging.yml --profile app up -d
+#   podman compose -f docker-compose.yml -f compose.staging.yml --profile app up -d
+#
+# Differences from dev:
+#  - restart policies (survive host reboots / crashes)
+#  - json logs + a quieter default filter
+#  - a memory ceiling on the app (the dynamic query layer is bounded; raise as needed)
+#  - the app still serves as the non-superuser mda_app role (MDA_APP_DATABASE_URL
+#    in the base file) so biz.* RLS engages.
+#
+# Override the image source by editing `app.image` (defaults to a local build).
+
+services:
+  app:
+    image: mda:latest
+    pull_policy: never            # built locally; flip to a registry + always in real staging
+    restart: unless-stopped
+    environment:
+      LOG_FORMAT: json
+      RUST_LOG: info,mda=info,sqlx=warn
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  postgres:
+    restart: unless-stopped
+
+  redis:
+    restart: unless-stopped

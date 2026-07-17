@@ -1,0 +1,10 @@
+[Container]
+Image=docker.io/library/redis:7-alpine
+ContainerName=mda-redis
+Network=mda.network
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+[Container]
+# Build locally:  podman build -t mda:latest .
+# Or from a registry: set this to ghcr.io/<org>/mda:<tag> and drop pull_policy.
+Image=mda:latest
+PullPolicy=ifnotpresent
+ContainerName=mda-app
+
+# Non-secret runtime config. The app binds 0.0.0.0:8080 inside the netns;
+# PublishPort exposes it on the host.
+Environment=MDA_HOST=0.0.0.0
+Environment=MDA_PORT=8080
+Environment=LOG_FORMAT=json
+Environment=RUST_LOG=info,mda=info,sqlx=warn
+Environment=REDIS_URL=redis://mda-redis:6379
+# Migrations run as the owner (creates the mda_app role + RLS grants at startup).
+Environment=DATABASE_URL=postgres://mda:mda@mda-postgres:5432/mda
+# The app serves requests as the non-superuser mda_app role (biz.* RLS engages).
+# MDA_APP_DATABASE_URL + MDA_JWT_SECRET come from the env file (secrets).
+EnvironmentFile=/etc/mda/mda-app.env
+PublishPort=8080:8080
+Network=mda.network
+# The image's CMD runs /app/mda-server; no Exec override needed.
+
+[Service]
+Restart=always
+# Start only after the datastores, and restart them if they go down.
+Requires=mda-postgres.service mda-redis.service
+After=mda-postgres.service mda-redis.service
+# Give it a generous start window (it runs migrations + a cache warm-up).
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

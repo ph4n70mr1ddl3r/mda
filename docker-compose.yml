@@ -1,10 +1,18 @@
 # Dev environment for MDA (PLAN §3 / Phase 0).
 #
-#   docker compose up -d postgres redis     # start the deps
-#   cargo run                                # run the server against them
-#   docker compose up -d --build app         # run the server itself (optional)
+# Works with both Docker and Podman:
+#   docker compose up -d postgres redis
+#   podman compose up -d postgres redis     # Podman 4+ (named volumes are
+#                                           # rootless-safe; no :Z needed)
+# then run the server against them:
+#   DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable cargo run
+# or build & run the app container:
+#   docker compose --profile app up -d --build
 #
-# The `app` service builds the Rust workspace from ./Dockerfile.
+# Staging (prod-like, json logs, restart policies, resource limits):
+#   docker compose -f docker-compose.yml -f compose.staging.yml --profile app up -d
+#
+# Production via systemd + Quadlet: see deploy/quadlet/README.md
 
 services:
   postgres:

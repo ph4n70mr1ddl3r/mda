@@ -11,12 +11,15 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 ## Quick start (Phase 0)
 
 ```bash
-# 1. dependencies (Postgres 16 + Redis)
+# 1. dependencies (Postgres 16 + Redis) — Docker OR Podman:
 docker compose up -d postgres redis
+# podman compose up -d postgres redis   # Podman 4+ works with the same file
 
-# 2. run the server (boots, runs migrations, serves /health)
 cp .env.example .env            # adjust if needed
+
+# 2. run the server (boots, runs migrations, serves /health):
 DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable cargo run
+# or:  make run-dev   (starts the deps + runs the server)
 ```
 
 Health check:
@@ -54,10 +57,33 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 Tests:
 
 ```bash
-cargo test --lib --bins                     # unit tests (no DB needed)
+# unit + doc tests (no DB needed)
+cargo test --lib --bins --doc
+
+# DB-backed suites — the real verification (CRUD, publish, RLS, SSE,
+# archive/restore, sharing, workflow, reporting). They share one database and
+# are NOT parallel-safe, so run single-threaded:
 DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
-  cargo test --test integration             # applies migrations + checks schema
+  cargo test --test data --test studio --test integration -- --test-threads=1
+# or:  make test   (unit + DB-backed)
 ```
+
+The `data`/`studio` suites connect the app as the non-superuser `mda_app` role
+(created by the RLS migration) so `biz.*` row-level security actually engages;
+superusers bypass RLS, so the owner role can't be the one under test.
+
+## Deployment
+
+- **Dev:** `docker compose` / `podman compose` (see Quick start).
+- **Staging (prod-like):** `make up-staging` →
+  `docker compose -f docker-compose.yml -f compose.staging.yml --profile app up -d`
+  (json logs, restart policies, a memory ceiling; still serves as `mda_app`).
+- **Production:** Podman + **Quadlet** (systemd-managed containers) — see
+  [`deploy/quadlet/README.md`](./deploy/quadlet/README.md). `make quadlet-install`
+  lays down the `.container`/`.network`/`.volume` units; secrets live in
+  `/etc/mda/mda-app.env` (`MDA_APP_DATABASE_URL`, `MDA_JWT_SECRET`).
+
+`make` targets take `CTN=podman` to switch runtimes, e.g. `make up-staging CTN=podman`.
 
 Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 

@@ -1,0 +1,15 @@
+[Container]
+Image=docker.io/library/postgres:16
+ContainerName=mda-postgres
+Environment=POSTGRES_USER=mda
+Environment=POSTGRES_PASSWORD=mda
+Environment=POSTGRES_DB=mda
+# Reference the Quadlet volume by file basename.
+Volume=mda-postgres.volume:/var/lib/postgresql/data
+Network=mda.network
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

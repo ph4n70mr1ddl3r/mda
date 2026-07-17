@@ -9,6 +9,9 @@
 .env
 .env.*
 !.env.example
+# Quadlet runtime env (secrets) — only the .example is tracked
+**/mda-app.env
+!**/mda-app.env.example
 
 # Editor / OS
 .idea/
