@@ -82,7 +82,9 @@ pub fn create_table(table: &str, e: &DraftEntity) -> Result<Vec<String>> {
     }
     cols.push("attributes JSONB NOT NULL DEFAULT '{}'::jsonb".into());
     let body = cols.join(",\n  ");
-    out.push(format!("CREATE TABLE biz.{table} (\n  {body}\n)"));
+    out.push(format!(
+        "CREATE TABLE IF NOT EXISTS biz.{table} (\n  {body}\n)"
+    ));
     out.push(format!(
         "CREATE INDEX IF NOT EXISTS {table}_tenant_idx ON biz.{table} (tenant_id)"
     ));
@@ -112,11 +114,35 @@ pub fn create_table(table: &str, e: &DraftEntity) -> Result<Vec<String>> {
          ON biz_archive.{table} (tenant_id, id, archived_at DESC)"
     ));
     out.push(format!(
-        "DROP TRIGGER IF EXISTS {table}_archive ON biz.{table}; \
-         CREATE TRIGGER {table}_archive BEFORE DELETE ON biz.{table} \
+        "DROP TRIGGER IF EXISTS {table}_archive ON biz.{table}"
+    ));
+    out.push(format!(
+        "CREATE TRIGGER {table}_archive BEFORE DELETE ON biz.{table} \
          FOR EACH ROW EXECUTE FUNCTION mda.archive_row()"
     ));
+    // Row-Level Security: tenant isolation at the DB layer (§5.4 / §5.11). The
+    // app connects as a non-superuser role that owns these tables, so both
+    // ENABLE and FORCE are required (FORCE makes even the owner subject). The
+    // app sets `app.tenant_id` per operation; a query that forgets — or a
+    // cross-tenant probe — sees nothing (fail-closed).
+    out.extend(rls_stmts("biz", table));
+    out.extend(rls_stmts("biz_archive", table));
     Ok(out)
+}
+
+/// ENABLE + FORCE RLS and a `tenant_isolation` policy for one table. Policy
+/// names are scoped per-table, so a fixed name is reused safely on every table.
+fn rls_stmts(schema: &str, table: &str) -> Vec<String> {
+    vec![
+        format!("ALTER TABLE {schema}.{table} ENABLE ROW LEVEL SECURITY"),
+        format!("ALTER TABLE {schema}.{table} FORCE ROW LEVEL SECURITY"),
+        format!("DROP POLICY IF EXISTS tenant_isolation ON {schema}.{table}"),
+        format!(
+            "CREATE POLICY tenant_isolation ON {schema}.{table} \
+             USING (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid) \
+             WITH CHECK (tenant_id = NULLIF(current_setting('app.tenant_id', true), '')::uuid)"
+        ),
+    ]
 }
 
 /// Add a new field to an existing biz table. Only unique/indexed fields need a

@@ -19,6 +19,8 @@ struct Ctx {
     token: String,
     jwt: JwtConfig,
     pool: PgPool,
+    /// The non-superuser pool the app actually serves through (RLS active).
+    app_pool: PgPool,
     tenant: Uuid,
     user_id: Uuid,
 }
@@ -42,6 +44,18 @@ fn customer_model() -> Value {
             "relationships": []
         }]
     })
+}
+
+/// Build a DATABASE_URL that connects as the non-superuser `mda_app` role
+/// (created by the RLS migration) by swapping the userinfo of `url`.
+fn app_role_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            return format!("{}://mda_app:mda@{}", &url[..scheme_end], &rest[at + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 async fn setup() -> Option<Ctx> {
@@ -92,8 +106,21 @@ async fn setup() -> Option<Ctx> {
     let token = jwt.issue_access(user_id, tenant).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
+    // The app runs as the non-superuser `mda_app` role so the biz.* RLS policies
+    // actually engage (superusers BYPASS RLS). Migrations ran above as the
+    // privileged owner; ctx.pool (superuser) is kept for direct assertions.
+    let app_pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&app_role_url(&url))
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "RLS not exercised: could not connect as mda_app ({e}); falling back to owner pool"
+            );
+            pool.clone()
+        });
     let app = mda_api::router(AppState {
-        pool: pool.clone(),
+        pool: app_pool.clone(),
         cache: MetadataCache::new(),
         jwt: jwt.clone(),
         blobs,
@@ -104,6 +131,7 @@ async fn setup() -> Option<Ctx> {
         token,
         jwt,
         pool,
+        app_pool,
         tenant,
         user_id,
     })
@@ -731,11 +759,12 @@ async fn report_runs_with_grouping_and_export() {
         None => return,
     };
     // Customer with tier + amount
+    let table = format!("cust_{}", Uuid::new_v4().simple());
     let model = json!({
         "modules": [],
         "entities": [{
             "id": Uuid::new_v4(), "module_id": null,
-            "name": "Customer", "table_name": format!("cust_{}", Uuid::new_v4().simple()),
+            "name": "Customer", "table_name": table,
             "label": "Customer", "description": null,
             "fields": [
                 {"id": Uuid::new_v4(), "name":"tier","label":"Tier","field_type":"enum","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"options":["Bronze","Silver","Gold"]}},
@@ -1094,14 +1123,30 @@ async fn record_delete_archives_and_restore_recovers() {
         Some(c) => c,
         None => return,
     };
-    publish(&ctx, customer_model()).await;
+    let table = format!("cust_{}", Uuid::new_v4().simple());
+    publish(
+        &ctx,
+        json!({
+            "modules": [],
+            "entities": [{
+                "id": Uuid::new_v4(), "module_id": null,
+                "name": "Customer", "table_name": table, "label": "Customer", "description": null,
+                "fields": [
+                    {"id": Uuid::new_v4(),"name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                    {"id": Uuid::new_v4(),"name":"email","label":"Email","field_type":"string","required":false,"is_unique":true,"is_indexed":false,"default_expr":null,"config":{}}
+                ],
+                "relationships": []
+            }]
+        }),
+    )
+    .await;
 
     let (st, rec) = call(
         &ctx.app,
         "POST",
         "/api/data/Customer",
         &ctx.token,
-        Some(json!({"name":"Acme","email":"arc@x","tier":"Gold","balance":10}).to_string()),
+        Some(json!({"name":"Acme","email":"arc@x"}).to_string()),
         None,
     )
     .await;
@@ -1120,11 +1165,21 @@ async fn record_delete_archives_and_restore_recovers() {
     .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
 
-    let archived: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM biz_archive.customer WHERE id IS NOT NULL")
-            .fetch_one(&ctx.pool)
-            .await
-            .unwrap();
+    // Count archives under this tenant's GUC (ctx.pool is non-superuser, so the
+    // biz_archive RLS policy would otherwise hide the rows).
+    let mut tx = ctx.pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(ctx.tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let archived: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM biz_archive.{table} WHERE id IS NOT NULL"
+    ))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.rollback().await.unwrap();
     assert!(archived >= 1, "delete should have archived the row");
 
     // read → 404 (gone from live table)
@@ -1316,10 +1371,10 @@ async fn edge_endpoints_security_headers_and_metrics() {
         None => return,
     };
 
-    // /livez is always 200 and does NOT touch the DB.
-    let (st, body) = call(&ctx.app, "GET", "/livez", &ctx.token, None, None).await;
-    assert_eq!(st, StatusCode::OK, "livez: {body}");
-    assert_eq!(body.as_str(), Some("ok"));
+    // /livez is always 200 and does NOT touch the DB. (It returns plain text
+    // "ok"; `call` JSON-parses, so only the status is asserted here.)
+    let (st, _body) = call(&ctx.app, "GET", "/livez", &ctx.token, None, None).await;
+    assert_eq!(st, StatusCode::OK, "livez");
 
     // /readyz reflects DB reachability.
     let (st, body) = call(&ctx.app, "GET", "/readyz", &ctx.token, None, None).await;
@@ -1372,18 +1427,23 @@ async fn cross_tenant_data_is_isolated() {
     };
     // Two tenants share ONE biz table (same table_name) — the hardest case.
     let table = format!("cust_{}", Uuid::new_v4().simple());
-    let model = json!({
-        "modules": [],
-        "entities": [{
-            "id": Uuid::new_v4(), "module_id": null,
-            "name": "Customer", "table_name": table, "label": "Customer", "description": null,
-            "fields": [
-                {"id": Uuid::new_v4(),"name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
-            ],
-            "relationships": []
-        }]
-    });
-    publish(&ctx, model.clone()).await;
+    // A factory so each tenant gets fresh ids but the SAME table_name (shared
+    // biz table — the hardest cross-tenant case). md_* PKs are global.
+    let model_for = |t: String| {
+        json!({
+            "modules": [],
+            "entities": [{
+                "id": Uuid::new_v4(), "module_id": null,
+                "name": "Customer", "table_name": t, "label": "Customer", "description": null,
+                "fields": [
+                    {"id": Uuid::new_v4(),"name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+                ],
+                "relationships": []
+            }]
+        })
+    };
+    let model = model_for(table.clone());
+    publish(&ctx, model).await;
 
     // Tenant B: its own user/role/token in a DIFFERENT tenant.
     let tenant_b = Uuid::new_v4();
@@ -1429,7 +1489,30 @@ async fn cross_tenant_data_is_isolated() {
     .await;
     let did = d["id"].as_str().unwrap().parse::<Uuid>().unwrap();
     let etag = d["version_etag"].as_str().unwrap().to_string();
-    publish_with_uuid_etag(&ctx, did, &etag, model).await;
+    // Publish for tenant B as B (fresh ids, same table_name → shared biz table).
+    let model_b = model_for(table.clone());
+    let put = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/studio/drafts/{did}/model"))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token_b}"),
+        )
+        .header("if-match", etag)
+        .header("content-type", "application/json")
+        .body(Body::from(model_b.to_string()))
+        .unwrap();
+    let _ = ctx.app.clone().oneshot(put).await.unwrap();
+    let (pst, pr) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/studio/drafts/{did}/publish"),
+        &token_b,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(pst, StatusCode::OK, "B publish: {pr}");
 
     // Tenant A creates a record.
     let (_, a_rec) = call(
@@ -1482,4 +1565,134 @@ async fn cross_tenant_data_is_isolated() {
     )
     .await;
     assert_eq!(list_a["total"], 1, "tenant A sees only its own: {list_a}");
+}
+
+#[tokio::test]
+async fn rls_enforces_tenant_isolation_at_db_layer() {
+    // Direct proof that the biz.* RLS policy engages at the POSTGRES layer —
+    // independent of the app's tenant_id filters. Connects as the non-superuser
+    // `mda_app` role and queries with no / wrong / correct tenant GUC.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    let table = format!("rls_probe_{}", Uuid::new_v4().simple());
+    publish(
+        &ctx,
+        json!({
+            "modules": [],
+            "entities": [{
+                "id": Uuid::new_v4(), "module_id": null,
+                "name": "Probe", "table_name": table, "label": "Probe", "description": null,
+                "fields": [
+                    {"id": Uuid::new_v4(),"name":"k","label":"K","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+                ],
+                "relationships": []
+            }]
+        }),
+    )
+    .await;
+    let (_, _) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Probe",
+        &ctx.token,
+        Some(json!({"k":"v"}).to_string()),
+        None,
+    )
+    .await;
+
+    // The app serves through ctx.app_pool as a NON-SUPERUSER role, so the biz.*
+    // RLS policy engages (in docker that role is mda_app; in any non-superuser
+    // deployment the connection role already qualifies). These probes bypass
+    // the app's tenant_id filters entirely — they are a direct DB-layer check.
+
+    // (1) No tenant GUC → RLS fails closed (0 rows). A query that forgets the
+    //     GUC can never leak across tenants.
+    let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM biz.{table}"))
+        .fetch_one(&ctx.app_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "non-superuser with no GUC must see 0 rows (fail-closed)"
+    );
+
+    // (2) Correct tenant GUC → sees the row.
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(ctx.tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let ok: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM biz.{table}"))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(ok, 1, "with the right GUC the tenant's row is visible");
+    tx.rollback().await.unwrap();
+
+    // (3) Wrong tenant GUC → 0 rows.
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(Uuid::new_v4().to_string())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let wrong: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM biz.{table}"))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(wrong, 0, "with a wrong GUC must see 0 rows");
+}
+
+#[tokio::test]
+async fn tenant_guc_does_not_leak_across_pool_checkouts() {
+    // Regression guard for a subtle RLS bypass: mda-data sets app.tenant_id
+    // transaction-LOCAL. If it ever leaked to the session, a *later* query on a
+    // reused pooled connection (e.g. a report, which does NOT set the GUC)
+    // would see another tenant's rows. This test proves the GUC is scoped to the
+    // create txn only.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    let table = format!("leak_{}", Uuid::new_v4().simple());
+    publish(
+        &ctx,
+        json!({
+            "modules": [],
+            "entities": [{
+                "id": Uuid::new_v4(), "module_id": null,
+                "name": "Leak", "table_name": table, "label": "L", "description": null,
+                "fields": [
+                    {"id": Uuid::new_v4(),"name":"k","label":"K","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+                ],
+                "relationships": []
+            }]
+        }),
+    )
+    .await;
+    // Create via the app (mda_app) — this sets the GUC inside the create txn.
+    let _ = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Leak",
+        &ctx.token,
+        Some(json!({"k":"v"}).to_string()),
+        None,
+    )
+    .await;
+
+    // Now, on the SAME app pool (a connection that may have served the create),
+    // issue a raw biz query with NO tenant GUC set. RLS must block it (0 rows).
+    // If this returns 1, the GUC leaked to the session and RLS is bypassable.
+    let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM biz.{table}"))
+        .fetch_one(&ctx.app_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 0,
+        "app.tenant_id leaked to the session — a later GUC-less query saw tenant data (RLS bypass)"
+    );
 }

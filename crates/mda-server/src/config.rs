@@ -13,6 +13,10 @@ pub struct Settings {
     pub host: String,
     pub port: u16,
     pub db_max_connections: u32,
+    /// Optional non-superuser connection string (the `mda_app` role). The app
+    /// serves requests through this pool so biz.* RLS engages. The owner
+    /// `database_url` is still used for migrations + bootstrap.
+    pub app_database_url: Option<String>,
     pub log_format: String,
     /// Fallback filter used only when `RUST_LOG` is unset.
     pub log_default: String,
@@ -26,6 +30,7 @@ impl Settings {
             host: env_or("MDA_HOST", "0.0.0.0"),
             port: parse_env("MDA_PORT", 8080)?,
             db_max_connections: parse_env("MDA_DB_MAX_CONNECTIONS", 10)?,
+            app_database_url: std::env::var("MDA_APP_DATABASE_URL").ok(),
             log_format: env_or("LOG_FORMAT", "pretty"),
             log_default: "info,mda=debug,sqlx=warn".to_string(),
         })

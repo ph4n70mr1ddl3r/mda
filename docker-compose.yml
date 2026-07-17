@@ -40,6 +40,9 @@ services:
     profiles: ["app"]
     environment:
       DATABASE_URL: postgres://mda:mda@postgres:5432/mda
+      # The app serves as the non-superuser mda_app role so biz.* RLS engages.
+      # The role + grants are created at startup by migrations/...rls.sql.
+      MDA_APP_DATABASE_URL: postgres://mda_app:mda@postgres:5432/mda
       REDIS_URL: redis://redis:6379
       MDA_HOST: 0.0.0.0
       MDA_PORT: 8080

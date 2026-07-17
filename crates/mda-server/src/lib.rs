@@ -28,19 +28,50 @@ pub async fn run() -> anyhow::Result<()> {
     // Ensure a bootstrap admin exists (idempotent) for the bootstrap tenant.
     bootstrap::ensure_admin(&pool).await?;
 
-    // Metadata cache + invalidation (PLAN §5.3).
+    // The app serves requests as the non-superuser `mda_app` role so the biz.*
+    // RLS policies engage (superusers/owners BYPASS RLS). Migrations + bootstrap
+    // above ran as the owner; from here the runtime uses the low-privilege pool
+    // when MDA_APP_DATABASE_URL is set. If unset we warn loudly — in release the
+    // app would run as the owner and RLS would be silently inert.
+    let app_pool = match &cfg.app_database_url {
+        Some(url) => {
+            tracing::info!("app role pool: mda_app (RLS active)");
+            PgPoolOptions::new()
+                .max_connections(cfg.db_max_connections)
+                .connect(url)
+                .await
+                .context("connecting app (mda_app) pool")?
+        }
+        None => {
+            if cfg!(debug_assertions) {
+                tracing::warn!(
+                    "MDA_APP_DATABASE_URL unset — running as the owner; biz.* RLS is INERT. \
+                     Set it to the mda_app role for tenant isolation at the DB layer."
+                );
+            } else {
+                tracing::error!(
+                    "MDA_APP_DATABASE_URL unset in release — the app runs as the owner and \
+                     biz.* RLS policies do NOT engage. Set it to the non-superuser mda_app role."
+                );
+            }
+            pool.clone()
+        }
+    };
+
+    // Metadata cache + invalidation (PLAN §5.3). Background workers touch only
+    // sys_* / meta tables (no RLS in this scope), so the app role pool is safe.
     let cache = mda_meta::MetadataCache::new();
-    mda_meta::cache::spawn_listen(pool.clone(), cache.clone());
-    mda_meta::cache::spawn_poll(pool.clone(), cache.clone());
-    outbox::spawn_drain(pool.clone());
+    mda_meta::cache::spawn_listen(app_pool.clone(), cache.clone());
+    mda_meta::cache::spawn_poll(app_pool.clone(), cache.clone());
+    outbox::spawn_drain(app_pool.clone());
 
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
     let events = mda_api::events::channel();
-    mda_api::events::spawn_listen(pool.clone(), events.clone());
+    mda_api::events::spawn_listen(app_pool.clone(), events.clone());
 
     let app: Router = mda_api::router(AppState {
-        pool: pool.clone(),
+        pool: app_pool,
         cache,
         jwt: mda_security::JwtConfig::from_env(),
         blobs,

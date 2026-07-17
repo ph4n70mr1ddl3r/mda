@@ -146,6 +146,7 @@ async fn pump(pool: &PgPool, last: i64, tx: &broadcast::Sender<EventRow>) -> i64
 struct EventDbRow {
     seq: i64,
     tenant_id: Uuid,
+    #[sqlx(rename = "type")]
     typ: String,
     entity: Option<String>,
     record_id: Option<Uuid>,

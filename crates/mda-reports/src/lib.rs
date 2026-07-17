@@ -214,8 +214,15 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
 
     // bind tenant + owner + filters (all text; casts applied in SQL). Run inside
     // a short-lived txn so the per-run statement_timeout is scoped to this query
-    // only (§5.17) — a runaway report is killed rather than left to scan.
+    // only (§5.17) — a runaway report is killed rather than left to scan — AND
+    // so the biz.* RLS policy sees this caller's tenant (RLS fail-closes without
+    // the GUC; mda-data does the same per operation).
     let mut tx = pool.begin().await.map_err(Error::internal)?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(identity.tenant_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
     sqlx::query("SELECT set_config('statement_timeout', $1, true)")
         .bind(REPORT_TIMEOUT_MS)
         .execute(&mut *tx)

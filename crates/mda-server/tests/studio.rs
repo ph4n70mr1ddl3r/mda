@@ -81,14 +81,35 @@ async fn setup() -> Option<(axum::Router, String)> {
     let token = jwt.issue_access(user_id, tenant).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
+    // Publish DDL + meta writes run as the non-superuser `mda_app` role (the
+    // role the app uses in production), matching prod ownership of biz tables.
+    let app_pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&app_role_url(&url))
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("could not connect as mda_app ({e}); using owner pool");
+            pool
+        });
     let app = mda_api::router(AppState {
-        pool,
+        pool: app_pool,
         cache: MetadataCache::new(),
         jwt,
         blobs,
         events: mda_api::events::channel(),
     });
     Some((app, token))
+}
+
+/// Swap the userinfo of `url` to connect as the non-superuser `mda_app` role.
+fn app_role_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        if let Some(at) = rest.find('@') {
+            return format!("{}://mda_app:mda@{}", &url[..scheme_end], &rest[at + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 async fn call(

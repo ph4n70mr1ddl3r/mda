@@ -20,6 +20,18 @@ use uuid::Uuid;
 const MAX_PAGE_SIZE: u64 = 200;
 const DEFAULT_PAGE_SIZE: u64 = 50;
 
+/// Set the per-transaction tenant context used by the `biz.*` RLS policies
+/// (PLAN §5.4 / §5.11). `set_config(..., true)` is transaction-local; without it
+/// the policy denies every row (fail-closed).
+async fn set_tenant(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, tenant: Uuid) -> Result<()> {
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    Ok(())
+}
+
 /// Resolved record-level scope for one request on one entity.
 #[derive(Debug, Clone, Copy)]
 pub struct RecordScope {
@@ -142,12 +154,6 @@ pub async fn create(
             }
         }
     }
-    for f in &def.fields {
-        if f.field_type == "auto_number" && !attributes.contains_key(&f.name) {
-            let n = next_sequence(pool, tenant, def.entity.id, &f.name).await?;
-            attributes.insert(f.name.clone(), Value::from(n));
-        }
-    }
 
     let mut fk_cols: Vec<&str> = Vec::new();
     let mut fk_values: Vec<Option<Uuid>> = Vec::new();
@@ -166,6 +172,30 @@ pub async fn create(
     }
 
     let id = Uuid::from(mda_core::Id::new());
+
+    // Run under the tenant GUC so the biz.<t> RLS WITH CHECK passes, and keep
+    // the gapless auto_number UPSERT atomic with the INSERT.
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    for f in &def.fields {
+        if f.field_type == "auto_number" && !attributes.contains_key(&f.name) {
+            let (n,): (i64,) = sqlx::query_as(
+                "INSERT INTO meta.md_sequence (tenant_id, entity_id, field_name, next)
+                 VALUES ($1, $2, $3, 1)
+                 ON CONFLICT (tenant_id, entity_id, field_name)
+                 DO UPDATE SET next = meta.md_sequence.next + 1
+                 RETURNING next",
+            )
+            .bind(tenant)
+            .bind(def.entity.id)
+            .bind(&f.name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            attributes.insert(f.name.clone(), Value::from(n));
+        }
+    }
+
     let attrs_json = Value::Object(attributes);
     let mut cols: Vec<&str> = vec!["id", "tenant_id", "owner_id", "attributes"];
     cols.extend(fk_cols.iter().copied());
@@ -176,7 +206,6 @@ pub async fn create(
         cols.join(", "),
         placeholders.join(", ")
     );
-
     let mut q = sqlx::query(&sql)
         .bind(id)
         .bind(tenant)
@@ -185,7 +214,8 @@ pub async fn create(
     for v in fk_values {
         q = q.bind(v);
     }
-    q.execute(pool).await.map_err(Error::internal)?;
+    q.execute(&mut *tx).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
 
     read(pool, tenant, def, id, &RecordScope::superuser(owner)).await
 }
@@ -208,16 +238,17 @@ pub async fn read(
     if let Some(ref p) = &rp {
         sql.push_str(&format!(" AND {}", p.replace("{u}", "3")));
     }
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
     let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str())
         .bind(id)
         .bind(tenant);
     if rp.is_some() {
         q = q.bind(scope.user_id);
     }
-    q.fetch_optional(pool)
-        .await
-        .map_err(Error::internal)?
-        .map(|(v,)| reconstruct(def, v))
+    let row = q.fetch_optional(&mut *tx).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    row.map(|(v,)| reconstruct(def, v))
         .ok_or_else(|| Error::NotFound(format!("record {id}")))
 }
 
@@ -301,14 +332,18 @@ pub async fn update(
         q = q.bind(scope.user_id);
     }
 
-    match q.fetch_optional(pool).await.map_err(Error::internal)? {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let result = match q.fetch_optional(&mut *tx).await.map_err(Error::internal)? {
         Some((doc,)) => Ok(reconstruct(def, doc)),
-        None => distinguish_not_found_or_conflict(pool, def, tenant, id, scope).await,
-    }
+        None => distinguish_not_found_or_conflict(&mut tx, def, tenant, id, scope).await,
+    };
+    tx.commit().await.map_err(Error::internal)?;
+    result
 }
 
 async fn distinguish_not_found_or_conflict(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     def: &EntityDefinition,
     tenant: Uuid,
     id: Uuid,
@@ -321,7 +356,7 @@ async fn distinguish_not_found_or_conflict(
     ))
     .bind(id)
     .bind(tenant)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(Error::internal)?;
     match exists {
@@ -341,7 +376,8 @@ async fn distinguish_not_found_or_conflict(
             if rp.is_some() {
                 q = q.bind(scope.user_id);
             }
-            let writable: Option<(i32,)> = q.fetch_optional(pool).await.map_err(Error::internal)?;
+            let writable: Option<(i32,)> =
+                q.fetch_optional(&mut **tx).await.map_err(Error::internal)?;
             if writable.is_none() {
                 Err(Error::NotFound(format!("record {id}"))) // not visible/writable -> 404 (no leak)
             } else {
@@ -375,7 +411,10 @@ pub async fn delete(
     if rp.is_some() {
         q = q.bind(scope.user_id);
     }
-    let res = q.execute(pool).await.map_err(Error::internal)?;
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let res = q.execute(&mut *tx).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     if res.rows_affected() == 0 {
         return Err(Error::NotFound(format!("record {id}")));
     }
@@ -420,8 +459,6 @@ pub async fn list(
             ListBind::Text(v) => cq.bind(v.clone()),
         };
     }
-    let total = cq.fetch_one(pool).await.map_err(Error::internal)?;
-
     // page
     let list_sql = format!(
         "SELECT to_jsonb(t.*) AS doc FROM biz.{table} t WHERE {where_sql} ORDER BY {order_sql} \
@@ -437,7 +474,12 @@ pub async fn list(
         };
     }
     q = q.bind(page_size as i64).bind(offset as i64);
-    let rows = q.fetch_all(pool).await.map_err(Error::internal)?;
+
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let total = cq.fetch_one(&mut *tx).await.map_err(Error::internal)?;
+    let rows = q.fetch_all(&mut *tx).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     let items = rows.into_iter().map(|(v,)| reconstruct(def, v)).collect();
     Ok(ListResult {
         items,
@@ -614,26 +656,29 @@ pub async fn restore(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "INSERT INTO biz.{table} \
+        "INSERT INTO biz.{table} AS t \
             (id, tenant_id, owner_id, state, version, created_at, updated_at, attributes{fk_head}) \
          SELECT id, tenant_id, owner_id, state, version + 1, created_at, now(), attributes{fk_head} \
          FROM biz_archive.{table} a \
          WHERE a.id = $1 AND a.tenant_id = $2 \
          ORDER BY a.archived_at DESC \
          LIMIT 1 \
-         RETURNING to_jsonb(*) AS doc",
+         RETURNING to_jsonb(t.*) AS doc",
         fk_head = if fk.is_empty() {
             String::new()
         } else {
             format!(", {fk}")
         }
     );
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
     let row: Option<(Value,)> = sqlx::query_as(&sql)
         .bind(id)
         .bind(tenant)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     let (doc,) = row.ok_or_else(|| Error::NotFound(format!("archived record {id}")))?;
     Ok(reconstruct(def, doc))
 }
