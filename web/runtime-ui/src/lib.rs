@@ -4,10 +4,25 @@
 
 mod api;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use leptos::*;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{closure::Closure, JsCast};
 
 use api::{local_get, local_remove, local_set, EntityInfo, ModelInfo};
+
+/// Owns an SSE `EventSource` and its `onmessage` closure for a record form, so
+/// both can be dropped (→ connection closed) when the form unmounts.
+type EsHandle = Rc<
+    RefCell<
+        Option<(
+            web_sys::EventSource,
+            Closure<dyn FnMut(web_sys::MessageEvent)>,
+        )>,
+    >,
+>;
 
 // ===== global app state =====
 
@@ -16,6 +31,9 @@ pub struct AppState {
     pub token: RwSignal<Option<String>>,
     pub page: RwSignal<Page>,
     pub model: RwSignal<Option<ModelInfo>>,
+    /// Bumped after a create/update/delete so list views refetch on return
+    /// (doesn't rely on SPA component remount to pick up changes).
+    pub refresh: RwSignal<u64>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -23,7 +41,10 @@ pub enum Page {
     Dashboard,
     List(String),
     /// Edit an existing record (Some id) or create one (None).
-    Form { entity: String, id: Option<String> },
+    Form {
+        entity: String,
+        id: Option<String>,
+    },
 }
 
 // ===== root =====
@@ -33,7 +54,13 @@ pub fn App() -> impl IntoView {
     let token = create_rw_signal(local_get("mda_token"));
     let page = create_rw_signal(Page::Dashboard);
     let model = create_rw_signal(None);
-    let state = AppState { token, page, model };
+    let refresh = create_rw_signal(0u64);
+    let state = AppState {
+        token,
+        page,
+        model,
+        refresh,
+    };
     provide_context(state);
 
     let token_for_effect = token;
@@ -191,8 +218,9 @@ fn EntityList(entity: String) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let token = state.token;
     let entity_fetch = entity.clone();
+    let refresh = state.refresh;
     let resource = create_resource(
-        move || (),
+        move || refresh.get(),
         move |_| {
             let token = token.get().unwrap_or_default();
             let entity = entity_fetch.clone();
@@ -240,7 +268,7 @@ fn EntityList(entity: String) -> impl IntoView {
                                 let token_del = token;
                                 let ent_sig_edit = ent_sig;
                                 let ent_sig_del = ent_sig;
-                                let res_ref = resource.clone();
+                                let res_ref = resource;
                                 view! {
                                     <div style="padding:6px; margin:4px 0; border:1px solid #eee; border-radius:4px; display:flex; align-items:center;">
                                         <span style="flex:1;">{display}</span>
@@ -257,7 +285,7 @@ fn EntityList(entity: String) -> impl IntoView {
                                                 let tok = token_del.get().unwrap_or_default();
                                                 let ent = ent_sig_del.get();
                                                 let idd = id_del.clone();
-                                                let res = res_ref.clone();
+                                                let res = res_ref;
                                                 spawn_local(async move {
                                                     let _ = api::delete_record(&tok, &ent, &idd).await;
                                                     res.refetch();
@@ -280,7 +308,6 @@ fn EntityList(entity: String) -> impl IntoView {
 
 #[component]
 fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
-    use std::collections::HashMap;
     let state = use_context::<AppState>().unwrap();
     let token = state.token;
     let s = state;
@@ -290,7 +317,12 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     let fields_of = move || {
         s.model
             .get()
-            .and_then(|m| m.entities.into_iter().find(|e| e.name == entity_for_fields).map(|e| e.fields))
+            .and_then(|m| {
+                m.entities
+                    .into_iter()
+                    .find(|e| e.name == entity_for_fields)
+                    .map(|e| e.fields)
+            })
             .unwrap_or_default()
     };
 
@@ -338,43 +370,54 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     });
 
     // SSE: watch this record for remote changes (edit only) → conflict banner.
-    let id_sse = id.clone();
-    let entity_sse = entity.clone();
-    create_effect(move |_| {
-        let rid = match id_sse.clone() {
-            Some(r) => r,
-            None => return,
-        };
-        let tok = match token.get() {
-            Some(t) => t,
-            None => return,
-        };
-        let url = api::events_url(&tok, &format!("record:{}:{rid}", entity_sse.clone()));
-        let es = match web_sys::EventSource::new(&url) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let my_id = rid.clone();
-        let set_conflict = conflict;
-        let cb = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
-            move |ev: web_sys::MessageEvent| {
-                if let Some(data) = ev.data().as_string() {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                        if v["record_id"].as_str() == Some(my_id.as_str())
-                            && v["type"].as_str() == Some("record.updated")
-                        {
-                            if let Some(to_v) = v["payload"]["to_version"].as_i64() {
-                                set_conflict.set(Some(to_v));
+    // The EventSource + its onmessage closure are owned by `es_holder` and
+    // closed/dropped on unmount via `on_cleanup`, so navigating the SPA back to
+    // the list releases the connection instead of leaking one per form visit.
+    let es_holder: EsHandle = Rc::new(RefCell::new(None));
+    {
+        if let Some(rid) = id.clone() {
+            if let Some(tok) = token.get() {
+                let channel = format!("record:{}:{rid}", entity);
+                let my_id = rid.clone();
+                let set_conflict = conflict;
+                let es_holder2 = es_holder.clone();
+                // EventSource can't set headers, so first fetch a short-lived,
+                // one-shot ticket — never putting the access JWT in the URL.
+                spawn_local(async move {
+                    let Ok(ticket) = api::event_ticket(&tok).await else {
+                        return;
+                    };
+                    let url = api::events_url(&ticket, &channel);
+                    let Ok(es) = web_sys::EventSource::new(&url) else {
+                        return;
+                    };
+                    let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+                        move |ev: web_sys::MessageEvent| {
+                            if let Some(data) = ev.data().as_string() {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                                    if v["record_id"].as_str() == Some(my_id.as_str())
+                                        && v["type"].as_str() == Some("record.updated")
+                                    {
+                                        if let Some(to_v) = v["payload"]["to_version"].as_i64() {
+                                            set_conflict.set(Some(to_v));
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    }
-                }
-            },
-        );
-        let _ = es.set_onmessage(Some(cb.as_ref().unchecked_ref()));
-        cb.forget();
-        // keep the EventSource alive for this view (closes when the tab navigates)
-        std::mem::forget(es);
+                        },
+                    );
+                    es.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+                    *es_holder2.borrow_mut() = Some((es, cb));
+                });
+            }
+        }
+    }
+    let es_holder_cleanup = es_holder.clone();
+    on_cleanup(move || {
+        if let Some((es, _cb)) = es_holder_cleanup.borrow_mut().take() {
+            es.close();
+            // `cb` drops here too, unlinking the JS callback.
+        }
     });
 
     let entity_save = entity.clone();
@@ -383,6 +426,19 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
         let tok = token.get().unwrap_or_default();
         let ent = entity_save.clone();
         let ver = version.get();
+        // Field name → declared type, so typed fields are sent as JSON scalars
+        // (bool/integer/decimal) rather than always as strings.
+        let field_types: HashMap<String, String> = s
+            .model
+            .get()
+            .and_then(|m| {
+                m.entities
+                    .into_iter()
+                    .find(|e| e.name == ent)
+                    .map(|e| e.fields)
+            })
+            .map(|fs| fs.into_iter().map(|f| (f.name, f.field_type)).collect())
+            .unwrap_or_default();
         let body = serde_json::Value::Object(
             values
                 .get()
@@ -393,10 +449,8 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                         "id" | "version" | "owner_id" | "state" | "created_at" | "updated_at"
                     ) {
                         None
-                    } else if v.is_empty() {
-                        Some((k.clone(), serde_json::Value::Null))
                     } else {
-                        Some((k.clone(), serde_json::Value::String(v.clone())))
+                        Some((k.clone(), coerce_field(&field_types, k, v)))
                     }
                 })
                 .collect(),
@@ -411,7 +465,11 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                 None => api::create_record(&tok, &ent, body).await,
             };
             match res {
-                Ok(_) => s_nav.page.set(Page::List(ent)),
+                Ok(_) => {
+                    // Refresh the list so the change is visible on return.
+                    s_nav.refresh.update(|n| *n += 1);
+                    s_nav.page.set(Page::List(ent));
+                }
                 Err(e) => {
                     if e.contains("409") {
                         error.set(
@@ -536,5 +594,27 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                 if e.is_empty() { ().into_view() } else { view!{ <p style="color:red;">{e}</p> }.into_view() }
             }}
         </div>
+    }
+}
+
+/// Coerce a form string value into the JSON value matching the field's declared
+/// type (per the mda-meta field registry), so bool/integer/decimal fields are
+/// sent as JSON scalars instead of always as strings. Empty → `Null` (clears
+/// the field); an unparseable number falls back to a string rather than drop.
+fn coerce_field(types: &HashMap<String, String>, key: &str, val: &str) -> serde_json::Value {
+    if val.is_empty() {
+        return serde_json::Value::Null;
+    }
+    match types.get(key).map(String::as_str).unwrap_or("string") {
+        "bool" => serde_json::Value::Bool(matches!(val, "true" | "1")),
+        "integer" => val
+            .parse::<i64>()
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|_| serde_json::Value::String(val.to_string())),
+        "decimal" | "money" => val
+            .parse::<f64>()
+            .map(serde_json::Value::from)
+            .unwrap_or_else(|_| serde_json::Value::String(val.to_string())),
+        _ => serde_json::Value::String(val.to_string()),
     }
 }
