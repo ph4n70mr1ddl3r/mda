@@ -53,3 +53,26 @@ jobs:
       # so they are fully parallel-safe — no --test-threads=1 needed.
       - name: DB-backed tests (RLS, CRUD, publish, SSE, archive/restore, …)
         run: cargo test --test data --test studio --test integration
+
+  # Build the Leptos WASM runtime UI with Trunk (catches UI regressions; the
+  # backend job can't — the UI is a separate standalone workspace). Runs in
+  # parallel; no DB needed.
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "web/runtime-ui"
+
+      - name: Install trunk
+        run: cargo install --locked trunk
+
+      - name: Build WASM UI
+        working-directory: web/runtime-ui
+        run: trunk build --release
