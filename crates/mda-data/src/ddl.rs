@@ -94,6 +94,28 @@ pub fn create_table(table: &str, e: &DraftEntity) -> Result<Vec<String>> {
             ));
         }
     }
+    // ADR-0006 / ADR-0015: a twin archive table + BEFORE DELETE trigger so every
+    // hard delete (and every cascade-deleted child) is recoverable. The archive
+    // is a plain structural copy (no generated columns / constraints); the
+    // generic mda.archive_row() copies the non-generated columns on DELETE.
+    out.push(format!(
+        "CREATE TABLE IF NOT EXISTS biz_archive.{table} (LIKE biz.{table})"
+    ));
+    out.push(format!(
+        "ALTER TABLE biz_archive.{table} \
+         ADD COLUMN IF NOT EXISTS archive_batch_id UUID, \
+         ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+         ADD COLUMN IF NOT EXISTS archived_by UUID"
+    ));
+    out.push(format!(
+        "CREATE INDEX IF NOT EXISTS archive_{table}_restore_idx \
+         ON biz_archive.{table} (tenant_id, id, archived_at DESC)"
+    ));
+    out.push(format!(
+        "DROP TRIGGER IF EXISTS {table}_archive ON biz.{table}; \
+         CREATE TRIGGER {table}_archive BEFORE DELETE ON biz.{table} \
+         FOR EACH ROW EXECUTE FUNCTION mda.archive_row()"
+    ));
     Ok(out)
 }
 
@@ -120,6 +142,13 @@ pub fn add_field(table: &str, f: &DraftField) -> Result<Vec<String>> {
             f.name, f.name
         ));
     }
+    // mirror the column to the archive table as a plain stored column so the
+    // BEFORE DELETE trigger's column list stays valid (generated columns aren't
+    // inserted; this holds the old value).
+    out.push(format!(
+        "ALTER TABLE biz_archive.{table} ADD COLUMN IF NOT EXISTS {} {st}",
+        f.name
+    ));
     Ok(out)
 }
 
@@ -134,14 +163,19 @@ pub fn add_relationship(
         "master_detail" => (" NOT NULL", "CASCADE"),
         _ => ("", on_delete_clause(&r.on_delete)),
     };
-    Ok(vec![
+    let mut out = vec![
         format!("ALTER TABLE biz.{table} ADD COLUMN {col} UUID{nullspec}"),
         format!(
             "ALTER TABLE biz.{table} ADD CONSTRAINT {table}_{col}_fk \
              FOREIGN KEY ({col}) REFERENCES biz.{target_table} (id) ON DELETE {ondel}"
         ),
         format!("CREATE INDEX IF NOT EXISTS {table}_{col}_idx ON biz.{table} ({col})"),
-    ])
+    ];
+    // mirror the FK column to the archive table (see add_field).
+    out.push(format!(
+        "ALTER TABLE biz_archive.{table} ADD COLUMN IF NOT EXISTS {col} UUID{nullspec}"
+    ));
+    Ok(out)
 }
 
 #[cfg(test)]

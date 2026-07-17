@@ -25,5 +25,6 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 tower = "0.5"
 http-body-util = "0.1"
+tokio-stream = "0.1"
 serde_json = { workspace = true }
 axum = { workspace = true }

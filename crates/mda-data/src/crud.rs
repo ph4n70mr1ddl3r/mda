@@ -590,6 +590,54 @@ fn uuid_or_null(v: Option<&Value>, field: &str) -> Result<Option<Uuid>> {
     }
 }
 
+// ===== restore from archive (ADR-0006 / ADR-0015) =====
+//
+// Hard delete moves the row to biz_archive.<table> via the BEFORE DELETE
+// trigger. Restore re-inserts the most recently archived copy of one record
+// with a higher `version` (so any stale client hits a clean 409, §5.9) and
+// created_at preserved. Single-record scope here; batch/cascade restore (one
+// click for a whole cascade tree) is the full ADR-0015 design and a follow-up.
+pub async fn restore(
+    pool: &PgPool,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    id: Uuid,
+) -> Result<Value> {
+    ensure_active(def)?;
+    // core + attributes + FK columns (same set as create; generated columns are
+    // excluded — they regenerate from `attributes` on insert).
+    let table = &def.entity.table_name;
+    let fk = def
+        .relationships
+        .iter()
+        .map(|r| r.source_field_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT INTO biz.{table} \
+            (id, tenant_id, owner_id, state, version, created_at, updated_at, attributes{fk_head}) \
+         SELECT id, tenant_id, owner_id, state, version + 1, created_at, now(), attributes{fk_head} \
+         FROM biz_archive.{table} a \
+         WHERE a.id = $1 AND a.tenant_id = $2 \
+         ORDER BY a.archived_at DESC \
+         LIMIT 1 \
+         RETURNING to_jsonb(*) AS doc",
+        fk_head = if fk.is_empty() {
+            String::new()
+        } else {
+            format!(", {fk}")
+        }
+    );
+    let row: Option<(Value,)> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(tenant)
+        .fetch_optional(pool)
+        .await
+        .map_err(Error::internal)?;
+    let (doc,) = row.ok_or_else(|| Error::NotFound(format!("archived record {id}")))?;
+    Ok(reconstruct(def, doc))
+}
+
 fn reconstruct(def: &EntityDefinition, doc: Value) -> Value {
     let Some(obj) = doc.as_object() else {
         return doc;

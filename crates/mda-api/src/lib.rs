@@ -15,6 +15,7 @@ pub mod auth;
 pub mod blobs;
 pub mod data;
 pub mod error;
+pub mod events;
 pub mod extract;
 pub mod notifications;
 pub mod reports;
@@ -29,6 +30,8 @@ pub struct AppState {
     pub cache: MetadataCache,
     pub jwt: JwtConfig,
     pub blobs: std::sync::Arc<dyn crate::blobs::BlobStore>,
+    /// Fan-out for the SSE real-time channel (§5.10); fed by `events::spawn_listen`.
+    pub events: tokio::sync::broadcast::Sender<crate::events::EventRow>,
 }
 
 /// Build the application router.
@@ -42,6 +45,7 @@ pub fn router(state: AppState) -> Router {
         .merge(reports::routes())
         .merge(notifications::routes())
         .merge(blobs::routes())
+        .merge(events::routes())
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }

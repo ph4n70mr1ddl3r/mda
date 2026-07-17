@@ -42,6 +42,10 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(transition_record),
         )
         .route(
+            "/api/data/:entity/:id/restore",
+            axum::routing::post(restore_record),
+        )
+        .route(
             "/api/impex/:entity/import",
             axum::routing::post(import_records),
         )
@@ -189,6 +193,33 @@ async fn update_record(
     Ok(Json(project(&user, &entity, &def, after)))
 }
 
+// ===== restore from archive (ADR-0006 / ADR-0015) =====
+
+/// `POST /api/data/:entity/:id/restore` — re-insert the most recently archived
+/// copy of a hard-deleted record (admin undo). Single-record scope; batch /
+/// cascade restore is the full ADR-0015 design and a follow-up.
+async fn restore_record(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((entity, id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<Value>> {
+    authorize(&user, &entity, "create")?;
+    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    let rec = mda_data::restore(&st.pool, user.tenant_id, &def, id).await?;
+    audit(
+        &st,
+        user.tenant_id,
+        user.user_id,
+        &entity,
+        Some(id),
+        "create",
+        None,
+        Some(rec.clone()),
+    )
+    .await;
+    Ok(Json(project(&user, &entity, &def, rec)))
+}
+
 async fn delete_record(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
@@ -324,6 +355,7 @@ async fn audit(
     before: Option<Value>,
     after: Option<Value>,
 ) {
+    // Compliance audit (heavy before/after JSONB, §4.7).
     if let Err(e) = sqlx::query(
         "INSERT INTO sys_audit_log (tenant_id, actor_id, entity, record_id, op, before, after)
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -333,14 +365,92 @@ async fn audit(
     .bind(entity)
     .bind(record_id.unwrap_or_else(Uuid::nil))
     .bind(op)
-    .bind(before)
-    .bind(after)
+    .bind(&before)
+    .bind(&after)
     .execute(&st.pool)
     .await
     {
         let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
         tracing::error!(?e, failures = n, "audit log insert failed");
     }
+
+    // Canonical domain event (lightweight facts for real-time/replay, §5.10).
+    // Written in the same transaction-bound request so it is consistent with the
+    // write; best-effort like the audit row.
+    let (etype, payload) = event_for(op, &before, &after);
+    if let (Some(etype), Some(rid)) = (etype, record_id) {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO sys_event_log (tenant_id, type, entity, record_id, actor_id, payload)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(tenant)
+        .bind(etype)
+        .bind(entity)
+        .bind(rid)
+        .bind(actor)
+        .bind(payload)
+        .execute(&st.pool)
+        .await
+        {
+            tracing::warn!(?e, "event log insert failed");
+        }
+    }
+}
+
+/// Map an audit op to a domain event type + a conservative payload. The payload
+/// carries only field *names* that changed (never values) so the SSE relay can
+/// notify a viewer that a record changed without leaking field-level data (the
+/// relay additionally AuthZ-filters; §5.10.6 full field filtering is a follow-up).
+fn event_for(
+    op: &str,
+    before: &Option<Value>,
+    after: &Option<Value>,
+) -> (Option<&'static str>, Value) {
+    let changed: Vec<String> = match (before, after) {
+        (Some(Value::Object(b)), Some(Value::Object(a))) => {
+            let core: &[&str] = &["id", "version", "updated_at", "created_at"];
+            a.iter()
+                .filter(|(k, v)| !core.contains(&k.as_str()) && b.get(*k) != Some(*v))
+                .map(|(k, _)| k.clone())
+                .collect()
+        }
+        (_, Some(Value::Object(a))) => {
+            let core: &[&str] = &["id", "version", "updated_at", "created_at"];
+            a.keys()
+                .filter(|k| !core.contains(&k.as_str()))
+                .cloned()
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let (etype, from_v, to_v) = match op {
+        "create" => (
+            Some("record.created"),
+            None,
+            after.as_ref().and_then(version_of),
+        ),
+        "update" => (
+            Some("record.updated"),
+            before.as_ref().and_then(version_of),
+            after.as_ref().and_then(version_of),
+        ),
+        "delete" => (
+            Some("record.deleted"),
+            before.as_ref().and_then(version_of),
+            None,
+        ),
+        _ => (None, None, None),
+    };
+    let payload = json!({
+        "changed_fields": changed,
+        "from_version": from_v,
+        "to_version": to_v,
+    });
+    (etype, payload)
+}
+
+fn version_of(v: &Value) -> Option<i64> {
+    v.get("version").and_then(|x| x.as_i64())
 }
 
 // ===== request parsing helpers =====

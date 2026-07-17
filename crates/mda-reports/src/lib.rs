@@ -24,6 +24,11 @@ use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Wall-clock cap (ms) on a single synchronous report run (§5.17 cost control).
+/// Overruns are killed by Postgres and surface as an internal error; large
+/// reports must run async as a job (a follow-up).
+const REPORT_TIMEOUT_MS: &str = "10000";
+
 /// A structured report dataset (the JSON stored in `md_report.dataset`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Dataset {
@@ -207,12 +212,21 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         sql.push_str(&format!(" LIMIT {lim}"));
     }
 
-    // bind tenant + owner + filters (all text; casts applied in SQL)
+    // bind tenant + owner + filters (all text; casts applied in SQL). Run inside
+    // a short-lived txn so the per-run statement_timeout is scoped to this query
+    // only (§5.17) — a runaway report is killed rather than left to scan.
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+        .bind(REPORT_TIMEOUT_MS)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
     let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str()).bind(identity.tenant_id);
     for b in &binds {
         q = q.bind(b);
     }
-    let rows: Vec<(Value,)> = q.fetch_all(pool).await.map_err(Error::internal)?;
+    let rows: Vec<(Value,)> = q.fetch_all(&mut *tx).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     let out: Vec<Map<String, Value>> = rows
         .into_iter()
         .map(|(v,)| match v {

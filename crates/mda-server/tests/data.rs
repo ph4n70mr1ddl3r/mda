@@ -97,6 +97,7 @@ async fn setup() -> Option<Ctx> {
         cache: MetadataCache::new(),
         jwt: jwt.clone(),
         blobs,
+        events: mda_api::events::channel(),
     });
     Some(Ctx {
         app,
@@ -1085,4 +1086,225 @@ async fn record_sharing_makes_private_visible() {
     )
     .await;
     assert_eq!(list["total"], 1, "shared record appears in list");
+}
+
+#[tokio::test]
+async fn record_delete_archives_and_restore_recovers() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+
+    let (st, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","email":"arc@x","tier":"Gold","balance":10}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "create: {rec}");
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // hard-delete → archive row appears (ADR-0006)
+    let (st, _) = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+
+    let archived: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM biz_archive.customer WHERE id IS NOT NULL")
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert!(archived >= 1, "delete should have archived the row");
+
+    // read → 404 (gone from live table)
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // restore → record is back, with a higher version (ADR-0015)
+    let (st, restored) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/data/Customer/{id}/restore"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "restore: {restored}");
+    assert_eq!(restored["email"], "arc@x");
+    assert_eq!(restored["version"], 2, "restored row gets a bumped version");
+
+    // read now works again
+    let (st, got) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(got["email"], "arc@x");
+}
+
+#[tokio::test]
+async fn write_path_emits_event_log() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","email":"ev@x"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    let created: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_event_log WHERE tenant_id=$1 AND entity='Customer' AND type='record.created'",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(created, 1, "create should emit one record.created event");
+
+    let _ = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"tier":"Silver"}).to_string()),
+        Some(1),
+    )
+    .await;
+    let updated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_event_log WHERE tenant_id=$1 AND entity='Customer' AND type='record.updated'",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert!(updated >= 1, "update should emit a record.updated event");
+
+    let _ = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    let deleted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_event_log WHERE tenant_id=$1 AND entity='Customer' AND type='record.deleted'",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(deleted, 1, "delete should emit one record.deleted event");
+
+    // events carry changed field *names* (never values) — verify shape.
+    let (payload,): (Value,) = sqlx::query_as(
+        "SELECT payload FROM sys_event_log WHERE tenant_id=$1 AND type='record.updated' ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    let changed = payload["changed_fields"].as_array().unwrap();
+    assert!(changed.iter().any(|v| v == "tier"));
+    assert!(
+        !changed.iter().any(|v| v == "version" || v == "updated_at"),
+        "internal versioning columns must not be reported as changed fields"
+    );
+}
+
+#[tokio::test]
+async fn sse_relay_replays_events_and_requires_auth() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","email":"sse@x"}).to_string()),
+        None,
+    )
+    .await;
+    let _id = rec["id"].as_str().unwrap();
+
+    // No token → 401.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/events")
+        .body(Body::empty())
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // With token + Last-Event-ID:0 → the replay (DB-backed, independent of the
+    // live LISTEN worker) must deliver the committed record.created event.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/events")
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", ctx.token),
+        )
+        .header("Last-Event-ID", "0")
+        .body(Body::empty())
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    use tokio_stream::StreamExt;
+    let mut stream = resp.into_body().into_data_stream();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2000);
+    let mut got = String::new();
+    while let Ok(Some(Ok(bytes))) = tokio::time::timeout_at(deadline, stream.next()).await {
+        got.push_str(&String::from_utf8_lossy(&bytes));
+        if got.contains("record.created") {
+            break;
+        }
+    }
+    assert!(
+        got.contains("record.created"),
+        "replay should deliver the committed event: {got}"
+    );
+    assert!(
+        got.contains("id:"),
+        "events carry a seq id (Last-Event-ID cursor)"
+    );
 }

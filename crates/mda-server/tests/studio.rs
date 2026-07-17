@@ -86,6 +86,7 @@ async fn setup() -> Option<(axum::Router, String)> {
         cache: MetadataCache::new(),
         jwt,
         blobs,
+        events: mda_api::events::channel(),
     });
     Some((app, token))
 }
