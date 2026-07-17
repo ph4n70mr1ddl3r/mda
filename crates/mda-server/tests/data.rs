@@ -14,6 +14,8 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod common;
+
 struct Ctx {
     app: axum::Router,
     token: String,
@@ -66,12 +68,8 @@ async fn setup() -> Option<Ctx> {
             return None;
         }
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    mda_server::migrate::run(&pool).await.unwrap();
+    // Each test gets its own fresh, migrated database → fully parallel-safe.
+    let (pool, db_url) = common::spawn_db(&url).await;
     let tenant = Uuid::new_v4();
     let (role_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, 'admin') RETURNING id",
@@ -111,7 +109,7 @@ async fn setup() -> Option<Ctx> {
     // privileged owner; ctx.pool (superuser) is kept for direct assertions.
     let app_pool = PgPoolOptions::new()
         .max_connections(4)
-        .connect(&app_role_url(&url))
+        .connect(&app_role_url(&db_url))
         .await
         .unwrap_or_else(|e| {
             eprintln!(
@@ -1695,4 +1693,58 @@ async fn tenant_guc_does_not_leak_across_pool_checkouts() {
         n, 0,
         "app.tenant_id leaked to the session — a later GUC-less query saw tenant data (RLS bypass)"
     );
+}
+
+#[tokio::test]
+async fn rls_gates_sec_record_share_at_db_layer() {
+    // sec_record_share (and sec_owd) carry tenant_id and are read/written only
+    // in request context, so they are RLS-gated. This proves the policy engages
+    // at the Postgres layer — a GUC-less or wrong-tenant query sees nothing.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    // Seed a share row for this tenant under the tenant GUC (RLS WITH CHECK
+    // blocks a GUC-less insert — which itself confirms the policy is live).
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)
+         VALUES ($1, 'Customer', $2, $3, 'read')",
+    )
+    .bind(ctx.tenant)
+    .bind(Uuid::new_v4())
+    .bind(ctx.user_id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // (1) app role, NO tenant GUC → RLS fails closed (0 rows).
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sec.sec_record_share")
+        .fetch_one(&ctx.app_pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "sec_record_share: no GUC must see 0 rows");
+
+    // (2) correct tenant GUC → the row is visible.
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    let ok: i64 = sqlx::query_scalar("SELECT count(*) FROM sec.sec_record_share")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(ok, 1, "sec_record_share: right GUC sees the tenant's row");
+    tx.rollback().await.unwrap();
+
+    // (3) wrong tenant GUC → 0 rows.
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, Uuid::new_v4())
+        .await
+        .unwrap();
+    let wrong: i64 = sqlx::query_scalar("SELECT count(*) FROM sec.sec_record_share")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(wrong, 0, "sec_record_share: wrong GUC sees 0 rows");
 }

@@ -64,15 +64,19 @@ pub async fn load_identity(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Identit
     ))
 }
 
-/// Resolve the OWD for an entity (default Private).
+/// Resolve the OWD for an entity (default Private). `sec_owd` is RLS-gated by
+/// tenant, so this runs under the tenant GUC.
 pub async fn resolve_owd(pool: &sqlx::PgPool, tenant: Uuid, entity: &str) -> Result<Owd> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    crate::set_tenant(&mut tx, tenant).await?;
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT default_access FROM sec.sec_owd WHERE tenant_id = $1 AND entity = $2",
     )
     .bind(tenant)
     .bind(entity)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(row.map(|(d,)| Owd::parse(&d)).unwrap_or(Owd::Private))
 }

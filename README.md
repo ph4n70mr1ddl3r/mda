@@ -61,10 +61,10 @@ Tests:
 cargo test --lib --bins --doc
 
 # DB-backed suites — the real verification (CRUD, publish, RLS, SSE,
-# archive/restore, sharing, workflow, reporting). They share one database and
-# are NOT parallel-safe, so run single-threaded:
+# archive/restore, sharing, workflow, reporting). Each test gets its own fresh
+# database, so they run fully in parallel:
 DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
-  cargo test --test data --test studio --test integration -- --test-threads=1
+  cargo test --test data --test studio --test integration
 # or:  make test   (unit + DB-backed)
 ```
 

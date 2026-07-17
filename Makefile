@@ -44,9 +44,10 @@ clippy:
 test-unit:
 	cargo test --lib --bins --doc
 
-# DB-backed suites share one database and are not parallel-safe → single-threaded.
+# DB-backed suites — each test gets its own fresh database (tests/common/mod.rs),
+# so they run fully in parallel.
 test-db:
-	DATABASE_URL="$(DB_URL)" cargo test --test data --test studio --test integration -- --test-threads=1
+	DATABASE_URL="$(DB_URL)" cargo test --test data --test studio --test integration
 
 test: test-unit test-db
 

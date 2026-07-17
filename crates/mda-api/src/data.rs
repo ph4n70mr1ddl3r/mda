@@ -684,6 +684,9 @@ async fn create_share(
     if principal_ok.is_none() {
         return Err(Error::Invalid("principal is not an active user in this tenant".into()).into());
     }
+    // sec_record_share is RLS-gated by tenant → insert under the tenant GUC.
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     sqlx::query(
         "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)
          VALUES ($1, $2, $3, $4, $5)
@@ -694,8 +697,9 @@ async fn create_share(
     .bind(id)
     .bind(req.principal_id)
     .bind(&req.access)
-    .execute(&st.pool)
+    .execute(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(StatusCode::CREATED)
 }

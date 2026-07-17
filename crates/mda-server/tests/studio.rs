@@ -12,6 +12,8 @@ use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+mod common;
+
 fn customer_model() -> Value {
     json!({
         "modules": [],
@@ -41,12 +43,8 @@ async fn setup() -> Option<(axum::Router, String)> {
             return None;
         }
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    mda_server::migrate::run(&pool).await.unwrap();
+    // Each test gets its own fresh, migrated database → fully parallel-safe.
+    let (pool, db_url) = common::spawn_db(&url).await;
     let tenant = Uuid::new_v4();
     let (role_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, 'admin') RETURNING id",
@@ -85,7 +83,7 @@ async fn setup() -> Option<(axum::Router, String)> {
     // role the app uses in production), matching prod ownership of biz tables.
     let app_pool = PgPoolOptions::new()
         .max_connections(4)
-        .connect(&app_role_url(&url))
+        .connect(&app_role_url(&db_url))
         .await
         .unwrap_or_else(|e| {
             eprintln!("could not connect as mda_app ({e}); using owner pool");

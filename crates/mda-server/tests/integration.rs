@@ -1,8 +1,8 @@
-//! Integration test: applies migrations to the DB named by `DATABASE_URL` and
-//! asserts the meta schema is in place. Skipped when `DATABASE_URL` is unset,
-//! so `cargo test` still passes without a database.
+//! Integration test: applies migrations to a fresh per-test database and asserts
+//! the meta schema is in place. Skipped when `DATABASE_URL` is unset, so
+//! `cargo test` still passes without a database.
 
-use sqlx::postgres::PgPoolOptions;
+mod common;
 
 #[tokio::test]
 async fn migrations_apply_and_meta_schema_exists() {
@@ -13,14 +13,7 @@ async fn migrations_apply_and_meta_schema_exists() {
             return;
         }
     };
-
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&url)
-        .await
-        .expect("connect to DATABASE_URL");
-
-    mda_server::migrate::run(&pool).await.expect("migrate");
+    let (pool, _db_url) = common::spawn_db(&url).await;
 
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.tables
@@ -33,11 +26,17 @@ async fn migrations_apply_and_meta_schema_exists() {
     .expect("query meta tables");
     assert_eq!(count, 9, "all meta skeleton tables should exist");
 
-    // the bootstrap active-version pointer should still be present
-    let bootstrap: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM meta.md_active_version WHERE tenant_id = '00000000-0000-0000-0000-000000000000'")
-            .fetch_one(&pool)
-            .await
-            .expect("query md_active_version");
-    assert!(bootstrap >= 1, "bootstrap active_version row should exist");
+    // The bootstrap active-version pointer is seeded by a migration (not by
+    // bootstrap::ensure_admin), so a freshly migrated DB already has it.
+    let bootstrap: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM meta.md_active_version \
+          WHERE tenant_id = '00000000-0000-0000-0000-000000000000'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("query md_active_version");
+    assert_eq!(
+        bootstrap, 1,
+        "bootstrap active_version row should be seeded by migration"
+    );
 }
