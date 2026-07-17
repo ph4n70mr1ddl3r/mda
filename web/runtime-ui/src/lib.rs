@@ -85,6 +85,7 @@ pub fn App() -> impl IntoView {
 #[component]
 fn Login() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
+    let (tenant, set_tenant) = create_signal("default".to_string());
     let (email, set_email) = create_signal("admin@mda.local".to_string());
     let (password, set_password) = create_signal("admin123".to_string());
     let (error, set_error) = create_signal(String::new());
@@ -94,6 +95,10 @@ fn Login() -> impl IntoView {
     view! {
         <div style="max-width: 300px; margin: 2rem auto;">
             <h2>"Login"</h2>
+            <p><label>"Tenant"</label><br/>
+                <input prop:value=tenant
+                    on:input=move |ev| set_tenant.set(event_target_value(&ev))
+                    style="width:100%; padding:4px;" /></p>
             <p><label>"Email"</label><br/>
                 <input prop:value=email
                     on:input=move |ev| set_email.set(event_target_value(&ev))
@@ -107,9 +112,9 @@ fn Login() -> impl IntoView {
                 on:click=move |_: leptos::ev::MouseEvent| {
                     set_loading.set(true);
                     set_error.set(String::new());
-                    let (e, p) = (email.get(), password.get());
+                    let (t, e, p) = (tenant.get(), email.get(), password.get());
                     spawn_local(async move {
-                        match api::login(&e, &p).await {
+                        match api::login(&t, &e, &p).await {
                             Ok(token) => {
                                 local_set("mda_token", &token);
                                 s.token.set(Some(token.clone()));

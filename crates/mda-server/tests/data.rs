@@ -85,15 +85,7 @@ async fn setup() -> Option<Ctx> {
         .unwrap();
     let hash = mda_security::hash_password("x").unwrap();
     let email = format!("u{}@test", Uuid::new_v4().simple());
-    let (user_id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO sec.sec_user (tenant_id, email, name, password_hash) VALUES ($1, $2, 'admin', $3) RETURNING id",
-    )
-    .bind(tenant)
-    .bind(&email)
-    .bind(&hash)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let user_id = common::seed_user(&pool, tenant, &email, "admin", &hash).await;
     sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
         .bind(user_id)
         .bind(role_id)
@@ -155,15 +147,7 @@ async fn limited_user(ctx: &Ctx, perms: &[(&str, &str)]) -> (String, Uuid) {
     }
     let hash = mda_security::hash_password("x").unwrap();
     let email = format!("u{}@test", Uuid::new_v4().simple());
-    let (user_id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO sec.sec_user (tenant_id, email, name, password_hash) VALUES ($1, $2, 'limited', $3) RETURNING id",
-    )
-    .bind(ctx.tenant)
-    .bind(&email)
-    .bind(&hash)
-    .fetch_one(&ctx.pool)
-    .await
-    .unwrap();
+    let user_id = common::seed_user(&ctx.pool, ctx.tenant, &email, "limited", &hash).await;
     sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
         .bind(user_id)
         .bind(role_id)
@@ -1458,15 +1442,14 @@ async fn cross_tenant_data_is_isolated() {
         .await
         .unwrap();
     let email_b = format!("b{}@test", Uuid::new_v4().simple());
-    let (user_b,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO sec.sec_user (tenant_id, email, name, password_hash) VALUES ($1, $2, 'b', $3) RETURNING id",
+    let user_b = common::seed_user(
+        &ctx.pool,
+        tenant_b,
+        &email_b,
+        "b",
+        &mda_security::hash_password("x").unwrap(),
     )
-    .bind(tenant_b)
-    .bind(&email_b)
-    .bind(mda_security::hash_password("x").unwrap())
-    .fetch_one(&ctx.pool)
-    .await
-    .unwrap();
+    .await;
     sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
         .bind(user_b)
         .bind(role_b)
@@ -1747,4 +1730,101 @@ async fn rls_gates_sec_record_share_at_db_layer() {
         .await
         .unwrap();
     assert_eq!(wrong, 0, "sec_record_share: wrong GUC sees 0 rows");
+}
+
+#[tokio::test]
+async fn tenant_scoped_login_and_sec_user_rls() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    // A user with a known password in ctx.tenant (no role needed for login).
+    let email = format!("login_{}@test", Uuid::new_v4().simple());
+    let pass = "hunter2";
+    let _uid = common::seed_user(
+        &ctx.pool,
+        ctx.tenant,
+        &email,
+        "loginer",
+        &mda_security::hash_password(pass).unwrap(),
+    )
+    .await;
+
+    // (1) Correct tenant (UUID) + password → tokens.
+    let (st, body) = call(
+        &ctx.app,
+        "POST",
+        "/api/auth/login",
+        "",
+        Some(json!({"tenant": ctx.tenant, "email": email, "password": pass}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "login: {body}");
+    let token = body["access_token"].as_str().unwrap().to_string();
+    // The issued JWT must carry the right tenant and work for /me (load_identity
+    // under the JWT tenant → sec_user RLS allows the lookup).
+    let (st, me) = call(&ctx.app, "GET", "/api/auth/me", &token, None, None).await;
+    assert_eq!(st, StatusCode::OK, "me: {me}");
+    assert_eq!(me["tenant_id"], json!(ctx.tenant));
+
+    // (2) WRONG tenant + the same email → invalid credentials. sec_user is
+    //     RLS-gated, so tenant B's GUC hides tenant A's user entirely.
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        "/api/auth/login",
+        "",
+        Some(json!({"tenant": Uuid::new_v4(), "email": email, "password": pass}).to_string()),
+        None,
+    )
+    .await;
+    assert!(
+        st == StatusCode::UNPROCESSABLE_ENTITY || st == StatusCode::UNAUTHORIZED,
+        "wrong-tenant login must fail"
+    );
+
+    // (3) Slug-based login: register a slug for ctx.tenant (sec_tenant has no RLS).
+    let slug = format!("acme-{}", Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO sec.sec_tenant (id, slug, name) VALUES ($1, $2, 'Acme') ON CONFLICT (id) DO UPDATE SET slug = $2, name = 'Acme'")
+        .bind(ctx.tenant)
+        .bind(&slug)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let (st, body) = call(
+        &ctx.app,
+        "POST",
+        "/api/auth/login",
+        "",
+        Some(json!({"tenant": slug, "email": email, "password": pass}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "slug login: {body}");
+
+    // (4) sec_user RLS at the Postgres layer (via the non-superuser app pool):
+    //     no GUC → 0; correct GUC → the user; wrong GUC → 0.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sec.sec_user")
+        .fetch_one(&ctx.app_pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "sec_user: no GUC must see 0 rows");
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    let ok: i64 = sqlx::query_scalar("SELECT count(*) FROM sec.sec_user WHERE email = $1")
+        .bind(&email)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(ok, 1, "sec_user: right GUC sees the user");
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, Uuid::new_v4())
+        .await
+        .unwrap();
+    let wrong: i64 = sqlx::query_scalar("SELECT count(*) FROM sec.sec_user")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(wrong, 0, "sec_user: wrong GUC sees 0 rows");
 }

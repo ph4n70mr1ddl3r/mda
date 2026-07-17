@@ -60,15 +60,7 @@ async fn setup() -> Option<(axum::Router, String)> {
         .unwrap();
     let hash = mda_security::hash_password("x").unwrap();
     let email = format!("u{}@test", Uuid::new_v4().simple());
-    let (user_id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO sec.sec_user (tenant_id, email, name, password_hash) VALUES ($1, $2, 'tester', $3) RETURNING id",
-    )
-    .bind(tenant)
-    .bind(&email)
-    .bind(&hash)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let user_id = common::seed_user(&pool, tenant, &email, "tester", &hash).await;
     sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
         .bind(user_id)
         .bind(role_id)

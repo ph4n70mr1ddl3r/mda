@@ -8,12 +8,17 @@ use uuid::Uuid;
 use crate::identity::{Access, Identity, Owd};
 
 /// Load the effective identity (roles -> object perms + field perms) for a user.
-pub async fn load_identity(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Identity> {
+/// `tenant` is the verified JWT's tenant claim — `sec_user` is RLS-gated, so the
+/// lookup runs under that tenant's GUC. A JWT whose (sub, tenant) don't match a
+/// real user-in-that-tenant fails closed (NotFound).
+pub async fn load_identity(pool: &sqlx::PgPool, user_id: Uuid, tenant: Uuid) -> Result<Identity> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    crate::set_tenant(&mut tx, tenant).await?;
     let (tenant_id, team_id): (Uuid, Option<Uuid>) = sqlx::query_as(
         "SELECT tenant_id, team_id FROM sec.sec_user WHERE id = $1 AND active = TRUE",
     )
     .bind(user_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?
     .ok_or_else(|| Error::NotFound(format!("user {user_id}")))?;
@@ -26,7 +31,7 @@ pub async fn load_identity(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Identit
           WHERE a.user_id = $1",
     )
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
     let object_perms: HashSet<(String, String)> = perms.into_iter().collect();
@@ -39,9 +44,10 @@ pub async fn load_identity(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Identit
           WHERE a.user_id = $1",
     )
     .bind(user_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     let mut field_perms: HashMap<(String, String), Access> = HashMap::new();
     for (entity, field, access) in fps {
         let a = Access::parse(&access);

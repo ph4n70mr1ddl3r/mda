@@ -4,18 +4,27 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// The bootstrap (all-zeros) tenant — created by the Phase-0 migration seed.
+/// The bootstrap (all-zeros) tenant — created by the Phase-0 migration seed and
+/// given the slug `default` by the tenant-login migration.
 const TENANT: Uuid = Uuid::nil();
 
 /// Ensure a bootstrap admin (`admin@mda.local`) with a superuser role exists.
 /// Password from `MDA_BOOTSTRAP_PASSWORD` (default `admin123`).
+///
+/// Runs under the bootstrap tenant's GUC because `sec_user` is RLS-gated: in
+/// production the owner role is a superuser (bypasses RLS anyway), but in dev it
+/// may be a non-superuser, so the GUC is set to be correct in both.
 pub async fn ensure_admin(pool: &PgPool) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    mda_security::set_tenant(&mut tx, TENANT).await?;
+
     let exists: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM sec.sec_user WHERE tenant_id = $1 LIMIT 1")
             .bind(TENANT)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await?;
     if exists.is_some() {
+        tx.commit().await?;
         return Ok(());
     }
 
@@ -28,21 +37,21 @@ pub async fn ensure_admin(pool: &PgPool) -> anyhow::Result<()> {
          ON CONFLICT (tenant_id, name) DO UPDATE SET name = 'Admins' RETURNING id",
     )
     .bind(TENANT)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     let (role_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, 'admin')
          ON CONFLICT (tenant_id, name) DO UPDATE SET name = 'admin' RETURNING id",
     )
     .bind(TENANT)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
         "INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1, '*', '*')
          ON CONFLICT DO NOTHING",
     )
     .bind(role_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     let (user_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO sec.sec_user (tenant_id, team_id, email, name, password_hash)
@@ -52,7 +61,7 @@ pub async fn ensure_admin(pool: &PgPool) -> anyhow::Result<()> {
     .bind(TENANT)
     .bind(team_id)
     .bind(&hash)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     sqlx::query(
         "INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)
@@ -60,9 +69,10 @@ pub async fn ensure_admin(pool: &PgPool) -> anyhow::Result<()> {
     )
     .bind(user_id)
     .bind(role_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
-    tracing::info!("bootstrap admin ready: admin@mda.local (tenant {TENANT})");
+    tracing::info!("bootstrap admin ready: admin@mda.local (tenant {TENANT}, slug 'default')");
     Ok(())
 }

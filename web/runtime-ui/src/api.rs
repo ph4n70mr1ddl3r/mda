@@ -45,10 +45,10 @@ pub struct TokenResp {
     pub access_token: String,
 }
 
-pub async fn login(email: &str, password: &str) -> Result<String, String> {
+pub async fn login(tenant: &str, email: &str, password: &str) -> Result<String, String> {
     let resp = gloo_net::http::Request::post(&format!("{API_BASE}/api/auth/login"))
         .header("content-type", "application/json")
-        .body(serde_json::json!({"email": email, "password": password}).to_string()).unwrap()
+        .body(serde_json::json!({"tenant": tenant, "email": email, "password": password}).to_string()).unwrap()
         .send()
         .await
         .map_err(|e| e.to_string())?;

@@ -29,6 +29,18 @@ curl localhost:8080/health
 # {"status":"ok","database":"up","version":"0.1.0"}
 ```
 
+Login is **tenant-scoped** (the client names the tenant; this is what lets the
+DB enforce `sec_user` row-level security — login sets the tenant context before
+the user lookup). The tenant may be a slug or a UUID; the bootstrap admin's
+tenant has slug `default`:
+
+```bash
+curl -X POST localhost:8080/api/auth/login \
+     -H 'content-type: application/json' \
+     -d '{"tenant":"default","email":"admin@mda.local","password":"admin123"}'
+# {"access_token":"…","refresh_token":"…","token_type":"Bearer"}
+```
+
 Studio API (Phase 1) — branch → edit → validate → publish:
 
 ```bash

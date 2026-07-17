@@ -672,21 +672,22 @@ async fn create_share(
     if !matches!(req.access.as_str(), "read" | "write") {
         return Err(Error::Invalid("access must be 'read' or 'write'".into()).into());
     }
+    // sec_user + sec_record_share are both RLS-gated by tenant → run both
+    // checks under the tenant GUC in one transaction.
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     // the principal must be an active user in the same tenant (no cross-tenant shares)
     let principal_ok: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM sec.sec_user WHERE id = $1 AND tenant_id = $2 AND active = TRUE",
     )
     .bind(req.principal_id)
     .bind(user.tenant_id)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
     if principal_ok.is_none() {
         return Err(Error::Invalid("principal is not an active user in this tenant".into()).into());
     }
-    // sec_record_share is RLS-gated by tenant → insert under the tenant GUC.
-    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
-    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     sqlx::query(
         "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)
          VALUES ($1, $2, $3, $4, $5)

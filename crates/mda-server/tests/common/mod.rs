@@ -9,6 +9,9 @@
 //! Requires the `DATABASE_URL` role to have `CREATEDB`. (The dev/CI `mda` user
 //! is a superuser; a local non-superuser with CREATEDB works too.)
 
+// Compiled into each test binary; not every helper is used by every binary.
+#![allow(dead_code)]
+
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -72,4 +75,32 @@ fn url_with_db(url: &str, db: &str) -> String {
         Some(pos) => format!("{}{db}", &url[..pos + 1]),
         None => format!("/{db}"),
     }
+}
+
+/// Insert a `sec_user` under the tenant GUC (`sec_user` is RLS-gated, so a
+/// GUC-less insert is rejected by the WITH CHECK policy). Returns the new id.
+pub async fn seed_user(
+    pool: &sqlx::PgPool,
+    tenant: uuid::Uuid,
+    email: &str,
+    name: &str,
+    password_hash: &str,
+) -> uuid::Uuid {
+    let mut tx = pool.begin().await.expect("seed_user begin");
+    mda_security::set_tenant(&mut tx, tenant)
+        .await
+        .expect("seed_user set_tenant");
+    let (id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO sec.sec_user (tenant_id, email, name, password_hash)
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(tenant)
+    .bind(email)
+    .bind(name)
+    .bind(password_hash)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("seed_user insert");
+    tx.commit().await.expect("seed_user commit");
+    id
 }

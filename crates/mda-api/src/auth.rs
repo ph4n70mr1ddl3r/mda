@@ -40,7 +40,9 @@ impl FromRequestParts<AppState> for AuthUser {
             .map_err(|_| unauthorized("invalid or expired token"))?;
         let user_id =
             Uuid::parse_str(&claims.sub).map_err(|_| unauthorized("malformed token subject"))?;
-        let identity = load_identity(&state.pool, user_id)
+        let tenant_id =
+            Uuid::parse_str(&claims.tenant).map_err(|_| unauthorized("malformed token tenant"))?;
+        let identity = load_identity(&state.pool, user_id, tenant_id)
             .await
             .map_err(|_| unauthorized("user not found or inactive"))?;
         Ok(AuthUser(identity))
@@ -64,6 +66,9 @@ fn unauthorized(msg: &str) -> Response {
 
 #[derive(Deserialize)]
 struct LoginReq {
+    /// Tenant identifier: a slug (e.g. "acme") or a tenant UUID. Resolved to a
+    /// tenant_id so the sec_user lookup can run under that tenant's GUC (RLS).
+    tenant: String,
     email: String,
     password: String,
 }
@@ -79,18 +84,39 @@ async fn login(
     State(st): State<AppState>,
     Json(req): Json<LoginReq>,
 ) -> ApiResult<Json<TokenResp>> {
+    // Resolve the tenant BEFORE the sec_user lookup (sec_user is RLS-gated, so
+    // we need the GUC set; sec_tenant is a public directory with no RLS).
+    let tenant_id = if let Ok(id) = Uuid::parse_str(req.tenant.trim()) {
+        id
+    } else {
+        let (id,): (Uuid,) =
+            sqlx::query_as("SELECT id FROM sec.sec_tenant WHERE slug = $1 AND active = TRUE")
+                .bind(req.tenant.trim())
+                .fetch_optional(&st.pool)
+                .await
+                .map_err(Error::internal)?
+                .ok_or_else(|| Error::Invalid("unknown tenant".into()))?;
+        id
+    };
+
+    // Tenant-scoped lookup: set the GUC, then query sec_user (RLS allows only
+    // this tenant's rows → an email from another tenant is invisible, fail-closed).
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant_id).await?;
     let row: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT id, tenant_id, password_hash FROM sec.sec_user WHERE email = $1 AND active = TRUE",
+        "SELECT id, tenant_id, password_hash FROM sec.sec_user \
+          WHERE email = $1 AND active = TRUE",
     )
     .bind(&req.email)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
-    let (user_id, tenant_id, hash) =
-        row.ok_or_else(|| Error::Invalid("invalid credentials".into()))?;
+    let (user_id, _, hash) = row.ok_or_else(|| Error::Invalid("invalid credentials".into()))?;
     if !verify_password(&req.password, &hash) {
         return Err(Error::Invalid("invalid credentials".into()).into());
     }
+    tx.commit().await.map_err(Error::internal)?;
+
     let tokens = st.jwt.issue_pair(user_id, tenant_id)?;
     Ok(Json(TokenResp {
         access_token: tokens.access,
