@@ -261,6 +261,12 @@ pub async fn update(
     for r in &def.relationships {
         if let Some(v) = body.get(&r.source_field_name) {
             let u = uuid_or_null(Some(v), &r.source_field_name)?;
+            if r.required && u.is_none() {
+                return Err(Error::Invalid(format!(
+                    "field {} is required",
+                    r.source_field_name
+                )));
+            }
             sets.push(format!("{} = ${}", r.source_field_name, binds.len() + 1));
             binds.push(Bind::Uuid(u));
         }
@@ -490,6 +496,18 @@ fn build_order(def: &EntityDefinition, sort: &[Sort]) -> String {
         return "id".to_string();
     }
     let scalar: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
+    // Numeric-typed scalars must sort numerically, not lexically (else "10" < "2").
+    let numeric: HashSet<&str> = def
+        .fields
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.field_type.as_str(),
+                "integer" | "auto_number" | "decimal" | "money"
+            )
+        })
+        .map(|f| f.name.as_str())
+        .collect();
     let fk: HashSet<&str> = def
         .relationships
         .iter()
@@ -508,7 +526,12 @@ fn build_order(def: &EntityDefinition, sort: &[Sort]) -> String {
         if s.field == "id" || core.contains(&s.field.as_str()) || fk.contains(s.field.as_str()) {
             parts.push(format!("{} {}", s.field, dir(s.asc)));
         } else if scalar.contains(s.field.as_str()) {
-            parts.push(format!("(attributes->>'{}') {}", s.field, dir(s.asc)));
+            let expr = if numeric.contains(s.field.as_str()) {
+                format!("(attributes->>'{}')::numeric", s.field)
+            } else {
+                format!("(attributes->>'{}')", s.field)
+            };
+            parts.push(format!("{expr} {}", dir(s.asc)));
         }
     }
     if parts.is_empty() {

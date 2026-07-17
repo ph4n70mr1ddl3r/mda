@@ -71,6 +71,7 @@ struct Draft {
 #[derive(Serialize)]
 struct EtagResp {
     version_etag: Uuid,
+    validation: DiffReport,
 }
 
 #[derive(Deserialize, Default)]
@@ -128,6 +129,7 @@ async fn get_draft(
 ) -> ApiResult<Json<Draft>> {
     require_studio(&user)?;
     let draft = fetch_draft(&st.pool, id).await?;
+    ensure_tenant(&draft, user.tenant_id)?;
     Ok(Json(draft))
 }
 
@@ -145,12 +147,15 @@ async fn put_model(
 
     // Ensure the draft belongs to this tenant before mutating.
     let existing = fetch_draft(&st.pool, id).await?;
-    if existing.tenant_id != tenant {
-        return Err(Error::NotFound(format!("draft {id}")).into());
-    }
+    ensure_tenant(&existing, tenant)?;
     if existing.status != "draft" {
         return Err(Error::Conflict(format!("draft is {} (not editable)", existing.status)).into());
     }
+
+    // Eagerly validate against the active model so the editor gets immediate
+    // feedback (the publish step repeats this, but early feedback is critical).
+    let active = loader::load_active_model(&st.pool, tenant).await?;
+    let report = diff(&active, &model);
 
     let updated: Option<(Uuid,)> = sqlx::query_as(
         "UPDATE meta.md_draft
@@ -166,7 +171,10 @@ async fn put_model(
     .map_err(Error::internal)?;
 
     match updated {
-        Some((etag,)) => Ok(Json(EtagResp { version_etag: etag })),
+        Some((etag,)) => Ok(Json(EtagResp {
+            version_etag: etag,
+            validation: report,
+        })),
         None => Err(Error::Conflict(
             "version_etag mismatch — draft was modified by another editor".into(),
         )

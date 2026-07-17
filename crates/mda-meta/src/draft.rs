@@ -251,6 +251,11 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
         report.additions.modules += 1;
         if m.name.trim().is_empty() {
             report.errors.push("a new module has an empty name".into());
+        } else if !is_valid_identifier(&m.name) {
+            report.errors.push(format!(
+                "module {} has an invalid name (lowercase [a-z][a-z0-9_]*, ≤63 chars, not reserved)",
+                m.name
+            ));
         }
         if !mod_names.insert(m.name.as_str()) {
             report
@@ -302,6 +307,11 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
                 report
                     .errors
                     .push(format!("entity {} has a field with an empty name", e.name));
+            } else if !is_valid_identifier(&f.name) {
+                report.errors.push(format!(
+                    "field {}.{} has an invalid name (lowercase [a-z][a-z0-9_]*, ≤63 chars, not reserved)",
+                    e.name, f.name
+                ));
             }
             if !field_names.insert(f.name.as_str()) {
                 report
@@ -311,6 +321,12 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
         }
         for r in &e.relationships {
             report.additions.relationships += 1;
+            if !is_valid_identifier(&r.source_field_name) {
+                report.errors.push(format!(
+                    "relationship column {} on {} is not a valid SQL identifier",
+                    r.source_field_name, e.name
+                ));
+            }
             if !all_entity_ids.contains(&r.target_entity_id) {
                 report.errors.push(format!(
                     "relationship {} on {} targets unknown entity {}",
@@ -448,13 +464,82 @@ fn index_relationships(
 }
 
 fn is_valid_table_name(name: &str) -> bool {
-    // conservative: lowercase ident, [a-z0-9_], starts with a letter, reasonable length
+    is_valid_identifier(name)
+}
+
+/// A safe SQL identifier for both DDL interpolation and JSONB-attribute keys:
+/// lowercase `[a-z][a-z0-9_]*`, ≤ 63 chars (PG `NAMEDATALEN-1`), and neither a
+/// SQL reserved word nor one of MDA's reserved core column names. This single
+/// gate is what lets us interpolate entity/field/relationship names into the
+/// generated `biz.*` SQL (PLAN §5.16 — metadata is untrusted).
+fn is_valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         && name.len() <= 63
+        && !is_reserved(name)
+}
+
+/// Reject SQL reserved words (unquoted use in DDL/queries would fail or parse
+/// ambiguously) and MDA core columns (a field shadowing these would collide
+/// with a real `biz.<table>` column / the JSONB payload key in `reconstruct`).
+fn is_reserved(name: &str) -> bool {
+    matches!(
+        name,
+        "all"
+            | "and"
+            | "any"
+            | "as"
+            | "asc"
+            | "between"
+            | "by"
+            | "case"
+            | "create"
+            | "default"
+            | "delete"
+            | "desc"
+            | "distinct"
+            | "else"
+            | "end"
+            | "false"
+            | "from"
+            | "group"
+            | "in"
+            | "insert"
+            | "into"
+            | "is"
+            | "key"
+            | "limit"
+            | "not"
+            | "null"
+            | "offset"
+            | "on"
+            | "or"
+            | "order"
+            | "primary"
+            | "references"
+            | "select"
+            | "set"
+            | "table"
+            | "then"
+            | "true"
+            | "unique"
+            | "update"
+            | "using"
+            | "when"
+            | "where"
+            | "with"
+            | "id"
+            | "tenant_id"
+            | "owner_id"
+            | "state"
+            | "version"
+            | "created_at"
+            | "updated_at"
+            | "attributes"
+    )
 }
 
 fn is_valid_cardinality(c: &str) -> bool {
@@ -578,5 +663,81 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("targets unknown entity")));
+    }
+
+    #[test]
+    fn rejects_invalid_field_name() {
+        let mut draft = DraftModel::empty();
+        let mut e = ent(1, "Customer");
+        e.fields.push(DraftField {
+            id: Uuid::from_u128(2),
+            name: "shady'; DROP TABLE; --".into(),
+            label: None,
+            field_type: "string".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        draft.entities.push(e);
+        let r = diff(&DraftModel::empty(), &draft);
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|m| m.contains("invalid name")));
+    }
+
+    #[test]
+    fn rejects_reserved_and_core_field_names() {
+        let bad_names = ["order", "attributes", "select", "id", "owner_id"];
+        let mut draft = DraftModel::empty();
+        let mut e = ent(1, "Customer");
+        for (idx, bad) in bad_names.iter().enumerate() {
+            e.fields.push(DraftField {
+                id: Uuid::from_u128(10 + idx as u128),
+                name: (*bad).into(),
+                label: None,
+                field_type: "string".into(),
+                required: false,
+                is_unique: false,
+                is_indexed: false,
+                default_expr: None,
+                config: serde_json::json!({}),
+            });
+        }
+        draft.entities.push(e);
+        let r = diff(&DraftModel::empty(), &draft);
+        assert!(!r.valid);
+        for bad in bad_names {
+            assert!(
+                r.errors.iter().any(|m| m.contains(bad)),
+                "expected rejection of {bad}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_relationship_column() {
+        let mut draft = DraftModel::empty();
+        let customer = ent(2, "Customer");
+        let mut invoice = ent(1, "Invoice");
+        invoice.relationships.push(DraftRelationship {
+            id: Uuid::from_u128(3),
+            source_field_name: "evil column".into(),
+            target_entity_id: customer.id,
+            cardinality: "many_to_one".into(),
+            strength: "lookup".into(),
+            on_delete: None,
+            required: false,
+            reference_qualifier: None,
+            rollup_summary: None,
+        });
+        draft.entities.push(customer);
+        draft.entities.push(invoice);
+        let r = diff(&DraftModel::empty(), &draft);
+        assert!(!r.valid);
+        assert!(r
+            .errors
+            .iter()
+            .any(|m| m.contains("not a valid SQL identifier")));
     }
 }

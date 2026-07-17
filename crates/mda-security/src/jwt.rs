@@ -28,12 +28,39 @@ pub struct AccessToken {
     pub refresh: String,
 }
 
+/// Minimum entropy for HMAC-SHA256 keys (32 bytes = 256 bits).
+const MIN_SECRET_LEN: usize = 32;
+
 impl JwtConfig {
     pub fn from_env() -> Self {
-        let secret = std::env::var("MDA_JWT_SECRET").unwrap_or_else(|_| {
-            tracing::warn!("MDA_JWT_SECRET unset — using insecure dev default");
-            "dev-insecure-secret-change-me".to_string()
-        });
+        let secret = match std::env::var("MDA_JWT_SECRET") {
+            Ok(s) if s.len() >= MIN_SECRET_LEN => s,
+            Ok(_) => {
+                let msg = format!(
+                    "MDA_JWT_SECRET is too short (need ≥ {MIN_SECRET_LEN} bytes for HS256)"
+                );
+                if cfg!(debug_assertions) {
+                    tracing::warn!("{msg} — using insecure dev default");
+                    "dev-insecure-secret-change-me-32b!".to_string()
+                } else {
+                    panic!("{msg}");
+                }
+            }
+            Err(_) => {
+                if cfg!(debug_assertions) {
+                    tracing::warn!(
+                        "MDA_JWT_SECRET unset — using insecure dev default \
+                         (set it before deploying!)"
+                    );
+                    "dev-insecure-secret-change-me-32b!".to_string()
+                } else {
+                    panic!(
+                        "MDA_JWT_SECRET is required in release mode \
+                         (generate with: openssl rand -hex 32)"
+                    );
+                }
+            }
+        };
         Self {
             encoding: EncodingKey::from_secret(secret.as_bytes()),
             decoding: DecodingKey::from_secret(secret.as_bytes()),

@@ -2,10 +2,15 @@
 //! and turns them into side-effects. Phase-1-of-this: `workflow.transitioned`
 //! events become in-app `sys_notification` rows (email/SMS/push channels are
 //! follow-ups). At-least-once; idempotent on the outbox row id.
+//!
+//! Poison messages are moved to `status = 'dead'` after [`MAX_RETRIES`] failures.
 
 use std::time::Duration;
 
 use sqlx::PgPool;
+
+/// Maximum retry attempts before moving a failing item to the dead-letter queue.
+const MAX_RETRIES: i32 = 10;
 
 /// Spawn the background drain loop.
 pub fn spawn_drain(pool: PgPool) {
@@ -34,17 +39,31 @@ async fn drain_once(pool: &PgPool) -> Result<(), sqlx::Error> {
     .await?;
 
     for (id, tenant, kind, payload) in rows {
+        // Snapshot current attempts so the dead-letter decision is based on
+        // the pre-increment count.
+        let current_attempts: i32 = sqlx::query_scalar(
+            "SELECT attempts FROM sys_outbox WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+
         let res = process(&mut tx, tenant, &kind, &payload).await;
         let (status, attempts_incr): (&str, i32) = match res {
             Ok(()) => ("done", 0),
             Err(e) => {
-                tracing::warn!(?e, %kind, "outbox item failed");
-                ("failed", 1)
+                tracing::warn!(?e, %kind, attempts = current_attempts, "outbox item failed");
+                if current_attempts + 1 >= MAX_RETRIES {
+                    tracing::error!(%kind, id = %id, attempts = current_attempts, "outbox item moved to dead-letter queue");
+                    ("dead", 0)
+                } else {
+                    ("failed", 1)
+                }
             }
         };
         sqlx::query(
             "UPDATE sys_outbox SET status = $2, attempts = attempts + $3,
-                processed_at = CASE WHEN $2 = 'done' THEN now() ELSE processed_at END
+                processed_at = CASE WHEN $2 IN ('done', 'dead') THEN now() ELSE processed_at END
               WHERE id = $1",
         )
         .bind(id)
@@ -79,7 +98,8 @@ async fn process(
             if let Some(user) = user {
                 sqlx::query(
                     "INSERT INTO sys_notification (tenant_id, user_id, type, entity, record_id, payload)
-                     VALUES ($1, $2, $3, $4, $5, $6)",
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT DO NOTHING",
                 )
                 .bind(tenant)
                 .bind(user)

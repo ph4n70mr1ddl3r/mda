@@ -27,19 +27,26 @@ pub fn routes() -> Router<AppState> {
         .route("/api/attachments/:id", get(download_attachment))
 }
 
-trait BlobStore {
+/// Storage backend for attachments. Thread-safe (Send + Sync) so it can live
+/// in [`crate::AppState`] and be shared across handler invocations.
+pub trait BlobStore: Send + Sync {
     fn put(&self, key: &str, bytes: &[u8]) -> Result<()>;
     fn get(&self, key: &str) -> Result<Vec<u8>>;
 }
 
-struct LocalBlobStore(PathBuf);
+/// Filesystem-backed blob storage.
+#[derive(Clone)]
+pub struct LocalBlobStore(std::sync::Arc<PathBuf>);
 
 impl LocalBlobStore {
-    fn from_env() -> Self {
+    /// Create a local-FS store rooted at the directory given by
+    /// `MDA_BLOB_DIR` (default `/tmp/mda-blobs`). The directory is created
+    /// if it doesn't exist.
+    pub fn from_env() -> Self {
         let dir = std::env::var("MDA_BLOB_DIR").unwrap_or_else(|_| "/tmp/mda-blobs".to_string());
         let p = PathBuf::from(dir);
         let _ = std::fs::create_dir_all(&p);
-        Self(p)
+        Self(std::sync::Arc::new(p))
     }
 }
 
@@ -79,7 +86,7 @@ async fn upload_attachment(
         .map(str::to_string);
     let size = body.len() as i64;
 
-    LocalBlobStore::from_env().put(&key, &body)?;
+    st.blobs.put(&key, &body)?;
     sqlx::query(
         "INSERT INTO sys_blob (id, tenant_id, storage, storage_key, filename, mime, size, owner_id)
          VALUES ($1, $2, 'local', $3, $4, $5, $6, $7)",
@@ -135,7 +142,7 @@ async fn download_attachment(
         return Err(Error::Forbidden("not the blob owner".into()).into());
     }
 
-    let bytes = LocalBlobStore::from_env().get(&key)?;
+    let bytes = st.blobs.get(&key)?;
     let ct = mime.unwrap_or_else(|| "application/octet-stream".to_string());
     let mut resp = (StatusCode::OK, bytes).into_response();
     resp.headers_mut()

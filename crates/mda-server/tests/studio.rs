@@ -79,10 +79,13 @@ async fn setup() -> Option<(axum::Router, String)> {
         .unwrap();
     let jwt = mda_security::JwtConfig::from_env();
     let token = jwt.issue_access(user_id, tenant).unwrap();
+    let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
+        std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
     let app = mda_api::router(AppState {
         pool,
         cache: MetadataCache::new(),
         jwt,
+        blobs,
     });
     Some((app, token))
 }

@@ -34,10 +34,14 @@ pub async fn run() -> anyhow::Result<()> {
     mda_meta::cache::spawn_poll(pool.clone(), cache.clone());
     outbox::spawn_drain(pool.clone());
 
+    let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
+        std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
+
     let app: Router = mda_api::router(AppState {
         pool: pool.clone(),
         cache,
         jwt: mda_security::JwtConfig::from_env(),
+        blobs,
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);

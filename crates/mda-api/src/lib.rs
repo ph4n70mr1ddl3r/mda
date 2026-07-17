@@ -28,6 +28,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub cache: MetadataCache,
     pub jwt: JwtConfig,
+    pub blobs: std::sync::Arc<dyn crate::blobs::BlobStore>,
 }
 
 /// Build the application router.
@@ -50,6 +51,7 @@ struct HealthReport {
     status: &'static str,
     database: &'static str,
     version: &'static str,
+    audit_failures: u64,
 }
 
 /// `GET /health` — liveness + database connectivity (no auth).
@@ -63,6 +65,7 @@ async fn health(axum::extract::State(state): axum::extract::State<AppState>) -> 
         status: if db_ok { "ok" } else { "degraded" },
         database: if db_ok { "up" } else { "down" },
         version: env!("CARGO_PKG_VERSION"),
+        audit_failures: crate::data::audit_failure_count(),
     };
 
     let code = if db_ok {

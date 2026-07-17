@@ -90,10 +90,13 @@ async fn setup() -> Option<Ctx> {
         .unwrap();
     let jwt = JwtConfig::from_env();
     let token = jwt.issue_access(user_id, tenant).unwrap();
+    let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
+        std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
     let app = mda_api::router(AppState {
         pool: pool.clone(),
         cache: MetadataCache::new(),
         jwt: jwt.clone(),
+        blobs,
     });
     Some(Ctx {
         app,

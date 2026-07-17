@@ -1,6 +1,8 @@
 //! Runtime data API (PLAN §7) with Phase-3 security: object RBAC, field-level
 //! projection/rejection, record-level ownership/OWD scope, and audit logging.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -13,6 +15,16 @@ use mda_security::{Access, Identity, Owd};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
+
+/// Counter for failed audit-log writes. Surfaces as a metric in the health
+/// endpoint and can be scraped for alerting (audit integrity is a compliance
+/// requirement).
+static AUDIT_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the current audit-failure counter (for the health endpoint).
+pub fn audit_failure_count() -> u64 {
+    AUDIT_WRITE_FAILURES.load(Ordering::Relaxed)
+}
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
@@ -326,7 +338,8 @@ async fn audit(
     .execute(&st.pool)
     .await
     {
-        tracing::error!(?e, "audit log insert failed");
+        let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::error!(?e, failures = n, "audit log insert failed");
     }
 }
 
@@ -545,6 +558,21 @@ async fn create_share(
         .and_then(|s| s.parse::<Uuid>().ok());
     if !user.is_superuser && owner != Some(user.user_id) {
         return Err(Error::Forbidden("only the owner can share".into()).into());
+    }
+    if !matches!(req.access.as_str(), "read" | "write") {
+        return Err(Error::Invalid("access must be 'read' or 'write'".into()).into());
+    }
+    // the principal must be an active user in the same tenant (no cross-tenant shares)
+    let principal_ok: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM sec.sec_user WHERE id = $1 AND tenant_id = $2 AND active = TRUE",
+    )
+    .bind(req.principal_id)
+    .bind(user.tenant_id)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(Error::internal)?;
+    if principal_ok.is_none() {
+        return Err(Error::Invalid("principal is not an active user in this tenant".into()).into());
     }
     sqlx::query(
         "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)

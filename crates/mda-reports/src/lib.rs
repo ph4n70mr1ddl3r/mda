@@ -95,6 +95,14 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
     let mut columns: Vec<String> = Vec::new();
     for f in &ds.fields {
         let alias = f.alias.clone().unwrap_or_else(|| f.field.clone());
+        // Validate alias: must be a safe SQL identifier (no quotes, no
+        // backslashes). Single quotes in an alias would break the
+        // jsonb_build_object literal.
+        if !is_safe_alias(&alias) {
+            return Err(Error::Invalid(format!(
+                "invalid alias '{alias}': must be alphanumeric + underscores only"
+            )));
+        }
         // count(*) special case
         if f.aggregate.as_deref() == Some("count") && (f.field == "*" || f.field.is_empty()) {
             pairs.push(format!("'{alias}', count(*)"));
@@ -132,23 +140,24 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         group_exprs.push(field_expr(&def, g).to_string());
     }
 
-    // ---- order_by (by the underlying field expression) ----
-    let order_sql = if ds.order_by.is_empty() {
+    // ---- order_by (semantic: must be a known, readable field; never interpolated raw) ----
+    let mut order_parts: Vec<String> = Vec::new();
+    for s in &ds.order_by {
+        require_readable(
+            identity,
+            &ds.base_entity,
+            &s.field,
+            &scalar,
+            &fk,
+            "order_by",
+        )?;
+        let d = if s.asc { "ASC" } else { "DESC" };
+        order_parts.push(format!("{} {d}", field_expr(&def, &s.field)));
+    }
+    let order_sql = if order_parts.is_empty() {
         "1".to_string()
     } else {
-        ds.order_by
-            .iter()
-            .map(|s| {
-                let d = if s.asc { "ASC" } else { "DESC" };
-                let e = if scalar.contains(s.field.as_str()) || fk.contains(s.field.as_str()) {
-                    field_expr(&def, &s.field)
-                } else {
-                    s.field.clone()
-                };
-                format!("{e} {d}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        order_parts.join(", ")
     };
 
     // ---- WHERE: tenant + record scope + filters ----
@@ -259,6 +268,13 @@ fn field_expr(def: &EntityDefinition, name: &str) -> String {
     } else {
         format!("(attributes->>'{name}')")
     }
+}
+
+/// Reject aliases that contain characters unsafe in a single-quoted SQL literal.
+fn is_safe_alias(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn require_readable(

@@ -5,6 +5,10 @@
 //! `set_field` actions produce derived field values applied in the same write.
 //! Calculated fields (a field whose config carries a `formula`) are computed the
 //! same way. More action kinds + async outbox side-effects arrive later.
+//!
+//! Cycle detection: a rule cascade is limited to [`MAX_RULE_FIRINGS`] per
+//! `fire()` call. If exceeded the engine returns an error to prevent infinite
+//! loops from self-referential rule sets.
 
 pub use mda_expression::Registry;
 
@@ -14,6 +18,10 @@ use mda_meta::EntityDefinition;
 use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// Maximum number of rule actions that may fire in a single `fire()` call.
+/// Guards against infinite rule cycles (e.g. A sets X → B sets Y → A sets X …).
+const MAX_RULE_FIRINGS: u32 = 50;
 
 /// A business rule row.
 #[derive(sqlx::FromRow)]
@@ -49,12 +57,16 @@ pub async fn load_active(pool: &PgPool, tenant: Uuid, entity: &str) -> Result<Ve
 /// Fire the rules matching `event` against `ctx`; return the field assignments
 /// (field -> value) from set_field actions whose condition is true. `ctx` is
 /// mutated in place with each applied assignment so later rules see earlier ones.
+///
+/// Stops with an error if more than [`MAX_RULE_FIRINGS`] actions fire, which
+/// indicates a likely cycle in the rule set.
 pub fn fire(
     rules: &[Rule],
     event: &str,
     ctx: &mut Map<String, Value>,
     reg: &Registry,
 ) -> Result<()> {
+    let mut fired: u32 = 0;
     for r in rules {
         if r.event != event || r.action_type != "set_field" {
             continue;
@@ -71,6 +83,12 @@ pub fn fire(
             None => Value::Null,
         };
         ctx.insert(field.to_string(), value);
+        fired += 1;
+        if fired > MAX_RULE_FIRINGS {
+            return Err(Error::Invalid(format!(
+                "rule execution exceeded max firings ({MAX_RULE_FIRINGS}); likely a rule cycle"
+            )));
+        }
     }
     Ok(())
 }
