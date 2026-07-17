@@ -1308,3 +1308,178 @@ async fn sse_relay_replays_events_and_requires_auth() {
         "events carry a seq id (Last-Event-ID cursor)"
     );
 }
+
+#[tokio::test]
+async fn edge_endpoints_security_headers_and_metrics() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    // /livez is always 200 and does NOT touch the DB.
+    let (st, body) = call(&ctx.app, "GET", "/livez", &ctx.token, None, None).await;
+    assert_eq!(st, StatusCode::OK, "livez: {body}");
+    assert_eq!(body.as_str(), Some("ok"));
+
+    // /readyz reflects DB reachability.
+    let (st, body) = call(&ctx.app, "GET", "/readyz", &ctx.token, None, None).await;
+    assert_eq!(st, StatusCode::OK, "readyz: {body}");
+    assert_eq!(body["database"], "up");
+
+    // /metrics exposes the Prometheus text format with the expected series.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("mda_http_requests_total"), "metrics: {text}");
+    assert!(text.contains("mda_db_pool_size"), "metrics: {text}");
+    assert!(
+        text.contains("mda_audit_write_failures_total"),
+        "metrics: {text}"
+    );
+
+    // Every response carries a request id + defense-in-depth security headers.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert!(
+        resp.headers().get("x-request-id").is_some(),
+        "request id echoed"
+    );
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff",
+    );
+    assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+}
+
+#[tokio::test]
+async fn cross_tenant_data_is_isolated() {
+    // Regression guard for tenant isolation (PLAN §5.4 / §11). The app filters
+    // every biz.* query by tenant_id; a cross-tenant leak here means a future
+    // change punched a hole. (RLS, the DB-layer backstop, is a follow-up.)
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    // Two tenants share ONE biz table (same table_name) — the hardest case.
+    let table = format!("cust_{}", Uuid::new_v4().simple());
+    let model = json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null,
+            "name": "Customer", "table_name": table, "label": "Customer", "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(),"name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+            ],
+            "relationships": []
+        }]
+    });
+    publish(&ctx, model.clone()).await;
+
+    // Tenant B: its own user/role/token in a DIFFERENT tenant.
+    let tenant_b = Uuid::new_v4();
+    let (role_b,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, 'admin') RETURNING id",
+    )
+    .bind(tenant_b)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1, '*', '*')")
+        .bind(role_b)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let email_b = format!("b{}@test", Uuid::new_v4().simple());
+    let (user_b,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sec.sec_user (tenant_id, email, name, password_hash) VALUES ($1, $2, 'b', $3) RETURNING id",
+    )
+    .bind(tenant_b)
+    .bind(&email_b)
+    .bind(mda_security::hash_password("x").unwrap())
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
+        .bind(user_b)
+        .bind(role_b)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let token_b = ctx.jwt.issue_access(user_b, tenant_b).unwrap();
+
+    // Publish the SAME model for tenant B (same table → shared biz.<table>).
+    let (_, d) = call(
+        &ctx.app,
+        "POST",
+        "/api/studio/drafts",
+        &token_b,
+        Some(json!({"name":"p"}).to_string()),
+        None,
+    )
+    .await;
+    let did = d["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let etag = d["version_etag"].as_str().unwrap().to_string();
+    publish_with_uuid_etag(&ctx, did, &etag, model).await;
+
+    // Tenant A creates a record.
+    let (_, a_rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme-A"}).to_string()),
+        None,
+    )
+    .await;
+    let a_id = a_rec["id"].as_str().unwrap().to_string();
+
+    // Tenant B lists → must NOT see tenant A's record (0 results).
+    let (_, list_b) = call(&ctx.app, "GET", "/api/data/Customer", &token_b, None, None).await;
+    assert_eq!(
+        list_b["total"], 0,
+        "tenant B must not see tenant A's records: {list_b}"
+    );
+
+    // Tenant B reads tenant A's record id by id → 404 (no leak, no 200).
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{a_id}"),
+        &token_b,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "cross-tenant read must 404");
+
+    // Tenant B writes its own record into the shared table; tenant A must not see it.
+    let _ = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &token_b,
+        Some(json!({"name":"Beta-B"}).to_string()),
+        None,
+    )
+    .await;
+    let (_, list_a) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list_a["total"], 1, "tenant A sees only its own: {list_a}");
+}
