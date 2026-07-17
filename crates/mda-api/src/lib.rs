@@ -33,6 +33,9 @@ pub struct AppState {
     pub blobs: std::sync::Arc<dyn crate::blobs::BlobStore>,
     /// Fan-out for the SSE real-time channel (§5.10); fed by `events::spawn_listen`.
     pub events: tokio::sync::broadcast::Sender<crate::events::EventRow>,
+    /// Login brute-force defence (per-account lockout + per-IP limit), shared
+    /// across instances via `sys.sys_login_throttle` (§3).
+    pub login_throttle: mda_security::LoginThrottle,
 }
 
 /// Build the application router.

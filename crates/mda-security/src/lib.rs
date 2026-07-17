@@ -7,11 +7,14 @@
 pub mod context;
 pub mod identity;
 pub mod jwt;
+pub mod login_throttle;
 pub mod password;
+pub mod session;
 
 pub use context::{load_identity, resolve_owd};
 pub use identity::{Access, Identity, Owd};
-pub use jwt::{verify_access_token, AccessToken, JwtConfig};
+pub use jwt::{AccessToken, JwtConfig};
+pub use login_throttle::LoginThrottle;
 pub use password::{hash_password, verify_password};
 
 /// Set the per-transaction tenant context used by the `sec.*` RLS policies

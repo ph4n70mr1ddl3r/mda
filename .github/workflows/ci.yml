@@ -52,7 +52,7 @@ jobs:
       # The DB-backed suites each get their own fresh database (tests/common/mod.rs),
       # so they are fully parallel-safe — no --test-threads=1 needed.
       - name: DB-backed tests (RLS, CRUD, publish, SSE, archive/restore, …)
-        run: cargo test --test data --test studio --test integration
+        run: cargo test --test data --test studio --test integration --test events --test throttle --test sessions
 
   # Build the Leptos WASM runtime UI with Trunk (catches UI regressions; the
   # backend job can't — the UI is a separate standalone workspace). Runs in
@@ -62,7 +62,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to a concrete version that matches web/runtime-ui/Dockerfile,
+      # so a WASM regression can't slip in from a Rust/Trunk version skew.
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           targets: wasm32-unknown-unknown
 
@@ -71,7 +73,7 @@ jobs:
           workspaces: "web/runtime-ui"
 
       - name: Install trunk
-        run: cargo install --locked trunk
+        run: cargo install --locked --version 0.21.8 trunk
 
       - name: Build WASM UI
         working-directory: web/runtime-ui

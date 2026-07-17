@@ -52,7 +52,7 @@ async fn setup() -> Option<(axum::Router, String)> {
     let user_id = common::seed_user(&pool, tenant, &email, "tester", &hash).await;
     common::seed_assignment(&pool, tenant, user_id, role_id).await;
     let jwt = mda_security::JwtConfig::from_env();
-    let token = jwt.issue_access(user_id, tenant).unwrap();
+    let token = jwt.issue_access(user_id, tenant, None).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
     // Publish DDL + meta writes run as the non-superuser `mda_app` role (the
@@ -71,6 +71,7 @@ async fn setup() -> Option<(axum::Router, String)> {
         jwt,
         blobs,
         events: mda_api::events::channel(),
+        login_throttle: mda_security::LoginThrottle::default(),
     });
     Some((app, token))
 }

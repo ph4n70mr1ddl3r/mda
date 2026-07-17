@@ -21,7 +21,10 @@ use std::time::Duration;
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response};
+use axum::response::{
+    sse::{Event, KeepAlive, Sse},
+    IntoResponse, Response,
+};
 use axum::routing::get;
 use axum::Router;
 use mda_security::Identity;
@@ -159,53 +162,43 @@ struct StreamQuery {
     /// `tenant:<id>:broadcast`. Omit to receive all readable events.
     #[serde(default)]
     channel: Option<String>,
-    /// Bearer token, as a fallback for browser `EventSource` (which cannot set
-    /// request headers). Prefer cookie / short-lived-ticket auth in production so
-    /// JWTs don't land in URLs/logs; this is the standard SSE concession.
+    /// Short-lived one-shot ticket (`?ticket=`) for browser `EventSource`, which
+    /// can't set headers. Issued by `POST /api/auth/event-ticket`; NOT the access
+    /// JWT, so no long-lived credential lands in URLs/history/proxy-logs. The
+    /// `Authorization: Bearer <access>` header is the preferred path when usable.
     #[serde(default)]
-    token: Option<String>,
-}
-
-fn unauthorized_resp() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        axum::Json(serde_json::json!({ "error": "unauthorized" })),
-    )
-        .into_response()
+    ticket: Option<String>,
 }
 
 /// `GET /api/events` — SSE stream. Replays from `Last-Event-ID`, then live.
-/// Auth: `Authorization: Bearer <jwt>` (preferred) or `?token=<jwt>` (for
-/// `EventSource`, which can't set headers).
+/// Auth: `Authorization: Bearer <access>` (preferred) or `?ticket=<ticket>`
+/// (for `EventSource`, which can't set headers).
 async fn stream(
     State(st): State<AppState>,
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(str::to_string)
-        .or(q.token.clone());
-    let token = match token {
-        Some(t) => t,
-        None => return unauthorized_resp(),
+    // Auth: `Authorization: Bearer <access>` (preferred) or `?ticket=<ticket>`
+    // (for browser `EventSource`, which can't set headers). The ticket is a
+    // short-lived, one-shot token — NOT the access JWT — so no long-lived
+    // credential lands in the URL/history/proxy-logs.
+    let claims = if let Some(ticket) = q.ticket.as_deref() {
+        st.jwt.verify_ticket(ticket)
+    } else {
+        match headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+        {
+            Some(t) => st.jwt.verify_access(t),
+            None => return unauthorized_resp(),
+        }
     };
-    let claims = match st.jwt.verify(&token) {
-        Ok(c) => c,
-        Err(_) => return unauthorized_resp(),
-    };
-    let user_id = match Uuid::parse_str(&claims.sub) {
-        Ok(u) => u,
-        Err(_) => return unauthorized_resp(),
-    };
-    let tenant = match Uuid::parse_str(&claims.tenant) {
-        Ok(u) => u,
-        Err(_) => return unauthorized_resp(),
-    };
-    let user = match mda_security::load_identity(&st.pool, user_id, tenant).await {
-        Ok(i) => i,
+    let user = match claims {
+        Ok(c) => match crate::auth::identity_from_claims(&st, &c).await {
+            Ok(i) => i,
+            Err(resp) => return resp,
+        },
         Err(_) => return unauthorized_resp(),
     };
 
@@ -261,6 +254,14 @@ async fn stream(
         .into_response()
 }
 
+fn unauthorized_resp() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({ "error": "unauthorized" })),
+    )
+        .into_response()
+}
+
 /// Replay up to [`REPLAY_BATCH`] events newer than `last` that the caller may see.
 async fn replay(
     pool: &PgPool,
@@ -287,7 +288,7 @@ async fn replay(
         hi = r.seq.max(hi);
         let ev = EventRow {
             seq: r.seq,
-            tenant_id: user.tenant_id,
+            tenant_id: r.tenant_id,
             typ: r.typ,
             entity: r.entity,
             record_id: r.record_id,

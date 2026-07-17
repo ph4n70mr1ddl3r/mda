@@ -143,6 +143,9 @@ pub fn apply_security_headers(app: Router<AppState>) -> Router<AppState> {
 /// `/metrics`. Infra paths (`/livez`, `/readyz`, `/metrics`) are not logged or
 /// counted (k8s/scrape noise would drown out real traffic signals).
 pub async fn access_log(req: Request, next: Next) -> Response {
+    // Path-only by design: never log the query string. The SSE stream accepts
+    // `?token=<jwt>` (browser EventSource can't set headers), so a full-URI log
+    // here would capture bearer tokens. Preserve this if the log is ever changed.
     let path = req.uri().path().to_string();
     let is_infra = path == "/livez" || path == "/readyz" || path == "/metrics";
 

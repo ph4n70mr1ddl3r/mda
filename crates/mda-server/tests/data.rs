@@ -77,7 +77,7 @@ async fn setup() -> Option<Ctx> {
     let user_id = common::seed_user(&pool, tenant, &email, "admin", &hash).await;
     common::seed_assignment(&pool, tenant, user_id, role_id).await;
     let jwt = JwtConfig::from_env();
-    let token = jwt.issue_access(user_id, tenant).unwrap();
+    let token = jwt.issue_access(user_id, tenant, None).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
     // The app runs as the non-superuser `mda_app` role so the biz.* RLS policies
@@ -99,6 +99,7 @@ async fn setup() -> Option<Ctx> {
         jwt: jwt.clone(),
         blobs,
         events: mda_api::events::channel(),
+        login_throttle: mda_security::LoginThrottle::default(),
     });
     Some(Ctx {
         app,
@@ -124,7 +125,10 @@ async fn limited_user(ctx: &Ctx, perms: &[(&str, &str)]) -> (String, Uuid) {
     let email = format!("u{}@test", Uuid::new_v4().simple());
     let user_id = common::seed_user(&ctx.pool, ctx.tenant, &email, "limited", &hash).await;
     common::seed_assignment(&ctx.pool, ctx.tenant, user_id, role_id).await;
-    (ctx.jwt.issue_access(user_id, ctx.tenant).unwrap(), user_id)
+    (
+        ctx.jwt.issue_access(user_id, ctx.tenant, None).unwrap(),
+        user_id,
+    )
 }
 
 async fn call(
@@ -1428,7 +1432,7 @@ async fn cross_tenant_data_is_isolated() {
     )
     .await;
     common::seed_assignment(&ctx.pool, tenant_b, user_b, role_b).await;
-    let token_b = ctx.jwt.issue_access(user_b, tenant_b).unwrap();
+    let token_b = ctx.jwt.issue_access(user_b, tenant_b, None).unwrap();
 
     // Publish the SAME model for tenant B (same table → shared biz.<table>).
     let (_, d) = call(

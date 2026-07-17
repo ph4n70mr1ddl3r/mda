@@ -20,6 +20,9 @@ pub enum Error {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    #[error("too many requests: {0}")]
+    RateLimited(String),
+
     #[error("internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }

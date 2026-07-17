@@ -69,6 +69,20 @@ pub async fn run() -> anyhow::Result<()> {
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
     let events = mda_api::events::channel();
     mda_api::events::spawn_listen(app_pool.clone(), events.clone());
+    // Hourly purge of stale login-throttle rows (bounded by distinct account/IP
+    // keys, but attacker IP churn would otherwise grow it indefinitely).
+    {
+        let cleanup_pool = app_pool.clone();
+        tokio::spawn(async move {
+            mda_security::login_throttle::prune(&cleanup_pool).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                mda_security::login_throttle::prune(&cleanup_pool).await;
+            }
+        });
+    }
 
     let app: Router = mda_api::router(AppState {
         pool: app_pool,
@@ -76,6 +90,7 @@ pub async fn run() -> anyhow::Result<()> {
         jwt: mda_security::JwtConfig::from_env(),
         blobs,
         events,
+        login_throttle: mda_security::LoginThrottle::from_env(),
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
@@ -84,10 +99,13 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!("listening on {addr}");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server error")?;
 
     tracing::info!("shutdown complete");
     Ok(())
