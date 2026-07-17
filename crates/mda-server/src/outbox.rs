@@ -27,9 +27,12 @@ pub fn spawn_drain(pool: PgPool) {
 
 async fn drain_once(pool: &PgPool) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    // claim a batch of pending rows
-    let rows: Vec<(uuid::Uuid, uuid::Uuid, String, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, tenant_id, kind, payload FROM sys_outbox
+    // Claim a batch and snapshot `attempts` in the same locked read. The rows
+    // are held FOR UPDATE within this transaction, so the pre-increment count
+    // used for the dead-letter decision cannot change underneath us — no need
+    // for a per-row follow-up query (avoids an N+1).
+    let rows: Vec<(uuid::Uuid, uuid::Uuid, String, serde_json::Value, i32)> = sqlx::query_as(
+        "SELECT id, tenant_id, kind, payload, attempts FROM sys_outbox
           WHERE status = 'pending'
           ORDER BY created_at
           LIMIT 50
@@ -38,16 +41,7 @@ async fn drain_once(pool: &PgPool) -> Result<(), sqlx::Error> {
     .fetch_all(&mut *tx)
     .await?;
 
-    for (id, tenant, kind, payload) in rows {
-        // Snapshot current attempts so the dead-letter decision is based on
-        // the pre-increment count.
-        let current_attempts: i32 = sqlx::query_scalar(
-            "SELECT attempts FROM sys_outbox WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-
+    for (id, tenant, kind, payload, current_attempts) in rows {
         let res = process(&mut tx, tenant, &kind, &payload).await;
         let (status, attempts_incr): (&str, i32) = match res {
             Ok(()) => ("done", 0),

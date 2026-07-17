@@ -9,7 +9,7 @@
 //! Run with:
 //!   cargo test --test fuzz_expression -- --nocapture
 
-use mda_expression::{eval, Expr, Registry};
+use mda_expression::{eval, Expr, Registry, MAX_DEPTH};
 use proptest::prelude::*;
 use serde_json::{json, Value};
 
@@ -22,9 +22,8 @@ fn expr_leaf() -> impl Strategy<Value = Value> {
         any::<i64>().prop_map(|n| json!({"op": "Lit", "value": n})),
         Just(json!({"op": "Lit", "value": null})),
         // Field reference (names from a small set that may or may not be in ctx)
-        prop::sample::select(vec!["status", "amount", "qty", "name", "missing"]).prop_map(|f| {
-            json!({"op": "Field", "name": f})
-        }),
+        prop::sample::select(vec!["status", "amount", "qty", "name", "missing"])
+            .prop_map(|f| { json!({"op": "Field", "name": f}) }),
         // Call to a known function with no args
         Just(json!({"op": "Call", "name": "now", "args": []})),
         Just(json!({"op": "Call", "name": "today", "args": []})),
@@ -42,27 +41,21 @@ fn expr_tree(depth: u32) -> BoxedStrategy<Value> {
         // Not
         child.clone().prop_map(|e| json!({"op": "Not", "of": e})),
         // Cmp (eq/ne/gt/lt)
-        (child.clone(), child.clone()).prop_map(|(l, r)| {
-            json!({"op": "Cmp", "kind": "eq", "lhs": l, "rhs": r})
-        }),
-        (child.clone(), child.clone()).prop_map(|(l, r)| {
-            json!({"op": "Cmp", "kind": "gt", "lhs": l, "rhs": r})
-        }),
+        (child.clone(), child.clone())
+            .prop_map(|(l, r)| { json!({"op": "Cmp", "kind": "eq", "lhs": l, "rhs": r}) }),
+        (child.clone(), child.clone())
+            .prop_map(|(l, r)| { json!({"op": "Cmp", "kind": "gt", "lhs": l, "rhs": r}) }),
         // If
-        (child.clone(), child.clone(), child.clone()).prop_map(|(c, t, e)| {
-            json!({"op": "If", "cond": c, "then": t, "els": e})
-        }),
+        (child.clone(), child.clone(), child.clone())
+            .prop_map(|(c, t, e)| { json!({"op": "If", "cond": c, "then": t, "els": e}) }),
         // And / Or with 1–3 sub-expressions
-        prop::collection::vec(child.clone(), 1..=3).prop_map(|of| {
-            json!({"op": "And", "of": of})
-        }),
-        prop::collection::vec(child.clone(), 1..=3).prop_map(|of| {
-            json!({"op": "Or", "of": of})
-        }),
+        prop::collection::vec(child.clone(), 1..=3)
+            .prop_map(|of| { json!({"op": "And", "of": of}) }),
+        prop::collection::vec(child.clone(), 1..=3)
+            .prop_map(|of| { json!({"op": "Or", "of": of}) }),
         // Arith
-        (child.clone(), child.clone()).prop_map(|(l, r)| {
-            json!({"op": "Arith", "kind": "add", "lhs": l, "rhs": r})
-        }),
+        (child.clone(), child.clone())
+            .prop_map(|(l, r)| { json!({"op": "Arith", "kind": "add", "lhs": l, "rhs": r}) }),
     ]
     .boxed()
 }
@@ -100,30 +93,27 @@ proptest! {
     }
 
     #[test]
-    fn depth_limit_enforced(expr_json in expr_tree(6)) {
+    fn deep_nesting_hits_depth_budget(depth in 0u32..48) {
+        // Build a `Not` chain of the given length over a literal bool. The
+        // root evaluates at depth 0; the leaf at depth `depth`. The engine
+        // rejects any node whose depth exceeds MAX_DEPTH, so chains longer
+        // than MAX_DEPTH must error, and shorter ones must yield the bool
+        // back (parity of negations).
         let reg = Registry::new();
-        let ctx = ctx();
-
-        let Ok(expr) = Expr::from_json(&expr_json) else {
-            return Ok(());
-        };
-
-        let result = eval(&expr, &ctx, &reg);
-        // Ok or a depth/step error is fine; Invalid errors are expected
-        // from type mismatches (e.g. comparing a bool to a string, or
-        // arithmetic on non-numbers). Only flag truly unexpected errors.
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                assert!(
-                    msg.contains("max depth")
-                        || msg.contains("step budget")
-                        || msg.contains("invalid")
-                        || msg.contains("internal"),
-                    "unexpected error: {msg}"
-                );
-            }
+        let mut node = json!({"op": "Lit", "value": true});
+        for _ in 0..depth {
+            node = json!({"op": "Not", "of": node});
+        }
+        let expr = Expr::from_json(&node).unwrap();
+        let result = eval(&expr, &ctx(), &reg);
+        if depth > MAX_DEPTH {
+            assert!(
+                result.is_err(),
+                "expected depth-budget error at depth {depth} (MAX_DEPTH={MAX_DEPTH})"
+            );
+        } else {
+            let v = result.unwrap();
+            assert_eq!(v.as_bool().unwrap(), depth % 2 == 0);
         }
     }
 

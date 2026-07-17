@@ -16,6 +16,10 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+use crate::auth::AuthUser;
+use crate::error::ApiResult;
+use crate::AppState;
+
 /// Counter for failed audit-log writes. Surfaces as a metric in the health
 /// endpoint and can be scraped for alerting (audit integrity is a compliance
 /// requirement).
@@ -25,10 +29,6 @@ static AUDIT_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
 pub fn audit_failure_count() -> u64 {
     AUDIT_WRITE_FAILURES.load(Ordering::Relaxed)
 }
-
-use crate::auth::AuthUser;
-use crate::error::ApiResult;
-use crate::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()

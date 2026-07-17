@@ -119,38 +119,56 @@ async fn download_attachment(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Response> {
-    let row: Option<(Uuid, Option<String>, Option<String>, String)> =
-        sqlx::query_as("SELECT tenant_id, filename, mime, storage_key FROM sys_blob WHERE id = $1")
-            .bind(id)
-            .fetch_optional(&st.pool)
-            .await
-            .map_err(Error::internal)?;
-    let (tenant, filename, mime, key) = row.ok_or_else(|| Error::NotFound(format!("blob {id}")))?;
-    if tenant != user.tenant_id {
-        return Err(Error::NotFound(format!("blob {id}")).into());
+    // Single tenant-scoped read: metadata + owner in one round trip. A
+    // cross-tenant request yields 404 (no information leak).
+    #[derive(sqlx::FromRow)]
+    struct BlobMeta {
+        filename: Option<String>,
+        mime: Option<String>,
+        storage_key: String,
+        owner_id: Option<Uuid>,
     }
-    // owner-based access (record/field attachment AuthZ is a refinement)
-    let owner: Option<(Uuid,)> =
-        sqlx::query_as("SELECT owner_id FROM sys_blob WHERE id = $1 AND tenant_id = $2")
+    let row: Option<BlobMeta> =
+        sqlx::query_as("SELECT filename, mime, storage_key, owner_id FROM sys_blob WHERE id = $1 AND tenant_id = $2")
             .bind(id)
             .bind(user.tenant_id)
             .fetch_optional(&st.pool)
             .await
             .map_err(Error::internal)?;
-    let allowed = user.is_superuser || owner.map(|(o,)| o == user.user_id).unwrap_or(false);
+    let meta = row.ok_or_else(|| Error::NotFound(format!("blob {id}")))?;
+    // owner-based access (record/field attachment AuthZ is a refinement)
+    let allowed = user.is_superuser || meta.owner_id == Some(user.user_id);
     if !allowed {
         return Err(Error::Forbidden("not the blob owner".into()).into());
     }
 
-    let bytes = st.blobs.get(&key)?;
-    let ct = mime.unwrap_or_else(|| "application/octet-stream".to_string());
+    let bytes = st.blobs.get(&meta.storage_key)?;
+    let ct = meta
+        .mime
+        .unwrap_or_else(|| "application/octet-stream".to_string());
     let mut resp = (StatusCode::OK, bytes).into_response();
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, ct.parse().unwrap());
-    if let Some(name) = filename {
+    if let Some(name) = meta.filename.as_deref().and_then(sanitize_filename) {
         if let Ok(hv) = format!("attachment; filename=\"{name}\"").parse() {
             resp.headers_mut().insert(header::CONTENT_DISPOSITION, hv);
         }
     }
     Ok(resp)
+}
+
+/// Strip bytes that would break (or inject into) a `Content-Disposition`
+/// header value, then trim. `None` if nothing usable remains. The filename is
+/// client-supplied at upload time, so treat it as untrusted.
+fn sanitize_filename(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| *c >= ' ' && *c != '"' && *c != '\\')
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
 }

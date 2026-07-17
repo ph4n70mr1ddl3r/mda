@@ -85,16 +85,18 @@ fn as_datetime(v: &Value) -> Result<Value> {
     let s = match v {
         Value::String(s) => s.clone(),
         Value::Number(n) => n.to_string(),
-        _ => return Err(Error::Invalid("expected an ISO-8601 datetime string".into())),
+        _ => {
+            return Err(Error::Invalid(
+                "expected an ISO-8601 datetime string".into(),
+            ))
+        }
     };
     // Accept both RFC 3339 (compact) and ISO-8601 variants that chrono parses.
     let _ = chrono::DateTime::parse_from_rfc3339(&s)
         .or_else(|_| {
             // Also try RFC 3339 without timezone offset (assume UTC).
             chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S")
-                .or_else(|_| {
-                    chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f")
-                })
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
                 .map(|dt| dt.and_utc().into())
         })
         .map_err(|e| Error::Invalid(format!("invalid datetime '{s}': {e}")))?;

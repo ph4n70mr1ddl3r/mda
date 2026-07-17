@@ -272,9 +272,7 @@ fn field_expr(def: &EntityDefinition, name: &str) -> String {
 
 /// Reject aliases that contain characters unsafe in a single-quoted SQL literal.
 fn is_safe_alias(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn require_readable(
