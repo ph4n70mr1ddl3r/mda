@@ -42,14 +42,17 @@ async fn export_report(
 }
 
 async fn load_dataset(pool: &sqlx::PgPool, tenant: Uuid, id: Uuid) -> ApiResult<Dataset> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
     let (dataset,): (serde_json::Value,) =
         sqlx::query_as("SELECT dataset FROM meta.md_report WHERE id = $1 AND tenant_id = $2")
             .bind(id)
             .bind(tenant)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(Error::internal)?
             .ok_or_else(|| Error::NotFound(format!("report {id}")))?;
+    tx.commit().await.map_err(Error::internal)?;
     let ds: Dataset =
         serde_json::from_value(dataset).map_err(|e| Error::Invalid(format!("bad dataset: {e}")))?;
     Ok(ds)

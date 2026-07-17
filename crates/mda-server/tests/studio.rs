@@ -46,27 +46,11 @@ async fn setup() -> Option<(axum::Router, String)> {
     // Each test gets its own fresh, migrated database → fully parallel-safe.
     let (pool, db_url) = common::spawn_db(&url).await;
     let tenant = Uuid::new_v4();
-    let (role_id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, 'admin') RETURNING id",
-    )
-    .bind(tenant)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1, '*', '*')")
-        .bind(role_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let role_id = common::seed_role(&pool, tenant, "admin", &[("*", "*")]).await;
     let hash = mda_security::hash_password("x").unwrap();
     let email = format!("u{}@test", Uuid::new_v4().simple());
     let user_id = common::seed_user(&pool, tenant, &email, "tester", &hash).await;
-    sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
-        .bind(user_id)
-        .bind(role_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    common::seed_assignment(&pool, tenant, user_id, role_id).await;
     let jwt = mda_security::JwtConfig::from_env();
     let token = jwt.issue_access(user_id, tenant).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =

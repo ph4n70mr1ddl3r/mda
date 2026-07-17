@@ -15,6 +15,15 @@ use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+async fn set_tenant(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, tenant: Uuid) -> Result<()> {
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    Ok(())
+}
+
 #[derive(sqlx::FromRow)]
 struct Workflow {
     id: Uuid,
@@ -46,13 +55,15 @@ pub async fn run_transition(
     expected_version: i64,
     scope: &RecordScope,
 ) -> Result<Value> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
     let wf: Option<Workflow> = sqlx::query_as(
         "SELECT id, entity FROM meta.md_workflow
           WHERE tenant_id = $1 AND entity = $2 AND active = TRUE LIMIT 1",
     )
     .bind(tenant)
     .bind(entity)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
     let wf = wf.ok_or_else(|| Error::NotFound(format!("no workflow for {entity}")))?;
@@ -69,9 +80,10 @@ pub async fn run_transition(
            FROM meta.md_workflow_transition WHERE workflow_id = $1",
     )
     .bind(wf.id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     let t = transitions
         .iter()
         .find(|t| t.name == transition_name && t.from_state == state)
@@ -127,6 +139,8 @@ pub async fn run_transition(
 
     // create a task if the transition requires one
     if t.creates_task {
+        let mut tx = pool.begin().await.map_err(Error::internal)?;
+        set_tenant(&mut tx, tenant).await?;
         sqlx::query(
             "INSERT INTO meta.md_workflow_task (tenant_id, workflow_id, entity, record_id, transition_id)
              VALUES ($1, $2, $3, $4, $5)",
@@ -136,9 +150,10 @@ pub async fn run_transition(
         .bind(entity)
         .bind(record_id)
         .bind(t.id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
     }
 
     // enqueue a side-effect (outbox); the drain worker is a follow-up

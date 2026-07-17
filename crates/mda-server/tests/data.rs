@@ -71,27 +71,11 @@ async fn setup() -> Option<Ctx> {
     // Each test gets its own fresh, migrated database → fully parallel-safe.
     let (pool, db_url) = common::spawn_db(&url).await;
     let tenant = Uuid::new_v4();
-    let (role_id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, 'admin') RETURNING id",
-    )
-    .bind(tenant)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1, '*', '*')")
-        .bind(role_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    let role_id = common::seed_role(&pool, tenant, "admin", &[("*", "*")]).await;
     let hash = mda_security::hash_password("x").unwrap();
     let email = format!("u{}@test", Uuid::new_v4().simple());
     let user_id = common::seed_user(&pool, tenant, &email, "admin", &hash).await;
-    sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
-        .bind(user_id)
-        .bind(role_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    common::seed_assignment(&pool, tenant, user_id, role_id).await;
     let jwt = JwtConfig::from_env();
     let token = jwt.issue_access(user_id, tenant).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
@@ -129,31 +113,17 @@ async fn setup() -> Option<Ctx> {
 
 /// Create a user with the given permissions; return (token, user_id).
 async fn limited_user(ctx: &Ctx, perms: &[(&str, &str)]) -> (String, Uuid) {
-    let (role_id,): (Uuid,) =
-        sqlx::query_as("INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, $2) RETURNING id")
-            .bind(ctx.tenant)
-            .bind(format!("r{}", Uuid::new_v4().simple()))
-            .fetch_one(&ctx.pool)
-            .await
-            .unwrap();
-    for (e, v) in perms {
-        sqlx::query("INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1, $2, $3)")
-            .bind(role_id)
-            .bind(e)
-            .bind(v)
-            .execute(&ctx.pool)
-            .await
-            .unwrap();
-    }
+    let role_id = common::seed_role(
+        &ctx.pool,
+        ctx.tenant,
+        &format!("r{}", Uuid::new_v4().simple()),
+        perms,
+    )
+    .await;
     let hash = mda_security::hash_password("x").unwrap();
     let email = format!("u{}@test", Uuid::new_v4().simple());
     let user_id = common::seed_user(&ctx.pool, ctx.tenant, &email, "limited", &hash).await;
-    sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
-        .bind(user_id)
-        .bind(role_id)
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+    common::seed_assignment(&ctx.pool, ctx.tenant, user_id, role_id).await;
     (ctx.jwt.issue_access(user_id, ctx.tenant).unwrap(), user_id)
 }
 
@@ -560,16 +530,21 @@ async fn rules_and_calculated_fields_fire() {
     let id = rec["id"].as_str().unwrap().to_string();
 
     // install a rule: when status becomes Closed, set closed_at = now()
-    sqlx::query(
-        "INSERT INTO meta.md_rule (tenant_id, entity, event, condition, action_type, action_field, action_value)
-         VALUES ($1,'Ticket','after_update',
-            '{\"op\":\"Cmp\",\"kind\":\"eq\",\"lhs\":{\"op\":\"Field\",\"name\":\"status\"},\"rhs\":{\"op\":\"Lit\",\"value\":\"Closed\"}}'::jsonb,
-            'set_field','closed_at','{\"op\":\"Call\",\"name\":\"now\",\"args\":[]}'::jsonb)",
-    )
-    .bind(ctx.tenant)
-    .execute(&ctx.pool)
-    .await
-    .unwrap();
+    {
+        let mut tx = ctx.pool.begin().await.unwrap();
+        mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+        sqlx::query(
+            "INSERT INTO meta.md_rule (tenant_id, entity, event, condition, action_type, action_field, action_value)
+             VALUES ($1,'Ticket','after_update',
+                '{\"op\":\"Cmp\",\"kind\":\"eq\",\"lhs\":{\"op\":\"Field\",\"name\":\"status\"},\"rhs\":{\"op\":\"Lit\",\"value\":\"Closed\"}}'::jsonb,
+                'set_field','closed_at','{\"op\":\"Call\",\"name\":\"now\",\"args\":[]}'::jsonb)",
+        )
+        .bind(ctx.tenant)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
 
     // update status -> Closed => rule fires, closed_at set
     let (st, upd) = call(
@@ -609,33 +584,36 @@ async fn workflow_state_machine_runs() {
     });
     publish(&ctx, model).await;
 
-    // author the workflow via metadata (Studio is Phase 8)
+    // author the workflow via metadata (Studio is Phase 8). All md_workflow_* are
+    // RLS-gated, so seed them under the tenant GUC in one txn (workflow_state /
+    // transition get tenant_id via trigger from the workflow).
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
     let (wf_id,): (Uuid,) = sqlx::query_as(
         "INSERT INTO meta.md_workflow (tenant_id, entity, name) VALUES ($1,'Invoice','approval') RETURNING id",
     )
     .bind(ctx.tenant)
-    .fetch_one(&ctx.pool)
+    .fetch_one(&mut *tx)
     .await
     .unwrap();
     for s in ["active", "Submitted", "Approved"] {
         sqlx::query("INSERT INTO meta.md_workflow_state (workflow_id, name) VALUES ($1,$2)")
             .bind(wf_id)
             .bind(s)
-            .execute(&ctx.pool)
+            .execute(&mut *tx)
             .await
             .unwrap();
     }
-    // submit: active -> Submitted (creates an approval task)
     sqlx::query("INSERT INTO meta.md_workflow_transition (workflow_id, name, from_state, to_state, creates_task) VALUES ($1,'submit','active','Submitted',TRUE)")
-        .bind(wf_id).execute(&ctx.pool).await.unwrap();
-    // approve: Submitted -> Approved (guard amount>0; action approved_at=now())
+        .bind(wf_id).execute(&mut *tx).await.unwrap();
     sqlx::query(
         "INSERT INTO meta.md_workflow_transition (workflow_id, name, from_state, to_state, guard, actions)
          VALUES ($1,'approve','Submitted','Approved',
             '{\"op\":\"Cmp\",\"kind\":\"gt\",\"lhs\":{\"op\":\"Field\",\"name\":\"amount\"},\"rhs\":{\"op\":\"Lit\",\"value\":0}}'::jsonb,
             '[{\"field\":\"approved_at\",\"value\":{\"op\":\"Call\",\"name\":\"now\",\"args\":[]}}]'::jsonb)",
     )
-    .bind(wf_id).execute(&ctx.pool).await.unwrap();
+    .bind(wf_id).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
 
     // create an Invoice (state defaults to 'active', version 1)
     let (_, rec) = call(
@@ -663,14 +641,18 @@ async fn workflow_state_machine_runs() {
     assert_eq!(st, StatusCode::OK, "submit: {rec}");
     assert_eq!(rec["state"], "Submitted");
     assert_eq!(rec["version"], 2);
-    let tasks: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM meta.md_workflow_task WHERE tenant_id=$1 AND record_id=$2",
-    )
-    .bind(ctx.tenant)
-    .bind(Uuid::parse_str(&id).unwrap())
-    .fetch_one(&ctx.pool)
-    .await
-    .unwrap();
+    let tasks: i64 = {
+        let mut tx = ctx.pool.begin().await.unwrap();
+        mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+        sqlx::query_scalar(
+            "SELECT count(*) FROM meta.md_workflow_task WHERE tenant_id=$1 AND record_id=$2",
+        )
+        .bind(ctx.tenant)
+        .bind(Uuid::parse_str(&id).unwrap())
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap()
+    };
     assert_eq!(tasks, 1, "approval task should be created");
 
     // approve -> Approved, approved_at set, outbox row written
@@ -782,14 +764,20 @@ async fn report_runs_with_grouping_and_export() {
         "order_by":[{"field":"tier","asc":true}],
         "limit":10
     });
-    let (rep_id,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO meta.md_report (tenant_id, name, dataset) VALUES ($1,'by_tier',$2) RETURNING id",
-    )
-    .bind(ctx.tenant)
-    .bind(&dataset)
-    .fetch_one(&ctx.pool)
-    .await
-    .unwrap();
+    let rep_id: Uuid = {
+        let mut tx = ctx.pool.begin().await.unwrap();
+        mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+        let (id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO meta.md_report (tenant_id, name, dataset) VALUES ($1,'by_tier',$2) RETURNING id",
+        )
+        .bind(ctx.tenant)
+        .bind(&dataset)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        id
+    };
 
     let (st, res) = call(
         &ctx.app,
@@ -1429,18 +1417,7 @@ async fn cross_tenant_data_is_isolated() {
 
     // Tenant B: its own user/role/token in a DIFFERENT tenant.
     let tenant_b = Uuid::new_v4();
-    let (role_b,): (Uuid,) = sqlx::query_as(
-        "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1, 'admin') RETURNING id",
-    )
-    .bind(tenant_b)
-    .fetch_one(&ctx.pool)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1, '*', '*')")
-        .bind(role_b)
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+    let role_b = common::seed_role(&ctx.pool, tenant_b, "admin", &[("*", "*")]).await;
     let email_b = format!("b{}@test", Uuid::new_v4().simple());
     let user_b = common::seed_user(
         &ctx.pool,
@@ -1450,12 +1427,7 @@ async fn cross_tenant_data_is_isolated() {
         &mda_security::hash_password("x").unwrap(),
     )
     .await;
-    sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1, $2)")
-        .bind(user_b)
-        .bind(role_b)
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+    common::seed_assignment(&ctx.pool, tenant_b, user_b, role_b).await;
     let token_b = ctx.jwt.issue_access(user_b, tenant_b).unwrap();
 
     // Publish the SAME model for tenant B (same table → shared biz.<table>).
@@ -1827,4 +1799,62 @@ async fn tenant_scoped_login_and_sec_user_rls() {
         .await
         .unwrap();
     assert_eq!(wrong, 0, "sec_user: wrong GUC sees 0 rows");
+}
+
+#[tokio::test]
+async fn rls_gates_meta_at_db_layer() {
+    // meta.md_* is RLS-gated (except md_active_version, polled cross-tenant by
+    // the cache worker). Prove it at the Postgres layer: a non-superuser with no
+    // tenant GUC sees nothing; with the right GUC it sees its tenant's model;
+    // with a wrong GUC, nothing.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        json!({"modules":[],"entities":[{
+            "id": Uuid::new_v4(),"module_id":null,"name":"MetaProbe","table_name":format!("mp_{}", Uuid::new_v4().simple()),
+            "label":"MP","description":null,
+            "fields":[{"id": Uuid::new_v4(),"name":"k","label":"K","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}],
+            "relationships":[]
+        }]}),
+    )
+    .await;
+
+    // no GUC → 0 (a forgotten filter can never leak another tenant's model).
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM meta.md_entity")
+        .fetch_one(&ctx.app_pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "meta.md_entity: no GUC must see 0 rows");
+
+    // correct tenant GUC → the entity is visible.
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    let ok: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM meta.md_entity WHERE name = 'MetaProbe'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(ok, 1, "meta.md_entity: right GUC sees the tenant's entity");
+    tx.rollback().await.unwrap();
+
+    // wrong tenant GUC → 0.
+    let mut tx = ctx.app_pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, Uuid::new_v4())
+        .await
+        .unwrap();
+    let wrong: i64 = sqlx::query_scalar("SELECT count(*) FROM meta.md_entity")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(wrong, 0, "meta.md_entity: wrong GUC sees 0 rows");
+
+    // md_active_version is INTENTIONALLY exempt (cache poller reads all tenants):
+    // a GUC-less read must succeed (not be blocked).
+    let _: i64 = sqlx::query_scalar("SELECT count(*) FROM meta.md_active_version")
+        .fetch_one(&ctx.app_pool)
+        .await
+        .unwrap();
 }

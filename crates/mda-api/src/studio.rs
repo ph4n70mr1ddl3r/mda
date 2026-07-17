@@ -108,6 +108,8 @@ async fn create_draft(
     let name = req.name.unwrap_or_else(|| "draft".to_string());
     let active = loader::load_active_model(&st.pool, tenant).await?;
     let model_json = serde_json::to_value(&active).map_err(Error::internal)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
     let draft: Draft = sqlx::query_as::<_, Draft>(
         "INSERT INTO meta.md_draft (tenant_id, name, model, status)
          VALUES ($1, $2, $3, 'draft')
@@ -116,9 +118,10 @@ async fn create_draft(
     .bind(tenant)
     .bind(&name)
     .bind(&model_json)
-    .fetch_one(&st.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(Json(draft))
 }
 
@@ -127,8 +130,9 @@ async fn get_draft(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Draft>> {
+    let tenant = user.tenant_id;
     require_studio(&user)?;
-    let draft = fetch_draft(&st.pool, id).await?;
+    let draft = fetch_draft(&st.pool, id, tenant).await?;
     ensure_tenant(&draft, user.tenant_id)?;
     Ok(Json(draft))
 }
@@ -146,7 +150,7 @@ async fn put_model(
     let model_json = serde_json::to_value(&model).map_err(Error::internal)?;
 
     // Ensure the draft belongs to this tenant before mutating.
-    let existing = fetch_draft(&st.pool, id).await?;
+    let existing = fetch_draft(&st.pool, id, tenant).await?;
     ensure_tenant(&existing, tenant)?;
     if existing.status != "draft" {
         return Err(Error::Conflict(format!("draft is {} (not editable)", existing.status)).into());
@@ -157,7 +161,7 @@ async fn put_model(
     let active = loader::load_active_model(&st.pool, tenant).await?;
     let report = diff(&active, &model);
 
-    let updated: Option<(Uuid,)> = sqlx::query_as(
+    let q = sqlx::query_as::<_, (Uuid,)>(
         "UPDATE meta.md_draft
             SET model = $3, version_etag = gen_random_uuid(), updated_at = now()
           WHERE id = $1 AND version_etag = $2
@@ -165,10 +169,11 @@ async fn put_model(
     )
     .bind(id)
     .bind(if_match)
-    .bind(&model_json)
-    .fetch_optional(&st.pool)
-    .await
-    .map_err(Error::internal)?;
+    .bind(&model_json);
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    let updated: Option<(Uuid,)> = q.fetch_optional(&mut *tx).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
 
     match updated {
         Some((etag,)) => Ok(Json(EtagResp {
@@ -189,7 +194,7 @@ async fn validate_draft(
 ) -> ApiResult<Json<DiffReport>> {
     let tenant = user.tenant_id;
     require_studio(&user)?;
-    let draft = fetch_draft(&st.pool, id).await?;
+    let draft = fetch_draft(&st.pool, id, tenant).await?;
     ensure_tenant(&draft, tenant)?;
     let model: DraftModel = serde_json::from_value(draft.model.clone()).map_err(Error::internal)?;
     let active = loader::load_active_model(&st.pool, tenant).await?;
@@ -203,7 +208,7 @@ async fn publish_draft(
 ) -> ApiResult<Json<PublishResult>> {
     let tenant = user.tenant_id;
     require_studio(&user)?;
-    let draft = fetch_draft(&st.pool, id).await?;
+    let draft = fetch_draft(&st.pool, id, tenant).await?;
     ensure_tenant(&draft, tenant)?;
     if draft.status == "published" {
         return Err(Error::Conflict("draft already published".into()).into());
@@ -256,6 +261,8 @@ async fn import_model(
     let active = loader::load_active_model(&st.pool, tenant).await?;
     let _ = active; // branched model is the starting point; we replace with imported
     let model_json = serde_json::to_value(&model).map_err(Error::internal)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
     let draft: Draft = sqlx::query_as::<_, Draft>(
         "INSERT INTO meta.md_draft (tenant_id, name, model, status)
          VALUES ($1, 'imported', $2, 'draft')
@@ -263,9 +270,10 @@ async fn import_model(
     )
     .bind(tenant)
     .bind(&model_json)
-    .fetch_one(&st.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(Json(draft))
 }
 
@@ -275,14 +283,17 @@ async fn list_snapshots(
 ) -> ApiResult<Json<Vec<SnapshotRow>>> {
     let tenant = user.tenant_id;
     require_studio(&user)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
     let rows: Vec<SnapshotRow> = sqlx::query_as::<_, SnapshotRow>(
         "SELECT id, version, created_at FROM meta.md_snapshot
           WHERE tenant_id = $1 ORDER BY version DESC",
     )
     .bind(tenant)
-    .fetch_all(&st.pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(Json(rows))
 }
 
@@ -301,16 +312,22 @@ async fn get_entity_definition(
 
 // ===== helpers =====
 
-async fn fetch_draft(pool: &PgPool, id: Uuid) -> Result<Draft> {
-    sqlx::query_as::<_, Draft>(
+/// Load a draft by id under the caller's tenant GUC (md_draft is RLS-gated, so a
+/// GUC-less lookup returns nothing). `ensure_tenant` becomes a belt-and-suspenders
+/// check — RLS already guaranteed the row is this tenant's.
+async fn fetch_draft(pool: &PgPool, id: Uuid, tenant: Uuid) -> Result<Draft> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    let row = sqlx::query_as::<_, Draft>(
         "SELECT id, tenant_id, name, status, version_etag, model, created_at, updated_at
            FROM meta.md_draft WHERE id = $1",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(Error::internal)?
-    .ok_or_else(|| Error::NotFound(format!("draft {id}")))
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    row.ok_or_else(|| Error::NotFound(format!("draft {id}")))
 }
 
 fn ensure_tenant(draft: &Draft, tenant: Uuid) -> Result<()> {
@@ -363,6 +380,8 @@ async fn apply_additive_publish(
         .collect();
 
     let mut tx = pool.begin().await.map_err(Error::internal)?;
+    // All meta.md_* writes below are RLS-gated → set the tenant GUC for the txn.
+    mda_security::set_tenant(&mut tx, tenant).await?;
 
     // 1) archive the current active model
     let active_json = serde_json::to_value(active).map_err(Error::internal)?;

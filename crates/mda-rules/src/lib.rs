@@ -40,6 +40,12 @@ pub struct Rule {
 
 /// Load active rules for `(tenant, entity)`, ordered by priority.
 pub async fn load_active(pool: &PgPool, tenant: Uuid, entity: &str) -> Result<Vec<Rule>> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
     let rules: Vec<Rule> = sqlx::query_as(
         "SELECT id, entity, event, condition, action_type, action_field, action_value, priority
            FROM meta.md_rule
@@ -48,9 +54,10 @@ pub async fn load_active(pool: &PgPool, tenant: Uuid, entity: &str) -> Result<Ve
     )
     .bind(tenant)
     .bind(entity)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(rules)
 }
 

@@ -8,14 +8,27 @@ use crate::definition::EntityDefinition;
 use crate::draft::{DraftEntity, DraftField, DraftModel, DraftModule, DraftRelationship};
 use crate::model::{Entity, Field, Module, Relationship};
 
+/// Set the tenant GUC for a meta.* read. meta.md_* is RLS-gated (except
+/// md_active_version, polled cross-tenant by the cache worker).
+async fn set_tenant(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, tenant: Uuid) -> Result<()> {
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(tenant.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    Ok(())
+}
+
 /// Load the full active model for a tenant as a `DraftModel` (used by branch,
 /// export, snapshot archival, and diff).
 pub async fn load_active_model(pool: &sqlx::PgPool, tenant: Uuid) -> Result<DraftModel> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
     let modules: Vec<Module> = sqlx::query_as::<_, Module>(
         "SELECT id, tenant_id, name, label, created_at, updated_at FROM meta.md_module WHERE tenant_id = $1 ORDER BY name",
     )
     .bind(tenant)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
 
@@ -24,7 +37,7 @@ pub async fn load_active_model(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Draf
          FROM meta.md_entity WHERE tenant_id = $1 AND status = 'active' ORDER BY name",
     )
     .bind(tenant)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
 
@@ -34,7 +47,7 @@ pub async fn load_active_model(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Draf
          FROM meta.md_field WHERE tenant_id = $1 AND status = 'active'",
     )
     .bind(tenant)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
 
@@ -44,9 +57,10 @@ pub async fn load_active_model(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Draf
          FROM meta.md_relationship WHERE tenant_id = $1",
     )
     .bind(tenant)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
 
     let model = assemble_draft_model(modules, entities, fields, rels);
     Ok(model)
@@ -58,13 +72,15 @@ pub async fn load_entity_definition(
     tenant: Uuid,
     entity_id: Uuid,
 ) -> Result<EntityDefinition> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
     let entity = sqlx::query_as::<_, Entity>(
         "SELECT id, tenant_id, module_id, table_name, name, label, description, status, created_at, updated_at
          FROM meta.md_entity WHERE tenant_id = $1 AND id = $2 AND status = 'active'",
     )
     .bind(tenant)
     .bind(entity_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?
     .ok_or_else(|| Error::NotFound(format!("entity {entity_id}")))?;
@@ -76,7 +92,7 @@ pub async fn load_entity_definition(
     )
     .bind(tenant)
     .bind(entity_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
 
@@ -87,9 +103,10 @@ pub async fn load_entity_definition(
     )
     .bind(tenant)
     .bind(entity_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
 
     Ok(EntityDefinition {
         entity,
@@ -112,26 +129,32 @@ pub async fn active_version(pool: &sqlx::PgPool, tenant: Uuid) -> Result<i64> {
 /// Resolve an active entity's id by (tenant, name) — the runtime data API
 /// (`/api/data/:entity`) addresses entities by name.
 pub async fn entity_id_by_name(pool: &sqlx::PgPool, tenant: Uuid, name: &str) -> Result<Uuid> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
     let row: Option<(Uuid,)> = sqlx::query_as(
         "SELECT id FROM meta.md_entity WHERE tenant_id = $1 AND name = $2 AND status = 'active'",
     )
     .bind(tenant)
     .bind(name)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     row.map(|(id,)| id)
         .ok_or_else(|| Error::NotFound(format!("entity {name}")))
 }
 
 /// All active entity ids for a tenant (for cache invalidation / enumeration).
 pub async fn entity_ids_for_tenant(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Vec<Uuid>> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
     let rows: Vec<(Uuid,)> =
         sqlx::query_as("SELECT id FROM meta.md_entity WHERE tenant_id = $1 AND status = 'active'")
             .bind(tenant)
-            .fetch_all(pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
