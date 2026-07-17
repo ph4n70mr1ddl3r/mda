@@ -20,8 +20,8 @@
 use std::time::Duration;
 
 use axum::extract::{Query, State};
-use axum::http::HeaderMap;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use mda_security::Identity;
@@ -30,10 +30,9 @@ use serde_json::json;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::{Stream, StreamExt};
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use crate::auth::AuthUser;
 use crate::AppState;
 
 /// How many events the in-process broadcast buffer holds per instance. On
@@ -160,15 +159,56 @@ struct StreamQuery {
     /// `tenant:<id>:broadcast`. Omit to receive all readable events.
     #[serde(default)]
     channel: Option<String>,
+    /// Bearer token, as a fallback for browser `EventSource` (which cannot set
+    /// request headers). Prefer cookie / short-lived-ticket auth in production so
+    /// JWTs don't land in URLs/logs; this is the standard SSE concession.
+    #[serde(default)]
+    token: Option<String>,
+}
+
+fn unauthorized_resp() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({ "error": "unauthorized" })),
+    )
+        .into_response()
 }
 
 /// `GET /api/events` — SSE stream. Replays from `Last-Event-ID`, then live.
+/// Auth: `Authorization: Bearer <jwt>` (preferred) or `?token=<jwt>` (for
+/// `EventSource`, which can't set headers).
 async fn stream(
     State(st): State<AppState>,
-    AuthUser(user): AuthUser,
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+) -> Response {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .or(q.token.clone());
+    let token = match token {
+        Some(t) => t,
+        None => return unauthorized_resp(),
+    };
+    let claims = match st.jwt.verify(&token) {
+        Ok(c) => c,
+        Err(_) => return unauthorized_resp(),
+    };
+    let user_id = match Uuid::parse_str(&claims.sub) {
+        Ok(u) => u,
+        Err(_) => return unauthorized_resp(),
+    };
+    let tenant = match Uuid::parse_str(&claims.tenant) {
+        Ok(u) => u,
+        Err(_) => return unauthorized_resp(),
+    };
+    let user = match mda_security::load_identity(&st.pool, user_id, tenant).await {
+        Ok(i) => i,
+        Err(_) => return unauthorized_resp(),
+    };
+
     let last_seq = headers
         .get("Last-Event-ID")
         .and_then(|h| h.to_str().ok())
@@ -218,6 +258,7 @@ async fn stream(
 
     Sse::new(ReceiverStream::new(rx_sse).map(Ok::<_, std::convert::Infallible>))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 /// Replay up to [`REPLAY_BATCH`] events newer than `last` that the caller may see.
@@ -266,17 +307,21 @@ fn allow(ev: &EventRow, user: &Identity, filter: &ChannelFilter) -> Option<Event
     if !filter.matches(ev, user) {
         return None;
     }
-    let mut e = Event::default()
-        .id(ev.seq.to_string())
-        .event(ev.typ.clone());
-    let data = if let Some(ent) = &ev.entity {
-        json!({ "entity": ent, "record_id": ev.record_id, "payload": ev.payload })
-    } else {
-        json!({ "payload": ev.payload })
-    };
-    // json_data serializes; json! never fails to serialize.
-    e = e.json_data(data).expect("sse json_data");
-    Some(e)
+    // Default-message events (no `event:` type) so browser EventSource's
+    // onmessage receives them; the type rides inside the data payload. `id` is
+    // the seq → Last-Event-ID replay on reconnect.
+    let data = json!({
+        "type": ev.typ,
+        "entity": ev.entity,
+        "record_id": ev.record_id,
+        "payload": ev.payload,
+    });
+    Some(
+        Event::default()
+            .id(ev.seq.to_string())
+            .json_data(data)
+            .expect("sse json_data"),
+    )
 }
 
 #[derive(Clone)]

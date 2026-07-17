@@ -123,6 +123,24 @@ pub async fn update_record(
     Ok(())
 }
 
+pub async fn delete_record(token: &str, entity: &str, id: &str) -> Result<(), String> {
+    let resp = gloo_net::http::Request::delete(&format!("{API_BASE}/api/data/{entity}/{id}"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(format!("Delete failed ({})", resp.status()));
+    }
+    Ok(())
+}
+
+/// SSE endpoint URL for browser `EventSource` (which can't set headers), passing
+/// the token + a subscription channel as query params.
+pub fn events_url(token: &str, channel: &str) -> String {
+    format!("{API_BASE}/api/events?token={token}&channel={channel}")
+}
+
 // localStorage helpers
 pub fn local_get(key: &str) -> Option<String> {
     let window = web_sys::window()?;
