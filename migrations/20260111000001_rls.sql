@@ -32,16 +32,29 @@ EXCEPTION
 END
 $$;
 
--- Grants to mda_app — only if it exists.
+-- Grants to mda_app — only if it exists. The `biz` schema and its tables are
+-- created at publish time BY mda_app, so it owns them and needs no grant here;
+-- these cover the migration-owned `meta`/`sec` tables and the `sys_*`
+-- operational tables. Those sys_* tables live in `public` (there is no separate
+-- `sys` schema), so grant against `public` — the old `IN SCHEMA sys` references
+-- a non-existent schema and made this whole block fail whenever mda_app existed
+-- (i.e. any deployment that actually sets MDA_APP_DATABASE_URL).
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mda_app') THEN
-        EXECUTE 'GRANT USAGE ON SCHEMA meta, sec, sys, biz, biz_archive, mda TO mda_app';
-        EXECUTE 'GRANT CREATE ON SCHEMA biz, biz_archive TO mda_app';
-        EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA meta, sec, sys TO mda_app';
-        EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta, sys TO mda_app';
-        EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA meta, sec, sys GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mda_app';
-        EXECUTE 'ALTER DEFAULT PRIVILEGES IN SCHEMA meta, sec, sys GRANT USAGE, SELECT ON SEQUENCES TO mda_app';
+        GRANT USAGE ON SCHEMA meta, sec, mda, biz_archive TO mda_app;
+        -- mda_app creates the twin archive tables at publish → needs CREATE there.
+        GRANT USAGE, CREATE ON SCHEMA biz_archive TO mda_app;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA meta, sec, public TO mda_app;
+        GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA meta, public TO mda_app;
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA meta, sec, mda TO mda_app;
+        -- Future tables/sequences created by the migration role in these schemas
+        -- are granted automatically, so a later sys_* table (e.g.
+        -- sys_login_throttle) is covered without each migration repeating a GRANT.
+        ALTER DEFAULT PRIVILEGES IN SCHEMA meta, sec, public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO mda_app;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA meta, sec, public
+            GRANT USAGE, SELECT ON SEQUENCES TO mda_app;
         EXECUTE format('GRANT CONNECT ON DATABASE %I TO mda_app', current_database());
     END IF;
 END
