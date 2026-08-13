@@ -64,6 +64,7 @@ pub async fn run() -> anyhow::Result<()> {
     mda_meta::cache::spawn_listen(app_pool.clone(), cache.clone());
     mda_meta::cache::spawn_poll(app_pool.clone(), cache.clone());
     outbox::spawn_drain(app_pool.clone());
+    mda_api::notifications::spawn_digest(app_pool.clone());
 
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
