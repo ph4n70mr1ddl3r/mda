@@ -17,15 +17,15 @@ use crate::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/connectors", post(create_connector).get(list_connectors))
+        .route(
+            "/api/connectors",
+            post(create_connector).get(list_connectors),
+        )
         .route("/api/flows", post(create_flow).get(list_flows))
         .route("/api/flows/:id", get(get_flow))
         .route("/api/flows/:id/run", post(run_flow))
         .route("/api/flows/:id/runs", get(list_runs))
-        .route(
-            "/api/external-ids/:entity/:key",
-            get(lookup_external_id),
-        )
+        .route("/api/external-ids/:entity/:key", get(lookup_external_id))
 }
 
 // ===== connectors =====
@@ -73,7 +73,9 @@ async fn create_connector(
     let (id,) = row.ok_or_else(|| Error::Conflict(format!("connector {} exists", body.name)))?;
     Ok((
         StatusCode::CREATED,
-        Json(json!({"id": id, "name": body.name, "transport": body.transport, "base_url": body.base_url, "auth": body.auth})),
+        Json(
+            json!({"id": id, "name": body.name, "transport": body.transport, "base_url": body.base_url, "auth": body.auth}),
+        ),
     ))
 }
 
@@ -155,7 +157,12 @@ async fn create_flow(
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     let (id,) = row.ok_or_else(|| Error::Conflict(format!("flow {} exists", body.name)))?;
-    Ok((StatusCode::CREATED, Json(json!({"id": id, "name": body.name, "direction": body.direction, "entity": body.entity}))))
+    Ok((
+        StatusCode::CREATED,
+        Json(
+            json!({"id": id, "name": body.name, "direction": body.direction, "entity": body.entity}),
+        ),
+    ))
 }
 
 async fn list_flows(
@@ -164,13 +171,12 @@ async fn list_flows(
 ) -> ApiResult<Json<Vec<Value>>> {
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
-    let rows: Vec<(Value,)> = sqlx::query_as(
-        "SELECT to_jsonb(f.*) FROM int.flow f WHERE tenant_id = $1 ORDER BY name",
-    )
-    .bind(user.tenant_id)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(Error::internal)?;
+    let rows: Vec<(Value,)> =
+        sqlx::query_as("SELECT to_jsonb(f.*) FROM int.flow f WHERE tenant_id = $1 ORDER BY name")
+            .bind(user.tenant_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(Json(rows.into_iter().map(|(v,)| v).collect()))
 }
@@ -209,23 +215,16 @@ async fn run_flow(
 ) -> ApiResult<Json<Value>> {
     let flow = mda_integration::flow_by_id(&st.pool, user.tenant_id, id).await?;
     // resolve the entity definition (int flows target a canonical biz entity).
-    let entity_id = mda_meta::loader::entity_id_by_name(&st.pool, user.tenant_id, &flow.entity)
-        .await?;
-    let def = mda_meta::loader::load_entity_definition(&st.pool, user.tenant_id, entity_id)
-        .await?;
+    let entity_id =
+        mda_meta::loader::entity_id_by_name(&st.pool, user.tenant_id, &flow.entity).await?;
+    let def = mda_meta::loader::load_entity_definition(&st.pool, user.tenant_id, entity_id).await?;
     match flow.direction.as_str() {
         "inbound" => {
             let external = body
                 .payload
                 .ok_or_else(|| Error::Invalid("inbound run needs {\"payload\":{...}}".into()))?;
-            let rid = mda_integration::run_inbound(
-                &st.pool,
-                &def,
-                &flow,
-                &external,
-                user.user_id,
-            )
-            .await?;
+            let rid = mda_integration::run_inbound(&st.pool, &def, &flow, &external, user.user_id)
+                .await?;
             Ok(Json(json!({"record_id": rid})))
         }
         "outbound" => {
@@ -295,5 +294,7 @@ async fn lookup_external_id(
         .map_err(Error::internal)?,
     };
     let (record_id,) = row.ok_or_else(|| Error::NotFound(format!("external id {entity}/{key}")))?;
-    Ok(Json(json!({"entity": entity, "external_key": key, "record_id": record_id})))
+    Ok(Json(
+        json!({"entity": entity, "external_key": key, "record_id": record_id}),
+    ))
 }

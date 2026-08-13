@@ -46,7 +46,8 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
 
     // login to get an access token (admin can do everything).
     let (st, v) = login(&app, tenant, &email, PWD).await;
@@ -97,13 +98,21 @@ trait IntoJson {
 impl IntoJson for axum::response::Response {
     async fn into_json(self) -> (StatusCode, Value) {
         let st = self.status();
-        let bytes = to_bytes(self.into_body(), 1 << 20).await.unwrap_or_default();
+        let bytes = to_bytes(self.into_body(), 1 << 20)
+            .await
+            .unwrap_or_default();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (st, v)
     }
 }
 
-async fn authed(app: &axum::Router, token: &str, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+async fn authed(
+    app: &axum::Router,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let mut b = Request::builder()
         .method(method)
         .uri(path)

@@ -49,7 +49,9 @@ pub struct AppState {
     pub login_throttle: mda_security::LoginThrottle,
     /// GraphQL schema cache, keyed by `(tenant_id, active_version)` so a publish
     /// (version advance) rebuilds the schema (ADR-0010).
-    pub gql: std::sync::Arc<tokio::sync::RwLock<HashMap<(uuid::Uuid, i64), async_graphql::dynamic::Schema>>>,
+    pub gql: std::sync::Arc<
+        tokio::sync::RwLock<HashMap<(uuid::Uuid, i64), async_graphql::dynamic::Schema>>,
+    >,
 }
 
 /// Build the application router.

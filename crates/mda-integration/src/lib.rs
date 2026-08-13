@@ -79,8 +79,16 @@ impl HttpConnector {
     }
 
     /// Resolve the auth header(s) server-side from the secret store.
-    fn auth_headers(&self, secrets: &dyn SecretStore, _tenant: Uuid) -> Result<Vec<(String, String)>> {
-        let kind = self.auth.get("kind").and_then(|v| v.as_str()).unwrap_or("none");
+    fn auth_headers(
+        &self,
+        secrets: &dyn SecretStore,
+        _tenant: Uuid,
+    ) -> Result<Vec<(String, String)>> {
+        let kind = self
+            .auth
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
         match kind {
             "none" | "" => Ok(vec![]),
             "bearer" | "header" => {
@@ -98,7 +106,10 @@ impl HttpConnector {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Authorization");
                 let hv = if kind == "bearer" {
-                    format!("Bearer {}", String::from_utf8(val).map_err(Error::internal)?)
+                    format!(
+                        "Bearer {}",
+                        String::from_utf8(val).map_err(Error::internal)?
+                    )
                 } else {
                     String::from_utf8(val).map_err(Error::internal)?
                 };
@@ -221,8 +232,17 @@ pub async fn flow_for_webhook(
     mda_security::set_tenant(&mut tx, tenant).await?;
     #[allow(clippy::type_complexity)]
     type FlowRow = (
-        Uuid, String, String, String, Option<Uuid>, Option<Uuid>, Option<String>,
-        Value, String, String, Option<String>,
+        Uuid,
+        String,
+        String,
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+        Value,
+        String,
+        String,
+        Option<String>,
     );
     let row: Option<FlowRow> = sqlx::query_as(
         "SELECT id, name, direction, entity, connector_id, webhook_id, endpoint_path,
@@ -236,22 +256,20 @@ pub async fn flow_for_webhook(
     .await
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok(row.map(
-        |r| Flow {
-            id: r.0,
-            tenant_id: tenant,
-            name: r.1,
-            direction: r.2,
-            entity: r.3,
-            connector_id: r.4,
-            webhook_id: Some(webhook_id),
-            endpoint_path: r.6,
-            mapping: r.7,
-            external_key_field: r.8,
-            conflict_policy: r.9,
-            system: r.10,
-        },
-    ))
+    Ok(row.map(|r| Flow {
+        id: r.0,
+        tenant_id: tenant,
+        name: r.1,
+        direction: r.2,
+        entity: r.3,
+        connector_id: r.4,
+        webhook_id: Some(webhook_id),
+        endpoint_path: r.6,
+        mapping: r.7,
+        external_key_field: r.8,
+        conflict_policy: r.9,
+        system: r.10,
+    }))
 }
 
 /// Load a flow by id (any direction).
@@ -260,8 +278,17 @@ pub async fn flow_by_id(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<Flow> {
     mda_security::set_tenant(&mut tx, tenant).await?;
     #[allow(clippy::type_complexity)]
     type Row = (
-        Uuid, String, String, String, Option<Uuid>, Option<Uuid>, Option<String>,
-        Value, String, String, Option<String>,
+        Uuid,
+        String,
+        String,
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+        Value,
+        String,
+        String,
+        Option<String>,
     );
     let row: Option<Row> = sqlx::query_as(
         "SELECT id, name, direction, entity, connector_id, webhook_id, endpoint_path,
@@ -292,11 +319,7 @@ pub async fn flow_by_id(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<Flow> {
 }
 
 /// Load a connector (base_url + auth) for outbound / scheduled fetch.
-pub async fn connector_for(
-    pool: &PgPool,
-    tenant: Uuid,
-    id: Uuid,
-) -> Result<(String, Value)> {
+pub async fn connector_for(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<(String, Value)> {
     let mut tx = pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, tenant).await?;
     let row: Option<(String, Value)> =
@@ -401,12 +424,19 @@ fn apply_steps(
 }
 
 /// Load the value maps referenced by a flow's steps (RLS-gated → tenant GUC).
-async fn load_value_maps(pool: &PgPool, tenant: Uuid, steps: &[FlowStep]) -> Result<HashMap<String, Value>> {
+async fn load_value_maps(
+    pool: &PgPool,
+    tenant: Uuid,
+    steps: &[FlowStep],
+) -> Result<HashMap<String, Value>> {
     let names: Vec<String> = steps
         .iter()
         .filter_map(|s| {
             if s.kind == "value_map" {
-                s.config.get("map").and_then(|v| v.as_str()).map(String::from)
+                s.config
+                    .get("map")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
             } else {
                 None
             }
@@ -534,7 +564,15 @@ pub async fn run_inbound(
             id
         }
     };
-    upsert_external(pool, tenant, &flow.entity, record_id, &system, &external_key).await?;
+    upsert_external(
+        pool,
+        tenant,
+        &flow.entity,
+        record_id,
+        &system,
+        &external_key,
+    )
+    .await?;
     record_run(pool, tenant, flow, "ok", 1, Some(&external_key), None).await?;
     Ok(record_id)
 }
@@ -618,7 +656,11 @@ fn map_outbound(mapping: &Value, record: &Value) -> Value {
 }
 
 fn set_nested(out: &mut Map<String, Value>, path: &str, val: Value) {
-    let segs: Vec<&str> = path.split('.').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let segs: Vec<&str> = path
+        .split('.')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     if segs.is_empty() {
         return;
     }
@@ -665,12 +707,7 @@ async fn record_run(
 }
 
 /// Record a failed run (used by the drain on error).
-pub async fn record_failure(
-    pool: &PgPool,
-    tenant: Uuid,
-    flow: &Flow,
-    error: &str,
-) -> Result<()> {
+pub async fn record_failure(pool: &PgPool, tenant: Uuid, flow: &Flow, error: &str) -> Result<()> {
     record_run(pool, tenant, flow, "failed", 0, None, Some(error)).await
 }
 

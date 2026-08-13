@@ -52,7 +52,11 @@ jobs:
       # The DB-backed suites each get their own fresh database (tests/common/mod.rs),
       # so they are fully parallel-safe — no --test-threads=1 needed.
       - name: DB-backed tests (RLS, CRUD, publish, SSE, archive/restore, …)
-        run: cargo test --test data --test studio --test integration --test events --test throttle --test sessions --test observability
+        run: >-
+          cargo test --test data --test studio --test integration --test events
+          --test throttle --test sessions --test observability
+          --test secrets --test templates --test notifications --test webhooks
+          --test integration_flows --test graphql
 
   # Build the Leptos WASM runtime UI with Trunk (catches UI regressions; the
   # backend job can't — the UI is a separate standalone workspace). Runs in

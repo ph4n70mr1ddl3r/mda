@@ -65,7 +65,8 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
     Some(Ctx {
         app,
         token,
@@ -115,7 +116,10 @@ async fn publish(ctx: &Ctx, model: Value) {
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/api/studio/drafts/{id}/model"))
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", ctx.token))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", ctx.token),
+        )
         .header("if-match", etag)
         .header("content-type", "application/json")
         .body(Body::from(model.to_string()))
@@ -159,7 +163,8 @@ async fn template_renders_context_and_record_modes() {
         &ctx.token,
         Some(
             json!({"name":"welcome","kind":"email","content_type":"text/html",
-                    "body":"<p>Welcome, {{ who }}!</p>"}).to_string(),
+                    "body":"<p>Welcome, {{ who }}!</p>"})
+            .to_string(),
         ),
     )
     .await;
@@ -230,9 +235,7 @@ async fn template_locale_best_match() {
             "POST",
             "/api/templates",
             &ctx.token,
-            Some(
-                json!({"name":"greet","body":body,"locale":locale}).to_string(),
-            ),
+            Some(json!({"name":"greet","body":body,"locale":locale}).to_string()),
         )
         .await;
     }

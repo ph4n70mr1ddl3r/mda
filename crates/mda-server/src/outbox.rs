@@ -22,8 +22,7 @@ const MAX_RETRIES: i32 = 10;
 /// Spawn the background drain loop with the default channel set (in-app + email)
 /// and a default secret store + HTTP client.
 pub fn spawn_drain(pool: PgPool) {
-    let secrets: Arc<dyn SecretStore> =
-        Arc::new(mda_api::secrets::LocalSecretStore::from_env());
+    let secrets: Arc<dyn SecretStore> = Arc::new(mda_api::secrets::LocalSecretStore::from_env());
     spawn_drain_with(
         pool,
         notifications::default_channels(),
@@ -141,7 +140,9 @@ async fn process(
                 match mda_integration::flow_for_webhook(pool, tenant, webhook_id).await {
                     Ok(Some(flow)) => {
                         let entity_id = match mda_meta::loader::entity_id_by_name(
-                            pool, tenant, &flow.entity,
+                            pool,
+                            tenant,
+                            &flow.entity,
                         )
                         .await
                         {
@@ -149,7 +150,10 @@ async fn process(
                             Err(e) => {
                                 tracing::warn!(?e, entity = %flow.entity, "inbound flow target entity missing");
                                 let _ = mda_integration::record_failure(
-                                    pool, tenant, &flow, &e.to_string(),
+                                    pool,
+                                    tenant,
+                                    &flow,
+                                    &e.to_string(),
                                 )
                                 .await;
                                 return Err(sqlx::Error::Configuration(e.to_string().into()));
@@ -158,17 +162,26 @@ async fn process(
                         let def = mda_meta::loader::load_entity_definition(pool, tenant, entity_id)
                             .await
                             .map_err(|e| sqlx::Error::Configuration(e.to_string().into()))?;
-                        if let Err(e) =
-                            mda_integration::run_inbound(pool, &def, &flow, &external, uuid::Uuid::nil())
-                                .await
+                        if let Err(e) = mda_integration::run_inbound(
+                            pool,
+                            &def,
+                            &flow,
+                            &external,
+                            uuid::Uuid::nil(),
+                        )
+                        .await
                         {
                             tracing::warn!(?e, "inbound flow run failed");
                             // a filtered record is expected (not a poison message).
                             let is_filtered = matches!(e, mda_core::Error::Invalid(ref m) if m.contains("filtered"));
                             if !is_filtered {
-                                let _ =
-                                    mda_integration::record_failure(pool, tenant, &flow, &e.to_string())
-                                        .await;
+                                let _ = mda_integration::record_failure(
+                                    pool,
+                                    tenant,
+                                    &flow,
+                                    &e.to_string(),
+                                )
+                                .await;
                                 return Err(sqlx::Error::Configuration(e.to_string().into()));
                             }
                         }
@@ -186,10 +199,12 @@ async fn process(
         }
         "webhook.deliver" => {
             // outbound signed delivery (§5.21).
-            webhooks::deliver(pool, secrets, http, payload).await.map_err(|e| {
-                tracing::warn!(?e, "webhook delivery failed");
-                sqlx::Error::Configuration(e.to_string().into())
-            })?;
+            webhooks::deliver(pool, secrets, http, payload)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(?e, "webhook delivery failed");
+                    sqlx::Error::Configuration(e.to_string().into())
+                })?;
             Ok(())
         }
         "workflow.transitioned" => {

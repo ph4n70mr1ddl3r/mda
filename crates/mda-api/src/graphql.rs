@@ -61,14 +61,11 @@ async fn execute(
     Json(req): Json<GqlRequest>,
 ) -> ApiResult<Json<Value>> {
     let schema = schema_for(&st, user.tenant_id).await?;
-    let mut request = async_graphql::Request::new(req.query).variables(
-        async_graphql::Variables::from_value(
-            serde_json::from_value(Value::Object(
-                req.variables.into_iter().collect(),
-            ))
-            .unwrap_or_default(),
-        ),
-    );
+    let mut request =
+        async_graphql::Request::new(req.query).variables(async_graphql::Variables::from_value(
+            serde_json::from_value(Value::Object(req.variables.into_iter().collect()))
+                .unwrap_or_default(),
+        ));
     if let Some(op) = req.operation_name {
         request = request.operation_name(op);
     }
@@ -87,7 +84,10 @@ async fn schema_for(st: &AppState, tenant: Uuid) -> Result<Schema, Error> {
         return Ok(s.clone());
     }
     let schema = build_schema(&st.pool, tenant).await?;
-    st.gql.write().await.insert((tenant, version), schema.clone());
+    st.gql
+        .write()
+        .await
+        .insert((tenant, version), schema.clone());
     Ok(schema)
 }
 
@@ -128,7 +128,11 @@ fn record_to_gql(rec: &Value) -> GqlValue {
     GqlValue::try_from(rec.clone()).unwrap_or(GqlValue::Null)
 }
 
-async fn scope_for(pool: &sqlx::PgPool, user: &Identity, entity: &str) -> Result<RecordScope, Error> {
+async fn scope_for(
+    pool: &sqlx::PgPool,
+    user: &Identity,
+    entity: &str,
+) -> Result<RecordScope, Error> {
     let owd: Owd = mda_security::resolve_owd(pool, user.tenant_id, entity).await?;
     Ok(RecordScope {
         user_id: user.user_id,
@@ -231,33 +235,40 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
             let pool = pool.clone();
             let defs_map = defs_map.clone();
             let target = target.clone();
-            obj = obj.field(Field::new(field_name.clone(), TypeRef::named(target.clone()), move |ctx| {
-                let pool = pool.clone();
-                let defs_map = defs_map.clone();
-                let field_name = field_name.clone();
-                let target = target.clone();
-                FieldFuture::new(async move {
-                    let user = ctx.data::<Identity>()?.clone();
-                    if !user.can(&target, "read") {
-                        return Ok(None);
-                    }
-                    // read the FK off the parent record object
-                    let fk = ctx
-                        .parent_value
-                        .as_value()
-                        .and_then(|v| field_of(v, &field_name))
-                        .and_then(|v| match v {
-                            GqlValue::String(s) => Some(s.clone()),
-                            _ => None,
-                        });
-                    let id = fk.and_then(|s| Uuid::parse_str(&s).ok());
-                    let Some(id) = id else {
-                        return Ok(None);
-                    };
-                    let def = defs_map.get(&target).unwrap();
-                    Ok(load_one(&pool, &user, def, id).await.map_err(gql_err)?.map(|r| FieldValue::value(record_to_gql(&r))))
-                })
-            }));
+            obj = obj.field(Field::new(
+                field_name.clone(),
+                TypeRef::named(target.clone()),
+                move |ctx| {
+                    let pool = pool.clone();
+                    let defs_map = defs_map.clone();
+                    let field_name = field_name.clone();
+                    let target = target.clone();
+                    FieldFuture::new(async move {
+                        let user = ctx.data::<Identity>()?.clone();
+                        if !user.can(&target, "read") {
+                            return Ok(None);
+                        }
+                        // read the FK off the parent record object
+                        let fk = ctx
+                            .parent_value
+                            .as_value()
+                            .and_then(|v| field_of(v, &field_name))
+                            .and_then(|v| match v {
+                                GqlValue::String(s) => Some(s.clone()),
+                                _ => None,
+                            });
+                        let id = fk.and_then(|s| Uuid::parse_str(&s).ok());
+                        let Some(id) = id else {
+                            return Ok(None);
+                        };
+                        let def = defs_map.get(&target).unwrap();
+                        Ok(load_one(&pool, &user, def, id)
+                            .await
+                            .map_err(gql_err)?
+                            .map(|r| FieldValue::value(record_to_gql(&r))))
+                    })
+                },
+            ));
         }
         builder = builder.register(obj);
 
@@ -266,25 +277,35 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
         let dm1 = defs_map.clone();
         let en1 = entity_name.clone();
         query = query.field(
-            Field::new(entity_to_camel(&entity_name), TypeRef::named(&entity_name), move |ctx| {
-                let pool = pool1.clone();
-                let defs_map = dm1.clone();
-                let entity = en1.clone();
-                FieldFuture::new(async move {
-                    let user = ctx.data::<Identity>()?.clone();
-                    let def = defs_map.get(&entity).unwrap().clone();
-                    let id = ctx
-                        .args
-                        .get("id")
-                        .and_then(|a| a.string().ok())
-                        .and_then(|s| Uuid::parse_str(s).ok());
-                    let Some(id) = id else {
-                        return Ok(None);
-                    };
-                    Ok(load_one(&pool, &user, &def, id).await.map_err(gql_err)?.map(|r| FieldValue::value(record_to_gql(&r))))
-                })
-            })
-            .argument(async_graphql::dynamic::InputValue::new("id", TypeRef::named_nn(TypeRef::ID))),
+            Field::new(
+                entity_to_camel(&entity_name),
+                TypeRef::named(&entity_name),
+                move |ctx| {
+                    let pool = pool1.clone();
+                    let defs_map = dm1.clone();
+                    let entity = en1.clone();
+                    FieldFuture::new(async move {
+                        let user = ctx.data::<Identity>()?.clone();
+                        let def = defs_map.get(&entity).unwrap().clone();
+                        let id = ctx
+                            .args
+                            .get("id")
+                            .and_then(|a| a.string().ok())
+                            .and_then(|s| Uuid::parse_str(s).ok());
+                        let Some(id) = id else {
+                            return Ok(None);
+                        };
+                        Ok(load_one(&pool, &user, &def, id)
+                            .await
+                            .map_err(gql_err)?
+                            .map(|r| FieldValue::value(record_to_gql(&r))))
+                    })
+                },
+            )
+            .argument(async_graphql::dynamic::InputValue::new(
+                "id",
+                TypeRef::named_nn(TypeRef::ID),
+            )),
         );
 
         // ===== query: <entity>s(first: Int): [<Entity>!] =====
@@ -324,13 +345,20 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
                         let out: Vec<FieldValue> = result
                             .items
                             .into_iter()
-                            .map(|rec| FieldValue::value(record_to_gql(&project_field_level(&user, &def, rec))))
+                            .map(|rec| {
+                                FieldValue::value(record_to_gql(&project_field_level(
+                                    &user, &def, rec,
+                                )))
+                            })
                             .collect();
                         Ok(Some(FieldValue::list(out)))
                     })
                 },
             )
-            .argument(async_graphql::dynamic::InputValue::new("first", TypeRef::named(TypeRef::INT))),
+            .argument(async_graphql::dynamic::InputValue::new(
+                "first",
+                TypeRef::named(TypeRef::INT),
+            )),
         );
     }
 

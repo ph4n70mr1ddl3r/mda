@@ -102,7 +102,10 @@ async fn publish(ctx: &Ctx, model: Value) {
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/api/studio/drafts/{id}/model"))
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", ctx.token))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", ctx.token),
+        )
         .header("if-match", etag)
         .header("content-type", "application/json")
         .body(Body::from(model.to_string()))
@@ -119,7 +122,13 @@ async fn publish(ctx: &Ctx, model: Value) {
     assert_eq!(st, StatusCode::OK);
 }
 
-async fn call(app: &axum::Router, method: &str, uri: &str, token: &str, body: Option<String>) -> (StatusCode, Value) {
+async fn call(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<String>,
+) -> (StatusCode, Value) {
     let mut b = Request::builder().method(method).uri(uri);
     b = b.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
     let req = if let Some(body) = body {
@@ -158,7 +167,14 @@ async fn graphql_lists_and_fetches_with_traversal() {
     let Some(ctx) = setup().await else {
         return;
     };
-    publish(&ctx, model(&format!("c_{}", Uuid::new_v4().simple()), &format!("i_{}", Uuid::new_v4().simple()))).await;
+    publish(
+        &ctx,
+        model(
+            &format!("c_{}", Uuid::new_v4().simple()),
+            &format!("i_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
 
     // create a Customer, then an Invoice referencing it.
     let (_, c) = call(
@@ -197,7 +213,11 @@ async fn graphql_lists_and_fetches_with_traversal() {
     assert_eq!(v["data"]["invoice"]["customer"]["name"], "Acme");
 
     // (3) a non-existent id → null.
-    let v = gql(&ctx, "{ customer(id: \"00000000-0000-0000-0000-000000000000\") { name } }").await;
+    let v = gql(
+        &ctx,
+        "{ customer(id: \"00000000-0000-0000-0000-000000000000\") { name } }",
+    )
+    .await;
     assert!(v["data"]["customer"].is_null());
 }
 
@@ -206,7 +226,14 @@ async fn graphql_field_level_security_projects() {
     let Some(ctx) = setup().await else {
         return;
     };
-    publish(&ctx, model(&format!("c_{}", Uuid::new_v4().simple()), &format!("i_{}", Uuid::new_v4().simple()))).await;
+    publish(
+        &ctx,
+        model(
+            &format!("c_{}", Uuid::new_v4().simple()),
+            &format!("i_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
 
     // a Customer record with a `secret` field.
     let (_, c) = call(
@@ -226,7 +253,8 @@ async fn graphql_field_level_security_projects() {
     assert_eq!(v["data"]["customer"]["secret"], "topsecret");
 
     // create a limited user with read on Customer but `secret` field = none.
-    let role_id = common::seed_role(&ctx.pool, ctx.tenant, "limited", &[("Customer", "read")]).await;
+    let role_id =
+        common::seed_role(&ctx.pool, ctx.tenant, "limited", &[("Customer", "read")]).await;
     let hash = mda_security::hash_password("x").unwrap();
     let email = format!("u{}@test", Uuid::new_v4().simple());
     let lim_user = common::seed_user(&ctx.pool, ctx.tenant, &email, "limited", &hash).await;
@@ -240,7 +268,9 @@ async fn graphql_field_level_security_projects() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    let lim_token = JwtConfig::from_env().issue_access(lim_user, ctx.tenant, None).unwrap();
+    let lim_token = JwtConfig::from_env()
+        .issue_access(lim_user, ctx.tenant, None)
+        .unwrap();
 
     // limited user sees name, NOT secret (FLS drops it), even when selected.
     let q = format!("{{ customer(id: \"{id}\") {{ name secret }} }}");
@@ -265,7 +295,14 @@ async fn graphql_depth_limit_denies_deep_query() {
     let Some(ctx) = setup().await else {
         return;
     };
-    publish(&ctx, model(&format!("c_{}", Uuid::new_v4().simple()), &format!("i_{}", Uuid::new_v4().simple()))).await;
+    publish(
+        &ctx,
+        model(
+            &format!("c_{}", Uuid::new_v4().simple()),
+            &format!("i_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
 
     // a deliberately wide selection still works and the schema is queryable
     // via introspection (the depth/complexity limits are configured on the

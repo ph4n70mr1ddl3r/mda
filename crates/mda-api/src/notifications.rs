@@ -42,10 +42,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/notifications", get(list_notifications))
         .route("/api/notifications/:id", axum::routing::patch(mark_read))
         // types (metadata authoring)
-        .route(
-            "/api/notification-types",
-            post(create_type).get(list_types),
-        )
+        .route("/api/notification-types", post(create_type).get(list_types))
         .route("/api/notification-types/:key", get(get_type))
         // per-user preferences
         .route(
@@ -129,13 +126,15 @@ pub async fn load_type(pool: &PgPool, tenant: Uuid, key: &str) -> Result<Option<
     .await
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok(row.map(|(label, default_channels, template_name, digestible)| NotificationType {
-        key: key.to_string(),
-        label,
-        default_channels,
-        template_name,
-        digestible,
-    }))
+    Ok(row.map(
+        |(label, default_channels, template_name, digestible)| NotificationType {
+            key: key.to_string(),
+            label,
+            default_channels,
+            template_name,
+            digestible,
+        },
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,7 +527,10 @@ pub async fn fanout(pool: &PgPool, channels: &[Box<dyn Channel>], payload: &Valu
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let entity = payload.get("entity").and_then(|v| v.as_str()).map(String::from);
+    let entity = payload
+        .get("entity")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let record_id = payload
         .get("record_id")
         .and_then(|v| v.as_str())
@@ -596,12 +598,14 @@ pub async fn dispatch(
         "record_id": record_id,
         "context": context,
     });
-    sqlx::query("INSERT INTO sys_outbox (tenant_id, kind, payload) VALUES ($1, 'notification.fanout', $2)")
-        .bind(tenant)
-        .bind(&payload)
-        .execute(&mut **tx)
-        .await
-        .map_err(Error::internal)?;
+    sqlx::query(
+        "INSERT INTO sys_outbox (tenant_id, kind, payload) VALUES ($1, 'notification.fanout', $2)",
+    )
+    .bind(tenant)
+    .bind(&payload)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
     Ok(())
 }
 

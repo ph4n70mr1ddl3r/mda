@@ -124,12 +124,11 @@ pub async fn resolve_and_audit(
             .fetch_optional(pool)
             .await
             .map_err(Error::internal)?;
-    let (id, store_ref) =
-        row.ok_or_else(|| Error::NotFound(format!("secret {name}")))?;
+    let (id, store_ref) = row.ok_or_else(|| Error::NotFound(format!("secret {name}")))?;
 
-    let value = store.resolve(&store_ref)?.ok_or_else(|| {
-        Error::NotFound(format!("secret {name} has no value in the store"))
-    })?;
+    let value = store
+        .resolve(&store_ref)?
+        .ok_or_else(|| Error::NotFound(format!("secret {name} has no value in the store")))?;
 
     sqlx::query(
         "INSERT INTO sys_secret_audit (tenant_id, secret_id, name, resolved_by, purpose)
@@ -151,15 +150,19 @@ async fn list_secrets(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> ApiResult<Json<Vec<SecretRef>>> {
-    let rows: Vec<(String, String, String, Option<chrono::DateTime<chrono::Utc>>)> =
-        sqlx::query_as(
-            "SELECT name, kind, ref, rotated_at FROM sys_secret
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "SELECT name, kind, ref, rotated_at FROM sys_secret
               WHERE tenant_id = $1 ORDER BY name",
-        )
-        .bind(user.tenant_id)
-        .fetch_all(&st.pool)
-        .await
-        .map_err(Error::internal)?;
+    )
+    .bind(user.tenant_id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(Error::internal)?;
     Ok(Json(
         rows.into_iter()
             .map(|(name, kind, r#ref, rotated_at)| SecretRef {
@@ -177,16 +180,20 @@ async fn get_secret(
     AuthUser(user): AuthUser,
     Path(name): Path<String>,
 ) -> ApiResult<Json<SecretRef>> {
-    let row: Option<(String, String, String, Option<chrono::DateTime<chrono::Utc>>)> =
-        sqlx::query_as(
-            "SELECT name, kind, ref, rotated_at FROM sys_secret
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "SELECT name, kind, ref, rotated_at FROM sys_secret
               WHERE tenant_id = $1 AND name = $2",
-        )
-        .bind(user.tenant_id)
-        .bind(&name)
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(Error::internal)?;
+    )
+    .bind(user.tenant_id)
+    .bind(&name)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(Error::internal)?;
     let (name, kind, r#ref, rotated_at) =
         row.ok_or_else(|| Error::NotFound(format!("secret {name}")))?;
     Ok(Json(SecretRef {
@@ -205,19 +212,23 @@ async fn create_secret(
     if body.name.trim().is_empty() || body.r#ref.trim().is_empty() {
         return Err(Error::Invalid("name and ref are required".into()).into());
     }
-    let inserted: Option<(String, String, String, Option<chrono::DateTime<chrono::Utc>>)> =
-        sqlx::query_as(
-            "INSERT INTO sys_secret (tenant_id, name, kind, ref) VALUES ($1, $2, $3, $4)
+    let inserted: Option<(
+        String,
+        String,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "INSERT INTO sys_secret (tenant_id, name, kind, ref) VALUES ($1, $2, $3, $4)
              ON CONFLICT (tenant_id, name) DO NOTHING
              RETURNING name, kind, ref, rotated_at",
-        )
-        .bind(user.tenant_id)
-        .bind(&body.name)
-        .bind(&body.kind)
-        .bind(&body.r#ref)
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(Error::internal)?;
+    )
+    .bind(user.tenant_id)
+    .bind(&body.name)
+    .bind(&body.kind)
+    .bind(&body.r#ref)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(Error::internal)?;
     let row = inserted.ok_or_else(|| Error::Conflict(format!("secret {} exists", body.name)))?;
     Ok((
         StatusCode::CREATED,
@@ -261,18 +272,22 @@ async fn rotate_secret(
     Path(name): Path<String>,
     Json(body): Json<RotateBody>,
 ) -> ApiResult<Json<SecretRef>> {
-    let row: Option<(String, String, String, Option<chrono::DateTime<chrono::Utc>>)> =
-        sqlx::query_as(
-            "UPDATE sys_secret SET ref = $3, rotated_at = now()
+    let row: Option<(
+        String,
+        String,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        "UPDATE sys_secret SET ref = $3, rotated_at = now()
               WHERE tenant_id = $1 AND name = $2
              RETURNING name, kind, ref, rotated_at",
-        )
-        .bind(user.tenant_id)
-        .bind(&name)
-        .bind(&body.r#ref)
-        .fetch_optional(&st.pool)
-        .await
-        .map_err(Error::internal)?;
+    )
+    .bind(user.tenant_id)
+    .bind(&name)
+    .bind(&body.r#ref)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(Error::internal)?;
     let row = row.ok_or_else(|| Error::NotFound(format!("secret {name}")))?;
     Ok(Json(SecretRef {
         name: row.0,

@@ -65,7 +65,8 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
     Some(Ctx {
         app,
         token,
@@ -116,7 +117,10 @@ async fn publish(ctx: &Ctx, model: Value) {
     let req = Request::builder()
         .method("PUT")
         .uri(format!("/api/studio/drafts/{id}/model"))
-        .header(axum::http::header::AUTHORIZATION, format!("Bearer {}", ctx.token))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", ctx.token),
+        )
         .header("if-match", etag)
         .header("content-type", "application/json")
         .body(Body::from(model.to_string()))
@@ -160,7 +164,11 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     let Some(ctx) = setup().await else {
         return;
     };
-    publish(&ctx, customer_model(&format!("cust_{}", Uuid::new_v4().simple()))).await;
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
 
     // create an inbound flow mapping external → biz.
     let (_, f) = call(
@@ -171,7 +179,8 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
         Some(
             json!({"name":"sync_in","direction":"inbound","entity":"Customer",
                    "mapping":{"name":"name","tier":"tier"},
-                   "external_key_field":"external_id","system":"acme"}).to_string(),
+                   "external_key_field":"external_id","system":"acme"})
+            .to_string(),
         ),
     )
     .await;
@@ -183,9 +192,7 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
         "POST",
         &format!("/api/flows/{flow_id}/run"),
         &ctx.token,
-        Some(
-            json!({"payload":{"external_id":"A1","name":"Acme","tier":"Gold"}}).to_string(),
-        ),
+        Some(json!({"payload":{"external_id":"A1","name":"Acme","tier":"Gold"}}).to_string()),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -197,9 +204,7 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
         "POST",
         &format!("/api/flows/{flow_id}/run"),
         &ctx.token,
-        Some(
-            json!({"payload":{"external_id":"A1","name":"Acme","tier":"Silver"}}).to_string(),
-        ),
+        Some(json!({"payload":{"external_id":"A1","name":"Acme","tier":"Silver"}}).to_string()),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -207,16 +212,15 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     assert_eq!(rec1, rec2, "same external key → same record");
 
     // one Customer row, tier Silver.
-    let (count, tier): (i64, String) = sqlx::query_as(
-        "SELECT count(*), (SELECT tier FROM biz.customer_* LIMIT 1)",
-    )
-    .fetch_one(&ctx.pool)
-    .await
-    .map_err(|e| {
-        // dynamic table name; fall back to a count via the entity table.
-        eprintln!("join failed (dynamic table): {e}");
-    })
-    .unwrap_or((0, String::new()));
+    let (count, tier): (i64, String) =
+        sqlx::query_as("SELECT count(*), (SELECT tier FROM biz.customer_* LIMIT 1)")
+            .fetch_one(&ctx.pool)
+            .await
+            .map_err(|e| {
+                // dynamic table name; fall back to a count via the entity table.
+                eprintln!("join failed (dynamic table): {e}");
+            })
+            .unwrap_or((0, String::new()));
     let _ = (count, tier);
     // the table name is dynamic, so query it by listing via the API instead.
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
@@ -235,7 +239,10 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    assert_eq!(v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap(), rec1);
+    assert_eq!(
+        v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        rec1
+    );
 
     // a different external key → a new record (no cross-contamination).
     let (_, v) = call(
@@ -243,9 +250,7 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
         "POST",
         &format!("/api/flows/{flow_id}/run"),
         &ctx.token,
-        Some(
-            json!({"payload":{"external_id":"B2","name":"Globex","tier":"Bronze"}}).to_string(),
-        ),
+        Some(json!({"payload":{"external_id":"B2","name":"Globex","tier":"Bronze"}}).to_string()),
     )
     .await;
     let rec3 = v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap();
@@ -259,7 +264,11 @@ async fn outbound_pushes_mapped_record_to_external() {
     let Some(ctx) = setup().await else {
         return;
     };
-    publish(&ctx, customer_model(&format!("cust_{}", Uuid::new_v4().simple()))).await;
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
 
     let (base_url, captured) = mock_receiver().await;
 
@@ -269,7 +278,10 @@ async fn outbound_pushes_mapped_record_to_external() {
         "POST",
         "/api/connectors",
         &ctx.token,
-        Some(json!({"name":"acme","transport":"http","base_url":base_url,"auth":{"kind":"none"}}).to_string()),
+        Some(
+            json!({"name":"acme","transport":"http","base_url":base_url,"auth":{"kind":"none"}})
+                .to_string(),
+        ),
     )
     .await;
     let connector_id = c["id"].as_str().unwrap().parse::<Uuid>().unwrap();
@@ -282,7 +294,8 @@ async fn outbound_pushes_mapped_record_to_external() {
         Some(
             json!({"name":"sync_out","direction":"outbound","entity":"Customer",
                    "connector_id":connector_id,"endpoint_path":"/upsert",
-                   "mapping":{"name":"name","tier":"tier"}}).to_string(),
+                   "mapping":{"name":"name","tier":"tier"}})
+            .to_string(),
         ),
     )
     .await;
@@ -298,7 +311,11 @@ async fn outbound_pushes_mapped_record_to_external() {
     .await;
     assert_eq!(st, StatusCode::OK);
 
-    let got = captured.lock().await.clone().expect("external received the push");
+    let got = captured
+        .lock()
+        .await
+        .clone()
+        .expect("external received the push");
     assert_eq!(got["name"], "Acme");
     assert_eq!(got["tier"], "Gold");
 }
@@ -308,7 +325,11 @@ async fn inbound_value_map_step_translates_codes() {
     let Some(ctx) = setup().await else {
         return;
     };
-    publish(&ctx, customer_model(&format!("cust_{}", Uuid::new_v4().simple()))).await;
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
 
     // a value map translating external status codes → internal tiers.
     let mut tx = ctx.pool.begin().await.unwrap();
@@ -341,8 +362,8 @@ async fn inbound_value_map_step_translates_codes() {
         .bind(flow_id)
         .bind(json!({"name":"name","tier":"raw_tier"}))
         .execute(&mut *tx)
-    .await
-    .unwrap();
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     let (_, v) = call(
@@ -367,7 +388,11 @@ async fn webhook_to_inbound_flow_materializes_via_drain() {
     let Some(ctx) = setup().await else {
         return;
     };
-    publish(&ctx, customer_model(&format!("cust_{}", Uuid::new_v4().simple()))).await;
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
 
     // register a webhook + an inbound flow bound to it.
     let mut tx = ctx.pool.begin().await.unwrap();
@@ -412,7 +437,8 @@ async fn webhook_to_inbound_flow_materializes_via_drain() {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
 
     // POST a signed inbound event to the webhook receiver.
     let body = json!({"external_id":"D4","name":"Umbrella","tier":"Gold"}).to_string();

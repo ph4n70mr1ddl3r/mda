@@ -51,7 +51,8 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
     Some(Ctx {
         app,
         token,
@@ -99,19 +100,21 @@ async fn mock_receiver() -> (String, Arc<Mutex<Option<(String, String)>>>) {
     let cap = captured.clone();
     let app = axum::Router::new().route(
         "/hook",
-        axum::routing::post(move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
-            let cap = cap.clone();
-            async move {
-                let sig = headers
-                    .get("x-mda-signature")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let body = std::str::from_utf8(&body).unwrap_or("").to_string();
-                *cap.lock().await = Some((sig, body));
-                StatusCode::OK
-            }
-        }),
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                let cap = cap.clone();
+                async move {
+                    let sig = headers
+                        .get("x-mda-signature")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    let body = std::str::from_utf8(&body).unwrap_or("").to_string();
+                    *cap.lock().await = Some((sig, body));
+                    StatusCode::OK
+                }
+            },
+        ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -163,7 +166,8 @@ async fn webhook_subscriptions_crud() {
         Some(&ctx.token),
         Some(
             json!({"name":"sync","url":"http://example.com/hook",
-                   "event_types":["record.created"],"secret_ref":"wh_secret"}).to_string(),
+                   "event_types":["record.created"],"secret_ref":"wh_secret"})
+            .to_string(),
         ),
         vec![],
     )
@@ -226,7 +230,8 @@ async fn outbound_delivery_signs_envelope() {
         Some(&ctx.token),
         Some(
             json!({"name":"sync","url":hook_url,"event_types":["record.created"],
-                   "secret_ref":"wh_secret"}).to_string(),
+                   "secret_ref":"wh_secret"})
+            .to_string(),
         ),
         vec![],
     )
@@ -235,20 +240,22 @@ async fn outbound_delivery_signs_envelope() {
     let webhook_id = v["id"].as_str().unwrap().parse::<Uuid>().unwrap();
 
     // enqueue a webhook.deliver row directly.
-    sqlx::query("INSERT INTO sys_outbox (tenant_id, kind, payload) VALUES ($1,'webhook.deliver',$2)")
-        .bind(ctx.tenant)
-        .bind(json!({
-            "tenant_id": ctx.tenant,
-            "webhook_id": webhook_id,
-            "event_id": "42",
-            "event_type": "record.created",
-            "entity": "Customer",
-            "record_id": Uuid::new_v4(),
-            "data": {"changed_fields":["name"]}
-        }))
-        .execute(&ctx.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO sys_outbox (tenant_id, kind, payload) VALUES ($1,'webhook.deliver',$2)",
+    )
+    .bind(ctx.tenant)
+    .bind(json!({
+        "tenant_id": ctx.tenant,
+        "webhook_id": webhook_id,
+        "event_id": "42",
+        "event_type": "record.created",
+        "entity": "Customer",
+        "record_id": Uuid::new_v4(),
+        "data": {"changed_fields":["name"]}
+    }))
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
 
     // drain with the secret store that actually has the value.
     mda_server::outbox::spawn_drain_with(
@@ -367,7 +374,8 @@ async fn inbound_verifies_signature_and_dedupes() {
         secrets: secret_store,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
 
     let mut tx = ctx.pool.begin().await.unwrap();
     mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
@@ -448,7 +456,10 @@ async fn inbound_verifies_signature_and_dedupes() {
         &format!("/api/integrations/webhooks/{webhook_id}"),
         None,
         Some(body),
-        vec![("x-mda-signature", "t=1,v1=deadbeef"), ("x-mda-event-id", "evt-2")],
+        vec![
+            ("x-mda-signature", "t=1,v1=deadbeef"),
+            ("x-mda-event-id", "evt-2"),
+        ],
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);

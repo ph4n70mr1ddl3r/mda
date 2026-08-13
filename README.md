@@ -4,9 +4,14 @@ A declarative, data-driven, model-driven **no-code enterprise system** built in 
 Everything — entities, forms, screens, reports, workflows, rules, integrations — is
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
-> **Status:** Phases 0–7, 10 implemented + Phase 6 Runtime UI (Leptos).
+> **Status:** Phases 0–7, 9, 10 implemented + Phase 6 Runtime UI (Leptos),
+> plus the full §5.18–5.22 platform-capability cluster and a first-class GraphQL
+> runtime API (ADR-0010).
 > Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
-> notifications, sharing. Frontend: login + entity list (WASM).
+> notifications, sharing. Platform: secrets, templating, multi-channel
+> notifications + digest, signed webhook contract + inbound verification,
+> hub-model integration (connectors / flows / external-ID registry), and
+> GraphQL. Frontend: login + entity list (WASM).
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
 > (`/api/data/:entity/:id/{history,as-of}`), a tenant observability console
@@ -85,6 +90,42 @@ curl localhost:8080/api/observability/audit      -H "Authorization: Bearer $ADMI
 # {"code":"mda.conflict","status":409,"error":"conflict","message":"…"}
 ```
 
+Platform capabilities (§5.18–5.22) + GraphQL (ADR-0010) — all driven by metadata,
+AuthZ-enforced, sharing REST's service layer:
+
+```bash
+# GraphQL — schema generated from the active model; reads + nested traversal;
+# object/field/record security enforced per field.
+curl -X POST localhost:8080/api/graphql -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"query":"{ customer(id:\"…\") { name customer { name } } }"}'
+
+# Secrets (§5.20) — only the reference is stored; values resolve server-side and
+# are never returned by any API.
+curl -X POST localhost:8080/api/secrets -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"name":"smtp_password","ref":"MDA_SMTP"}'
+
+# Templating (§5.19) — sandboxed DSL; render under the caller's FLS.
+curl -X POST localhost:8080/api/templates/welcome/render?entity=Customer&id=$ID \
+     -H "Authorization: Bearer $JWT" -H 'content-type: application/json' -d '{}'
+
+# Notifications (§5.18) — types, per-user preferences, multi-channel fan-out + digest.
+curl -X POST localhost:8080/api/notifications/dispatch -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"type_key":"invoice.overdue","recipients":["$USER_ID"],"context":{"record":{"name":"Acme"}}}'
+
+# Webhooks (§5.21) — versioned HMAC-signed envelope; inbound receiver verifies + dedupes.
+curl -X POST localhost:8080/api/webhooks -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"name":"sync","url":"https://ext/hook","event_types":["record.created"],"secret_ref":"wh_secret"}'
+
+# Integration (§5.22) — hub model: inbound materializes into biz.*, keyed by external id.
+curl -X POST localhost:8080/api/flows/$FLOW_ID/run -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"payload":{"external_id":"A1","name":"Acme","tier":"Gold"}}'
+curl "localhost:8080/api/external-ids/Customer/A1?system=acme" -H "Authorization: Bearer $JWT"
+```
+
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
 > host-installed Postgres during local development.
 
@@ -100,6 +141,10 @@ cargo test --lib --bins --doc
 DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
   cargo test --test data --test studio --test integration
 # or:  make test   (unit + DB-backed)
+#
+# Platform-capability + GraphQL suites (§5.18–5.22, ADR-0010):
+#   cargo test --test secrets --test templates --test notifications \
+#              --test webhooks --test integration_flows --test graphql
 ```
 
 The `data`/`studio` suites connect the app as the non-superuser `mda_app` role
@@ -141,6 +186,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (18 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities).
 - [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE10.md`](./docs/PHASE10.md) — phase status & handoffs.
+- [`docs/CAPABILITIES.md`](./docs/CAPABILITIES.md) — the §5.18–5.22 platform-capability cluster (secrets, templating, notifications, webhook contract, hub-model integration) + GraphQL (ADR-0010) status & handoff.
 
 ## Roadmap (summary)
 
@@ -151,7 +197,9 @@ See §9 of `PLAN.md` (MVP milestone lands ~week 26).
 ## Layout
 
 ```
-crates/        Rust workspace: mda-core, mda-meta, mda-data, mda-api, mda-server
+crates/        Rust workspace: mda-core, mda-meta, mda-data, mda-expression,
+               mda-security, mda-rules, mda-workflow, mda-reports,
+               mda-integration, mda-api, mda-server
 migrations/    SQLx migrations (Phase 0: meta schema skeleton)
 web/           Phase 0 frontend spike (Leptos + React) — throwaway
 docker/ (in repo root: docker-compose.yml, Dockerfile)

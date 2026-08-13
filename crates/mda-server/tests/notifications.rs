@@ -47,7 +47,8 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+    });
     Some(Ctx {
         app,
         token,
@@ -116,7 +117,8 @@ async fn notification_types_crud() {
         &ctx.token,
         Some(
             json!({"key":"invoice.overdue","label":"Invoice Overdue",
-                   "default_channels":["in_app","email"],"template_name":null}).to_string(),
+                   "default_channels":["in_app","email"],"template_name":null})
+            .to_string(),
         ),
     )
     .await;
@@ -158,9 +160,7 @@ async fn fanout_delivers_inapp_and_email_and_respects_preferences() {
         "POST",
         "/api/templates",
         &ctx.token,
-        Some(
-            json!({"name":"overdue","body":"Hi, {{ record.name }} is overdue"}).to_string(),
-        ),
+        Some(json!({"name":"overdue","body":"Hi, {{ record.name }} is overdue"}).to_string()),
     )
     .await;
     call(
@@ -170,7 +170,8 @@ async fn fanout_delivers_inapp_and_email_and_respects_preferences() {
         &ctx.token,
         Some(
             json!({"key":"invoice.overdue","label":"Overdue",
-                   "default_channels":["in_app","email"],"template_name":"overdue"}).to_string(),
+                   "default_channels":["in_app","email"],"template_name":"overdue"})
+            .to_string(),
         ),
     )
     .await;
@@ -197,7 +198,8 @@ async fn fanout_delivers_inapp_and_email_and_respects_preferences() {
         &ctx.token,
         Some(
             json!({"type_key":"invoice.overdue","recipients":[ctx.user_id],
-                   "context":{"record":{"name":"Acme"}}}).to_string(),
+                   "context":{"record":{"name":"Acme"}}})
+            .to_string(),
         ),
     )
     .await;
@@ -236,9 +238,7 @@ async fn fanout_delivers_email_when_not_opted_out() {
         "POST",
         "/api/templates",
         &ctx.token,
-        Some(
-            json!({"name":"welcome","body":"Welcome {{ record.name }}!"}).to_string(),
-        ),
+        Some(json!({"name":"welcome","body":"Welcome {{ record.name }}!"}).to_string()),
     )
     .await;
     call(
@@ -248,7 +248,8 @@ async fn fanout_delivers_email_when_not_opted_out() {
         &ctx.token,
         Some(
             json!({"key":"user.welcome","label":"Welcome",
-                   "default_channels":["in_app","email"],"template_name":"welcome"}).to_string(),
+                   "default_channels":["in_app","email"],"template_name":"welcome"})
+            .to_string(),
         ),
     )
     .await;
@@ -260,7 +261,8 @@ async fn fanout_delivers_email_when_not_opted_out() {
         &ctx.token,
         Some(
             json!({"type_key":"user.welcome","recipients":[ctx.user_id],
-                   "context":{"record":{"name":"Ada"}}}).to_string(),
+                   "context":{"record":{"name":"Ada"}}})
+            .to_string(),
         ),
     )
     .await;
@@ -332,7 +334,9 @@ async fn digest_rolls_up_digestible_notifications() {
         tx.commit().await.unwrap();
     }
 
-    let rolled = mda_api::notifications::digest_once(&ctx.pool).await.unwrap();
+    let rolled = mda_api::notifications::digest_once(&ctx.pool)
+        .await
+        .unwrap();
     assert_eq!(rolled, 3);
 
     // originals marked digested; one summary notification created.

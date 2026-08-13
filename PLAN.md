@@ -1058,6 +1058,15 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 > history + as-of, the modeler/tenant observability console (events / outbox /
 > migrations / audit surfaces), and the error-code taxonomy. They are marked
 > **✅ closed** below. The remainder are still open.
+>
+> **Further progress (§5.18–5.22 + ADR-0010):** the scoped platform-capability
+> design sections are now **implemented** (see `docs/CAPABILITIES.md`):
+> notifications & messaging (§5.18), templating (§5.19), secrets (§5.20), the
+> outbound webhook contract + inbound verification (§5.21/§14), and the
+> hub-model integration architecture (§5.22 / Phase 9), plus a first-class
+> GraphQL runtime API (ADR-0010, query/traversal-first). Remaining §14 items —
+> full scheduled-job management, tenant-scoped backup/restore + data residency —
+> stay open (they tie to the deferred scheduler and tenant lifecycle).
 
 - **Modeler / tenant observability console** — a tenant-facing view of job / rule / workflow / integration run history and failures (beyond operator `tracing`/OpenTelemetry). Raw material exists (`md_migration_log`, `sys_event_log`); the *surface* is unbuilt.
   - **✅ closed (ADR-0018):** `/api/observability/{events,outbox,migrations,audit}` surface the run/delivery/audit history. Superuser-gated in v1; a scoped `observability.read` capability + field-level projection for non-admin modelers is the follow-up.
@@ -1072,4 +1081,4 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 
 ---
 
-*This plan is v0.4 — decisions are recorded as ADRs 0001–0017 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Successive review passes refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17), then rollup-summary semantics and canonical write-path consistency — audit/event-log split and the per-record share-recompute step (ADR-0017); a platform-capability review then added notifications, templating, secrets, the webhook contract (§5.18–5.21), the formula-dependency DAG check (§5.8), and the hub-model integration architecture (§5.22). Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
+*This plan is v0.4 — decisions are recorded as ADRs 0001–0017 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Successive review passes refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17), then rollup-summary semantics and canonical write-path consistency — audit/event-log split and the per-record share-recompute step (ADR-0017); a platform-capability review then added notifications, templating, secrets, the webhook contract (§5.18–5.21), the formula-dependency DAG check (§5.8), and the hub-model integration architecture (§5.22). The §5.18–5.22 cluster and GraphQL (ADR-0010) are now implemented (`docs/CAPABILITIES.md`). Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*

@@ -90,12 +90,13 @@ pub fn verify(secret: &[u8], header: &str, body: &str, now_unix: i64) -> Result<
     let ts = t.ok_or_else(|| Error::Invalid("signature missing t=".into()))?;
     let got = v1.ok_or_else(|| Error::Invalid("signature missing v1=".into()))?;
     if (now_unix - ts).abs() > REPLAY_WINDOW_SECS {
-        return Err(Error::Invalid("signature timestamp outside replay window".into()));
+        return Err(Error::Invalid(
+            "signature timestamp outside replay window".into(),
+        ));
     }
     let signed = format!("{ts}.{body}");
     // constant-time compare via hmac (avoid early-exit timing leak).
-    let mut want_mac =
-        HmacSha256::new_from_slice(secret).map_err(|e| Error::Internal(e.into()))?;
+    let mut want_mac = HmacSha256::new_from_slice(secret).map_err(|e| Error::Internal(e.into()))?;
     want_mac.update(signed.as_bytes());
     let got_bytes =
         hex::decode(got).map_err(|e| Error::Invalid(format!("bad signature hex: {e}")))?;
@@ -147,15 +148,9 @@ pub async fn deliver(
     }
 
     // resolve the signing secret server-side (§5.20), audited.
-    let secret = crate::secrets::resolve_and_audit(
-        pool,
-        secrets,
-        tenant,
-        &secret_ref,
-        None,
-        "webhook.sign",
-    )
-    .await?;
+    let secret =
+        crate::secrets::resolve_and_audit(pool, secrets, tenant, &secret_ref, None, "webhook.sign")
+            .await?;
 
     let envelope = Envelope {
         event_id: payload
@@ -170,7 +165,10 @@ pub async fn deliver(
             .and_then(|v| v.as_str())
             .unwrap_or("event")
             .to_string(),
-        entity: payload.get("entity").and_then(|v| v.as_str()).map(String::from),
+        entity: payload
+            .get("entity")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         record_id: payload
             .get("record_id")
             .and_then(|v| v.as_str())
@@ -200,7 +198,15 @@ pub async fn deliver(
         Ok(r) => {
             let status = r.status().as_u16() as i32;
             let ok = r.status().is_success();
-            (Some(status), ok, if ok { None } else { Some(format!("HTTP {status}")) })
+            (
+                Some(status),
+                ok,
+                if ok {
+                    None
+                } else {
+                    Some(format!("HTTP {status}"))
+                },
+            )
         }
         Err(e) => (None, false, Some(e.to_string())),
     };
@@ -266,15 +272,23 @@ pub async fn relay_once(pool: &PgPool) -> Result<u64> {
 
     // New events since the cursor.
     #[allow(clippy::type_complexity)]
-    type RelayEvent = (i64, Uuid, String, Option<String>, Option<Uuid>, Option<Uuid>, Value);
+    type RelayEvent = (
+        i64,
+        Uuid,
+        String,
+        Option<String>,
+        Option<Uuid>,
+        Option<Uuid>,
+        Value,
+    );
     let events: Vec<RelayEvent> = sqlx::query_as(
         "SELECT seq, tenant_id, type, entity, record_id, actor_id, payload
            FROM sys_event_log WHERE seq > $1 ORDER BY seq LIMIT 500",
     )
-        .bind(last)
-        .fetch_all(pool)
-        .await
-        .map_err(Error::internal)?;
+    .bind(last)
+    .fetch_all(pool)
+    .await
+    .map_err(Error::internal)?;
 
     if events.is_empty() {
         return Ok(0);
@@ -409,7 +423,10 @@ async fn create_webhook(
     AuthUser(user): AuthUser,
     Json(body): Json<CreateBody>,
 ) -> ApiResult<(StatusCode, Json<WebhookOut>)> {
-    if body.name.trim().is_empty() || body.url.trim().is_empty() || body.secret_ref.trim().is_empty() {
+    if body.name.trim().is_empty()
+        || body.url.trim().is_empty()
+        || body.secret_ref.trim().is_empty()
+    {
         return Err(Error::Invalid("name, url, and secret_ref are required".into()).into());
     }
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
@@ -553,19 +570,26 @@ async fn replay(
         None => 0,
     };
     #[allow(clippy::type_complexity)]
-    type ReplayEvent = (i64, String, Option<String>, Option<Uuid>, Option<Uuid>, Value);
+    type ReplayEvent = (
+        i64,
+        String,
+        Option<String>,
+        Option<Uuid>,
+        Option<Uuid>,
+        Value,
+    );
     let events: Vec<ReplayEvent> = sqlx::query_as(
         "SELECT seq, type, entity, record_id, actor_id, payload
                FROM sys_event_log
               WHERE tenant_id = $1 AND seq > $2
               ORDER BY seq LIMIT $3",
     )
-        .bind(user.tenant_id)
-        .bind(from_seq)
-        .bind(q.limit)
-        .fetch_all(&st.pool)
-        .await
-        .map_err(Error::internal)?;
+    .bind(user.tenant_id)
+    .bind(from_seq)
+    .bind(q.limit)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(Error::internal)?;
 
     let mut enqueued = 0u64;
     for (seq, etype, entity, record_id, actor, payload) in events {
@@ -614,16 +638,14 @@ async fn inbound(
             .fetch_optional(&st.pool)
             .await
             .map_err(Error::internal)?;
-    let (tenant, secret_ref) =
-        row.ok_or_else(|| Error::NotFound(format!("webhook {id}")))?;
+    let (tenant, secret_ref) = row.ok_or_else(|| Error::NotFound(format!("webhook {id}")))?;
 
     let sig = headers
         .get("x-mda-signature")
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| Error::Forbidden("missing X-MDA-Signature".into()))?;
-    let body_str = std::str::from_utf8(&body).map_err(|_| {
-        Error::Invalid("request body must be valid UTF-8".into())
-    })?;
+    let body_str = std::str::from_utf8(&body)
+        .map_err(|_| Error::Invalid("request body must be valid UTF-8".into()))?;
     let now = chrono::Utc::now().timestamp();
     let secret = crate::secrets::resolve_and_audit(
         &st.pool,
@@ -680,12 +702,14 @@ async fn inbound(
     }
 
     // enqueue for the integration flow runner (§5.22) to consume.
-    sqlx::query("INSERT INTO sys_outbox (tenant_id, kind, payload) VALUES ($1, 'integration.inbound', $2)")
-        .bind(tenant)
-        .bind(json!({"webhook_id": id, "event_type": event_type, "payload": payload}))
-        .execute(&st.pool)
-        .await
-        .map_err(Error::internal)?;
+    sqlx::query(
+        "INSERT INTO sys_outbox (tenant_id, kind, payload) VALUES ($1, 'integration.inbound', $2)",
+    )
+    .bind(tenant)
+    .bind(json!({"webhook_id": id, "event_type": event_type, "payload": payload}))
+    .execute(&st.pool)
+    .await
+    .map_err(Error::internal)?;
     Ok(StatusCode::ACCEPTED)
 }
 
