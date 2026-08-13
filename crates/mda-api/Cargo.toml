@@ -12,6 +12,7 @@ mda-security = { workspace = true }
 mda-rules = { workspace = true }
 mda-workflow = { workspace = true }
 mda-reports = { workspace = true }
+mda-expression = { workspace = true }
 sqlx = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

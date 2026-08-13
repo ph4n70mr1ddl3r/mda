@@ -24,6 +24,7 @@ pub mod observability;
 pub mod reports;
 pub mod secrets;
 pub mod studio;
+pub mod templates;
 
 use mda_meta::MetadataCache;
 
@@ -61,6 +62,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(studio::routes())
         .merge(data::routes())
         .merge(reports::routes())
+        .merge(templates::routes())
         .merge(notifications::routes())
         .merge(blobs::routes())
         .merge(secrets::routes())

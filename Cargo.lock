@@ -1026,6 +1026,7 @@ dependencies = [
  "chrono",
  "mda-core",
  "mda-data",
+ "mda-expression",
  "mda-meta",
  "mda-reports",
  "mda-rules",
@@ -1100,6 +1101,7 @@ version = "0.1.0"
 dependencies = [
  "mda-core",
  "mda-data",
+ "mda-expression",
  "mda-meta",
  "mda-security",
  "serde",

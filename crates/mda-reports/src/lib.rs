@@ -24,6 +24,10 @@ use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod template;
+
+pub use template::{render, render_body, Rendered, Template};
+
 /// Wall-clock cap (ms) on a single synchronous report run (§5.17 cost control).
 /// Overruns are killed by Postgres and surface as an internal error; large
 /// reports must run async as a job (a follow-up).

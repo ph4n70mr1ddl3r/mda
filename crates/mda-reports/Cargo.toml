@@ -9,6 +9,7 @@ mda-core = { workspace = true }
 mda-meta = { workspace = true }
 mda-data = { workspace = true }
 mda-security = { workspace = true }
+mda-expression = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
