@@ -22,6 +22,7 @@ pub mod history;
 pub mod notifications;
 pub mod observability;
 pub mod reports;
+pub mod secrets;
 pub mod studio;
 
 use mda_meta::MetadataCache;
@@ -33,6 +34,9 @@ pub struct AppState {
     pub cache: MetadataCache,
     pub jwt: JwtConfig,
     pub blobs: std::sync::Arc<dyn crate::blobs::BlobStore>,
+    /// Secrets (§5.20): values resolved server-side only, never returned by any
+    /// API. `sys_secret` holds the reference; this resolves the value.
+    pub secrets: std::sync::Arc<dyn mda_core::SecretStore>,
     /// Fan-out for the SSE real-time channel (§5.10); fed by `events::spawn_listen`.
     pub events: tokio::sync::broadcast::Sender<crate::events::EventRow>,
     /// Login brute-force defence (per-account lockout + per-IP limit), shared
@@ -59,6 +63,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(reports::routes())
         .merge(notifications::routes())
         .merge(blobs::routes())
+        .merge(secrets::routes())
         .merge(events::routes())
         .merge(history::routes())
         .merge(observability::routes());

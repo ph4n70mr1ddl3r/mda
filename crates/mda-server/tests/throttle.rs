@@ -55,6 +55,8 @@ async fn setup() -> Option<Ctx> {
     let jwt = JwtConfig::from_env();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
+    let secrets: std::sync::Arc<dyn mda_core::SecretStore> =
+        std::sync::Arc::new(mda_api::secrets::LocalSecretStore::from_env());
     let app_pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&app_role_url(&db_url))
@@ -68,6 +70,8 @@ async fn setup() -> Option<Ctx> {
         cache: MetadataCache::new(),
         jwt: jwt.clone(),
         blobs,
+
+        secrets,
         events: mda_api::events::channel(),
         login_throttle: LoginThrottle::default(),
     });

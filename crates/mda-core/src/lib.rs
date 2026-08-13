@@ -5,6 +5,8 @@
 
 pub mod error;
 pub mod id;
+pub mod secrets;
 
 pub use error::{Error, Result};
 pub use id::Id;
+pub use secrets::SecretStore;

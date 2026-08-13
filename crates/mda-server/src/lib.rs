@@ -67,6 +67,8 @@ pub async fn run() -> anyhow::Result<()> {
 
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
+    let secrets: std::sync::Arc<dyn mda_core::SecretStore> =
+        std::sync::Arc::new(mda_api::secrets::LocalSecretStore::from_env());
     let events = mda_api::events::channel();
     mda_api::events::spawn_listen(app_pool.clone(), events.clone());
     // Hourly purge of stale login-throttle rows (bounded by distinct account/IP
@@ -89,6 +91,7 @@ pub async fn run() -> anyhow::Result<()> {
         cache,
         jwt: mda_security::JwtConfig::from_env(),
         blobs,
+        secrets,
         events,
         login_throttle: mda_security::LoginThrottle::from_env(),
     });

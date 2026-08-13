@@ -45,11 +45,15 @@ async fn setup() -> Option<Ctx> {
     let token = jwt.issue_access(user_id, tenant, None).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
+    let secrets: std::sync::Arc<dyn mda_core::SecretStore> =
+        std::sync::Arc::new(mda_api::secrets::LocalSecretStore::from_env());
     let app = mda_api::router(AppState {
         pool: pool.clone(),
         cache: MetadataCache::new(),
         jwt: jwt.clone(),
         blobs,
+
+        secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
     });

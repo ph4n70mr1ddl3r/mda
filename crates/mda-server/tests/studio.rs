@@ -55,6 +55,8 @@ async fn setup() -> Option<(axum::Router, String)> {
     let token = jwt.issue_access(user_id, tenant, None).unwrap();
     let blobs: std::sync::Arc<dyn mda_api::blobs::BlobStore> =
         std::sync::Arc::new(mda_api::blobs::LocalBlobStore::from_env());
+    let secrets: std::sync::Arc<dyn mda_core::SecretStore> =
+        std::sync::Arc::new(mda_api::secrets::LocalSecretStore::from_env());
     // Publish DDL + meta writes run as the non-superuser `mda_app` role (the
     // role the app uses in production), matching prod ownership of biz tables.
     let app_pool = PgPoolOptions::new()
@@ -70,6 +72,8 @@ async fn setup() -> Option<(axum::Router, String)> {
         cache: MetadataCache::new(),
         jwt,
         blobs,
+
+        secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
     });
