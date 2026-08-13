@@ -19,6 +19,7 @@ pub mod error;
 pub mod events;
 pub mod extract;
 pub mod history;
+pub mod integrations;
 pub mod notifications;
 pub mod observability;
 pub mod reports;
@@ -70,6 +71,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(secrets::routes())
         .merge(events::routes())
         .merge(history::routes())
+        .merge(integrations::routes())
         .merge(observability::routes());
 
     // Layer order (last = outermost): body-limit → security headers → access

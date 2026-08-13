@@ -1,5 +1,5 @@
 [package]
-name = "mda-api"
+name = "mda-integration"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
@@ -9,24 +9,14 @@ mda-core = { workspace = true }
 mda-meta = { workspace = true }
 mda-data = { workspace = true }
 mda-security = { workspace = true }
-mda-rules = { workspace = true }
-mda-workflow = { workspace = true }
-mda-reports = { workspace = true }
 mda-expression = { workspace = true }
-mda-integration = { workspace = true }
 sqlx = { workspace = true }
-axum = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
-tower-http = { version = "0.6", features = ["cors", "set-header"] }
-tokio-stream = "0.1"
-tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
-reqwest = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
-hex = "0.4"
+base64 = { workspace = true }
+tracing = { workspace = true }

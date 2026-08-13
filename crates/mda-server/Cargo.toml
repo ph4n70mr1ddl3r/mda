@@ -9,6 +9,7 @@ mda-core = { workspace = true }
 mda-meta = { workspace = true }
 mda-security = { workspace = true }
 mda-api = { workspace = true }
+mda-integration = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
