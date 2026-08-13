@@ -1862,3 +1862,393 @@ async fn rls_gates_meta_at_db_layer() {
         .await
         .unwrap();
 }
+
+// ===== §14: record/field history + as-of (PLAN §14 surfaced capability) =====
+
+#[tokio::test]
+async fn record_history_timeline_and_field_diffs() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","email":"h@x","tier":"Bronze"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+    // update tier + name → a second audit row with a per-field diff.
+    let _ = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"tier":"Gold","name":"Acme Co"}).to_string()),
+        Some(1),
+    )
+    .await;
+
+    let (st, body) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/history"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "history: {body}");
+    let entries = body["entries"].as_array().unwrap();
+    assert!(entries.len() >= 2, "need create+update: {body}");
+    // newest-first: first entry is the update.
+    let upd = &entries[0];
+    assert_eq!(upd["op"], "update");
+    assert_eq!(upd["version"], 2);
+    let changed: std::collections::HashSet<String> = upd["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["field"].as_str().unwrap().to_string())
+        .collect();
+    assert!(changed.contains("tier"), "tier changed: {upd}");
+    assert!(changed.contains("name"), "name changed: {upd}");
+    // internal columns never appear as changes.
+    assert!(!changed.contains("version"));
+    assert!(!changed.contains("updated_at"));
+    // the diff carries from→to values for a readable field.
+    let tier_change = upd["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["field"] == "tier")
+        .unwrap();
+    assert_eq!(tier_change["from"], "Bronze");
+    assert_eq!(tier_change["to"], "Gold");
+}
+
+#[tokio::test]
+async fn as_of_reconstructs_prior_versions() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","tier":"Bronze"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+    let _ = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"tier":"Gold"}).to_string()),
+        Some(1),
+    )
+    .await;
+
+    // as-of version 1 → the original tier.
+    let (st, v1) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/as-of?version=1"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "as-of v1: {v1}");
+    assert_eq!(v1["tier"], "Bronze");
+    assert_eq!(v1["version"], 1);
+
+    // as-of version 2 → the updated tier.
+    let (_, v2) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/as-of?version=2"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(v2["tier"], "Gold");
+
+    // unknown version → 404 with the stable code.
+    let (st, miss) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/as-of?version=999"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(miss["code"], "mda.not_found", "error code in body: {miss}");
+
+    // bad params → 422 with code.
+    let (st, bad) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/as-of"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(bad["code"], "mda.invalid");
+}
+
+#[tokio::test]
+async fn history_respects_object_record_and_field_security() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Secret","tier":"Gold","email":"s@x"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // (1) no object read perm → 403 (code).
+    let (none_token, _) = limited_user(&ctx, &[]).await;
+    let (st, body) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/history"),
+        &none_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "object-level denies history: {body}"
+    );
+    assert_eq!(body["code"], "mda.forbidden");
+
+    // (2) a reader who can't see the private record (OWD private, not owner) → 404.
+    let (reader_token, _) = limited_user(&ctx, &[("Customer", "read")]).await;
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/history"),
+        &reader_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "record-level hides history");
+
+    // (3) field-level: a reader with 'none' on 'tier' must not see tier in diffs.
+    //     Share the record so the reader can read it, then restrict tier.
+    let (fls_token, fls_user) = limited_user(&ctx, &[("Customer", "read")]).await;
+    let _ = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"principal_id": fls_user, "access": "read"}).to_string()),
+        None,
+    )
+    .await;
+    // Seed a fresh role with read perm + an FLS 'none' on 'tier' and assign it
+    // to the FLS user. sec_* tables are RLS-gated, so seed under the tenant GUC.
+    {
+        let mut tx = ctx.pool.begin().await.unwrap();
+        mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+        let (role_id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(ctx.tenant)
+        .bind(format!("fls_none_{}", Uuid::new_v4().simple()))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1,'Customer','read')",
+        )
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sec.sec_field_permission (role_id, entity, field, access)
+             VALUES ($1,'Customer','tier','none')",
+        )
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1,$2)")
+            .bind(fls_user)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let (st, body) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/history"),
+        &fls_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "shared reader history: {body}");
+    // tier must be absent from every diff entry (FLS none).
+    for entry in body["entries"].as_array().unwrap() {
+        for ch in entry["changes"].as_array().unwrap() {
+            assert_ne!(
+                ch["field"], "tier",
+                "FLS-none field leaked into history: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_of_deleted_record_is_admin_only() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Gone"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+    let _ = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+
+    // admin (superuser) still sees the full history incl. the delete entry.
+    let (st, body) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/history"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "admin sees deleted history: {body}");
+    let ops: Vec<&str> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["op"].as_str().unwrap())
+        .collect();
+    assert!(ops.contains(&"delete"), "delete entry present: {body}");
+
+    // as-of before deletion still reconstructs it.
+    let (st, v1) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}/as-of?version=1"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(v1["name"], "Gone");
+}
+
+#[tokio::test]
+async fn error_responses_carry_stable_code() {
+    // Regression guard for the §14 error-code taxonomy: every error envelope
+    // carries a stable `code` (SDK/i18n key) + `status` + legacy `error`.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+
+    // missing If-Match on a PATCH → 422 mda.invalid.
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"X"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+    let (st, body) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"name":"Y"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["code"], "mda.invalid");
+    assert_eq!(body["status"], 422);
+    assert_eq!(body["error"], "invalid");
+
+    // wrong version → 409 mda.conflict.
+    let (st, body) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"name":"Y"}).to_string()),
+        Some(999),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "mda.conflict");
+    assert_eq!(body["status"], 409);
+
+    // unknown record → 404 mda.not_found.
+    let (st, body) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{}", Uuid::new_v4()),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "mda.not_found");
+}

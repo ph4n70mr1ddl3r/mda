@@ -28,6 +28,7 @@ decision and links back.
 | [0015](0015-deletion-and-restoration-lifecycle.md) | Deletion & restoration lifecycle: trigger-driven archive, batch restore, cold-storage purge | Accepted |
 | [0016](0016-chained-workflow-transitions-sync-default-async-with-failure-handling.md) | Chained workflow transitions: sync-by-default (atomic) vs async (with required failure handling) | Accepted |
 | [0017](0017-rollup-summaries-incremental-sync-default-async-opt-out.md) | Rollup summaries: incremental sync by default, async opt-out for hot parents | Accepted |
+| [0018](0018-surfaced-capabilities-history-observability-error-taxonomy.md) | Surfaced platform capabilities: record history/as-of, observability console, error taxonomy | Accepted |
 
 ## Status legend
 `Proposed` → `Accepted` → `Deprecated` / `Superseded by ADR-NNNN`.

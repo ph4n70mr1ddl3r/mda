@@ -1054,11 +1054,20 @@ The architecture no longer blocks on these, but they shape later phases and ops:
 
 Acknowledged platform gaps that are real but lower-priority — visible here so they are not rediscovered mid-build. All are generic (domain-neutral).
 
+> **Progress (ADR-0018):** three of these are now **closed** — record/field
+> history + as-of, the modeler/tenant observability console (events / outbox /
+> migrations / audit surfaces), and the error-code taxonomy. They are marked
+> **✅ closed** below. The remainder are still open.
+
 - **Modeler / tenant observability console** — a tenant-facing view of job / rule / workflow / integration run history and failures (beyond operator `tracing`/OpenTelemetry). Raw material exists (`md_migration_log`, `sys_event_log`); the *surface* is unbuilt.
+  - **✅ closed (ADR-0018):** `/api/observability/{events,outbox,migrations,audit}` surface the run/delivery/audit history. Superuser-gated in v1; a scoped `observability.read` capability + field-level projection for non-admin modelers is the follow-up.
 - **Scheduled-job management** for modeler-defined schedules (next-run / last-run / failure state) — scheduled rules and integration schedules exist conceptually but aren't managed as a user surface.
+  - **Partially ✅ closed (ADR-0018):** the outbox console surfaces delivery *failure state* (pending/failed counts + oldest age + outstanding list). Full scheduled-rule/integration next-run/last-run management remains open (lands with the Phase 9 scheduler).
 - **Inbound webhook verification** — shared-secret / signature / replay protection for the Phase 9 inbound receiver (parallels the outbound contract in §5.21).
 - **Record / field history as a surfaced capability** — `sys_audit_log` stores before/after for compliance, but "timeline of this record" and "as-of" queries are not yet framed as a platform API.
+  - **✅ closed (ADR-0018):** `GET /api/data/:entity/:id/history` (per-field diffs, FLS-projected) and `GET /api/data/:entity/:id/as-of?version=|at=` reconstruct from audit snapshots, gated like a live read.
 - **Error code taxonomy + localized error messages** — the platform emits 409s, validation errors, and publish failures with no coherent, i18n-able error model.
+  - **✅ closed (ADR-0018):** every `Error` carries a stable `code()` (`mda.<kind>`); the API envelope exposes `code`/`status`/`message`. `code` is the SDK branch key and the i18n message key. (Per-field `details` for validation payloads is a future refinement.)
 - **Tenant-scoped backup / restore + data residency** — currently DB-level, single-region; granular tenant export/restore and regional placement tie to the deferred tenant lifecycle (§5.4) and HA (U9).
 
 ---

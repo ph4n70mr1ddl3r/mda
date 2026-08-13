@@ -521,12 +521,20 @@ async fn apply_additive_publish(
     }
 
     exec_stmts(&mut tx, &ddl::ensure_schema()).await?;
+    // Counters for the publish execution log (meta.md_migration_log). Each is the
+    // real number of DDL ops executed in this txn — honest, additive rows that
+    // the observability console surfaces and that ADR-0011's staged-execution
+    // work can later extend with resume/revert checkpoints.
+    let mut created_tables: i64 = 0;
+    let mut added_columns: i64 = 0;
+    let mut added_fks: i64 = 0;
     // new entities -> CREATE TABLE (their fields are included as columns)
     for e in &draft.entities {
         if active_entity_ids.contains(&e.id) {
             continue;
         }
         exec_stmts(&mut tx, &ddl::create_table(&e.table_name, e)?).await?;
+        created_tables += 1;
     }
     // added fields on EXISTING entities -> ALTER ADD COLUMN
     for e in &draft.entities {
@@ -538,6 +546,7 @@ async fn apply_additive_publish(
                 continue;
             }
             exec_stmts(&mut tx, &ddl::add_field(&e.table_name, f)?).await?;
+            added_columns += 1;
         }
     }
     // added relationships -> ALTER ADD FK column + constraint (after tables exist)
@@ -553,6 +562,7 @@ async fn apply_additive_publish(
                 ))
             })?;
             exec_stmts(&mut tx, &ddl::add_relationship(&e.table_name, r, target)?).await?;
+            added_fks += 1;
         }
     }
     // retire removed entities / fields (two-phase)
@@ -568,6 +578,27 @@ async fn apply_additive_publish(
             }
         }
     }
+
+    // 7) record what this publish executed (§14 observability; ADR-0011 log).
+    log_migration(&mut tx, tenant, draft_id, "create_table", created_tables).await?;
+    log_migration(&mut tx, tenant, draft_id, "add_column", added_columns).await?;
+    log_migration(&mut tx, tenant, draft_id, "add_relationship", added_fks).await?;
+    log_migration(
+        &mut tx,
+        tenant,
+        draft_id,
+        "retire_entity",
+        retirements.entities as i64,
+    )
+    .await?;
+    log_migration(
+        &mut tx,
+        tenant,
+        draft_id,
+        "retire_field",
+        retirements.fields as i64,
+    )
+    .await?;
 
     // 7) bump the active version (create-or-increment)
     sqlx::query(
@@ -618,6 +649,35 @@ async fn exec_stmts(
 }
 
 const RETIRE_GRACE: &str = "14 days";
+
+/// Append a row to the publish execution log (meta.md_migration_log) for one op
+/// category. Called from within the publish transaction (tenant GUC already
+/// set), so the RLS WITH CHECK passes. Zero-count ops are skipped to keep the
+/// log to real activity. This is the honest, additive seed of ADR-0011's
+/// staged-execution log; resume/revert checkpoints arrive with transforming ops.
+async fn log_migration(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    draft_id: Uuid,
+    op: &str,
+    rows_affected: i64,
+) -> Result<()> {
+    if rows_affected == 0 {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO meta.md_migration_log (tenant_id, draft_id, op, status, rows_affected, finished_at)
+         VALUES ($1, $2, $3, 'done', $4, now())",
+    )
+    .bind(tenant)
+    .bind(draft_id)
+    .bind(op)
+    .bind(rows_affected)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
+}
 
 /// Two-phase retire of an entity: status -> retired + a pending-purge row.
 /// Live `biz.<table>` data is kept until a purge job drops it (PLAN §5.8).

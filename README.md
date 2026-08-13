@@ -7,6 +7,11 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > **Status:** Phases 0–7, 10 implemented + Phase 6 Runtime UI (Leptos).
 > Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
 > notifications, sharing. Frontend: login + entity list (WASM).
+>
+> **Platform surfaces (ADR-0018):** record/field history + as-of
+> (`/api/data/:entity/:id/{history,as-of}`), a tenant observability console
+> (`/api/observability/{events,outbox,migrations,audit}`), and a stable
+> error-code taxonomy (`mda.<kind>`) on every error response.
 
 ## Quick start (Phase 0)
 
@@ -63,6 +68,23 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 # PATCH /api/data/:entity/:id  (If-Match: <version>)  — OCC update (409 on conflict)
 ```
 
+Platform surfaces (ADR-0018) — record history & as-of, and the tenant
+observability console (superuser-gated). Every error carries a stable
+`code` (SDK/i18n key) in addition to `message`:
+
+```bash
+# timeline of changes for a record (per-field diffs, FLS-projected)
+curl "localhost:8080/api/data/Customer/$ID/history" -H "x-tenant-id: $TENANT"
+# reconstruct the record at version 1 (or ?at=2025-07-18T12:00:00Z)
+curl "localhost:8080/api/data/Customer/$ID/as-of?version=1" -H "x-tenant-id: $TENANT"
+# operator console: domain events, delivery queue, publish log, audit trail
+curl localhost:8080/api/observability/events    -H "Authorization: Bearer $ADMIN_JWT"
+curl localhost:8080/api/observability/outbox     -H "Authorization: Bearer $ADMIN_JWT"
+curl localhost:8080/api/observability/migrations -H "Authorization: Bearer $ADMIN_JWT"
+curl localhost:8080/api/observability/audit      -H "Authorization: Bearer $ADMIN_JWT"
+# {"code":"mda.conflict","status":409,"error":"conflict","message":"…"}
+```
+
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
 > host-installed Postgres during local development.
 
@@ -117,7 +139,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
   - §14 — tracked, not yet designed (platform gaps)
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
-- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (17 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL).
+- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (18 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities).
 - [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE10.md`](./docs/PHASE10.md) — phase status & handoffs.
 
 ## Roadmap (summary)

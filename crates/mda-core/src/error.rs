@@ -1,4 +1,11 @@
 //! Canonical error & result types for the MDA platform.
+//!
+//! Every platform error carries a **stable, machine-readable `code`** (the
+//! `mda.<kind>` string below) in addition to its human `message`. The `code` is
+//! the i18n key and the SDK contract: it never changes for a given failure
+//! class, even if the English `message` wording is refined. This closes the
+//! §14 "error code taxonomy + localized error messages" platform gap — clients
+//! switch on `code`, humans read `message`, translators key on `code`.
 
 /// The canonical `Result` alias used across crates.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -34,5 +41,47 @@ impl Error {
         E: Into<anyhow::Error>,
     {
         Self::Internal(e.into())
+    }
+
+    /// The stable, machine-readable error code for this failure class.
+    ///
+    /// These strings are part of the public API contract: SDK clients branch on
+    /// them and translators use them as message keys, so they must never change
+    /// for a given variant (add new codes for new variants, don't rename).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Error::Config(_) => "mda.config_error",
+            Error::Invalid(_) => "mda.invalid",
+            Error::NotFound(_) => "mda.not_found",
+            Error::Conflict(_) => "mda.conflict",
+            Error::Forbidden(_) => "mda.forbidden",
+            Error::RateLimited(_) => "mda.rate_limited",
+            Error::Internal(_) => "mda.internal_error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// The code set is the stable SDK/i18n contract — guard it against drift.
+    #[test]
+    fn codes_are_stable_and_unique() {
+        let cases = [
+            (Error::Config("x".into()), "mda.config_error"),
+            (Error::Invalid("x".into()), "mda.invalid"),
+            (Error::NotFound("x".into()), "mda.not_found"),
+            (Error::Conflict("x".into()), "mda.conflict"),
+            (Error::Forbidden("x".into()), "mda.forbidden"),
+            (Error::RateLimited("x".into()), "mda.rate_limited"),
+            (Error::Internal(anyhow::anyhow!("x")), "mda.internal_error"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (err, code) in cases {
+            assert_eq!(err.code(), code);
+            assert!(seen.insert(code), "duplicate code {code}");
+            assert!(code.starts_with("mda."), "code must be namespaced: {code}");
+        }
     }
 }

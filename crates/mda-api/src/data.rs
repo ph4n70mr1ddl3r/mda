@@ -292,7 +292,7 @@ async fn transition_record(
 
 // ===== security helpers =====
 
-fn authorize(id: &Identity, entity: &str, verb: &str) -> ApiResult<()> {
+pub(crate) fn authorize(id: &Identity, entity: &str, verb: &str) -> ApiResult<()> {
     if !id.can(entity, verb) {
         return Err(Error::Forbidden(format!("missing {verb} on {entity}")).into());
     }
@@ -314,7 +314,12 @@ fn assert_writable(
 }
 
 /// Drop fields the caller may not read (FLS read projection).
-fn project(id: &Identity, entity: &str, def: &EntityDefinition, mut rec: Value) -> Value {
+pub(crate) fn project(
+    id: &Identity,
+    entity: &str,
+    def: &EntityDefinition,
+    mut rec: Value,
+) -> Value {
     if let Some(obj) = rec.as_object_mut() {
         for f in &def.fields {
             if id.field_access(entity, &f.name) == Access::None {
@@ -325,7 +330,11 @@ fn project(id: &Identity, entity: &str, def: &EntityDefinition, mut rec: Value) 
     rec
 }
 
-async fn scope_for(st: &AppState, user: &Identity, entity: &str) -> ApiResult<RecordScope> {
+pub(crate) async fn scope_for(
+    st: &AppState,
+    user: &Identity,
+    entity: &str,
+) -> ApiResult<RecordScope> {
     let owd: Owd = mda_security::resolve_owd(&st.pool, user.tenant_id, entity).await?;
     Ok(RecordScope {
         user_id: user.user_id,
@@ -335,7 +344,7 @@ async fn scope_for(st: &AppState, user: &Identity, entity: &str) -> ApiResult<Re
     })
 }
 
-async fn entity_def(
+pub(crate) async fn entity_def(
     st: &AppState,
     tenant: Uuid,
     name: &str,

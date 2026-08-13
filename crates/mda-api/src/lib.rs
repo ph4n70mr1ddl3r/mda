@@ -18,7 +18,9 @@ pub mod edge;
 pub mod error;
 pub mod events;
 pub mod extract;
+pub mod history;
 pub mod notifications;
+pub mod observability;
 pub mod reports;
 pub mod studio;
 
@@ -57,7 +59,9 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(reports::routes())
         .merge(notifications::routes())
         .merge(blobs::routes())
-        .merge(events::routes());
+        .merge(events::routes())
+        .merge(history::routes())
+        .merge(observability::routes());
 
     // Layer order (last = outermost): body-limit → security headers → access
     // log/metrics → CORS. CORS is outermost so preflight is answered before

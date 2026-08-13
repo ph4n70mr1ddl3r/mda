@@ -46,7 +46,12 @@ impl IntoResponse for ApiError {
         (
             code,
             Json(serde_json::json!({
+                // Stable, machine-readable failure class (the SDK/i18n contract).
+                // `code` is the canonical key; `error` is retained for legacy
+                // clients and mirrors the HTTP status bucket.
+                "code": self.0.code(),
                 "error": kind,
+                "status": code.as_u16(),
                 "message": self.0.to_string(),
             })),
         )
