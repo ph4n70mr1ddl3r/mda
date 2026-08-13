@@ -25,6 +25,7 @@ pub mod reports;
 pub mod secrets;
 pub mod studio;
 pub mod templates;
+pub mod webhooks;
 
 use mda_meta::MetadataCache;
 
@@ -64,6 +65,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(reports::routes())
         .merge(templates::routes())
         .merge(notifications::routes())
+        .merge(webhooks::routes())
         .merge(blobs::routes())
         .merge(secrets::routes())
         .merge(events::routes())

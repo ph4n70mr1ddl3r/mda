@@ -8,34 +8,56 @@
 //! At-least-once; idempotent on the outbox row id. Poison messages move to
 //! `status = 'dead'` after [`MAX_RETRIES`] failures.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use mda_api::notifications::{self, Channel};
+use mda_api::webhooks;
+use mda_core::SecretStore;
 use sqlx::PgPool;
 
 /// Maximum retry attempts before moving a failing item to the dead-letter queue.
 const MAX_RETRIES: i32 = 10;
 
-/// Spawn the background drain loop with the default channel set (in-app + email).
+/// Spawn the background drain loop with the default channel set (in-app + email)
+/// and a default secret store + HTTP client.
 pub fn spawn_drain(pool: PgPool) {
-    spawn_drain_with(pool, notifications::default_channels());
+    let secrets: Arc<dyn SecretStore> =
+        Arc::new(mda_api::secrets::LocalSecretStore::from_env());
+    spawn_drain_with(
+        pool,
+        notifications::default_channels(),
+        secrets,
+        reqwest::Client::new(),
+    );
 }
 
-/// Spawn the drain loop with an explicit channel set (used to add the webhook
-/// channel alongside the integration/webhook layer, §5.21).
-pub fn spawn_drain_with(pool: PgPool, channels: Vec<Box<dyn Channel>>) {
+/// Spawn the drain loop with an explicit channel set, secret store, and HTTP
+/// client (used to add the webhook channel alongside §5.21 and to inject a
+/// test secret store / client).
+pub fn spawn_drain_with(
+    pool: PgPool,
+    channels: Vec<Box<dyn Channel>>,
+    secrets: Arc<dyn SecretStore>,
+    http: reqwest::Client,
+) {
     tokio::spawn(async move {
         tracing::info!("outbox drain worker started");
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if let Err(e) = drain_once(&pool, &channels).await {
+            if let Err(e) = drain_once(&pool, &channels, secrets.as_ref(), &http).await {
                 tracing::warn!(?e, "outbox drain pass failed");
             }
         }
     });
 }
 
-async fn drain_once(pool: &PgPool, channels: &[Box<dyn Channel>]) -> Result<(), sqlx::Error> {
+async fn drain_once(
+    pool: &PgPool,
+    channels: &[Box<dyn Channel>],
+    secrets: &dyn SecretStore,
+    http: &reqwest::Client,
+) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     // Claim a batch and snapshot `attempts` in the same locked read. The rows
     // are held FOR UPDATE within this transaction, so the pre-increment count
@@ -54,7 +76,7 @@ async fn drain_once(pool: &PgPool, channels: &[Box<dyn Channel>]) -> Result<(), 
     for (id, tenant, kind, payload, current_attempts) in rows {
         // Handlers run against the pool (their own transactions); the row lock
         // in `tx` simply reserves the row for this pass.
-        let res = process(pool, channels, tenant, &kind, &payload).await;
+        let res = process(pool, channels, secrets, http, tenant, &kind, &payload).await;
         let (status, attempts_incr): (&str, i32) = match res {
             Ok(()) => ("done", 0),
             Err(e) => {
@@ -86,6 +108,8 @@ async fn drain_once(pool: &PgPool, channels: &[Box<dyn Channel>]) -> Result<(), 
 async fn process(
     pool: &PgPool,
     channels: &[Box<dyn Channel>],
+    secrets: &dyn SecretStore,
+    http: &reqwest::Client,
     tenant: uuid::Uuid,
     kind: &str,
     payload: &serde_json::Value,
@@ -100,6 +124,14 @@ async fn process(
                     tracing::warn!(?e, "notification fanout failed");
                     sqlx::Error::Configuration(e.to_string().into())
                 })?;
+            Ok(())
+        }
+        "webhook.deliver" => {
+            // outbound signed delivery (§5.21).
+            webhooks::deliver(pool, secrets, http, payload).await.map_err(|e| {
+                tracing::warn!(?e, "webhook delivery failed");
+                sqlx::Error::Configuration(e.to_string().into())
+            })?;
             Ok(())
         }
         "workflow.transitioned" => {
