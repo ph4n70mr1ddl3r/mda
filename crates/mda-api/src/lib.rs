@@ -10,6 +10,7 @@ use axum::Router;
 use mda_security::jwt::JwtConfig;
 use serde::Serialize;
 use sqlx::PgPool;
+use std::collections::HashMap;
 
 pub mod auth;
 pub mod blobs;
@@ -18,6 +19,7 @@ pub mod edge;
 pub mod error;
 pub mod events;
 pub mod extract;
+pub mod graphql;
 pub mod history;
 pub mod integrations;
 pub mod notifications;
@@ -45,6 +47,9 @@ pub struct AppState {
     /// Login brute-force defence (per-account lockout + per-IP limit), shared
     /// across instances via `sys.sys_login_throttle` (§3).
     pub login_throttle: mda_security::LoginThrottle,
+    /// GraphQL schema cache, keyed by `(tenant_id, active_version)` so a publish
+    /// (version advance) rebuilds the schema (ADR-0010).
+    pub gql: std::sync::Arc<tokio::sync::RwLock<HashMap<(uuid::Uuid, i64), async_graphql::dynamic::Schema>>>,
 }
 
 /// Build the application router.
@@ -70,6 +75,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(blobs::routes())
         .merge(secrets::routes())
         .merge(events::routes())
+        .merge(graphql::routes())
         .merge(history::routes())
         .merge(integrations::routes())
         .merge(observability::routes());

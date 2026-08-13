@@ -6,7 +6,6 @@ use axum::http::{Request, StatusCode};
 use mda_api::AppState;
 use mda_meta::MetadataCache;
 use mda_security::jwt::JwtConfig;
-use mda_security::LoginThrottle;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use tower::ServiceExt;
@@ -68,8 +67,8 @@ async fn setup() -> Option<Ctx> {
 
         secrets,
         events: mda_api::events::channel(),
-        login_throttle: LoginThrottle::default(),
-    });
+        login_throttle: mda_security::LoginThrottle::default(),
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
     Some(Ctx { app, tenant, email })
 }
 

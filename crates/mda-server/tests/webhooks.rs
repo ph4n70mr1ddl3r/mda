@@ -51,7 +51,7 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
     Some(Ctx {
         app,
         token,
@@ -367,7 +367,7 @@ async fn inbound_verifies_signature_and_dedupes() {
         secrets: secret_store,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
 
     let mut tx = ctx.pool.begin().await.unwrap();
     mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();

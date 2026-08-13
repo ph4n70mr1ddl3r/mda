@@ -60,6 +60,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+async-graphql = "7"
+async-graphql-axum = "7"
 
 [profile.release]
 opt-level = 3

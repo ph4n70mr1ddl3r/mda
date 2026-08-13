@@ -96,6 +96,7 @@ pub async fn run() -> anyhow::Result<()> {
         secrets,
         events,
         login_throttle: mda_security::LoginThrottle::from_env(),
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
 
     let addr = format!("{}:{}", cfg.host, cfg.port);

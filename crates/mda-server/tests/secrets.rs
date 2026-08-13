@@ -8,7 +8,6 @@ use mda_api::secrets::{resolve_and_audit, LocalSecretStore};
 use mda_api::AppState;
 use mda_meta::MetadataCache;
 use mda_security::jwt::JwtConfig;
-use mda_security::LoginThrottle;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -46,8 +45,8 @@ async fn setup() -> Option<Ctx> {
         blobs,
         secrets,
         events: mda_api::events::channel(),
-        login_throttle: LoginThrottle::default(),
-    });
+        login_throttle: mda_security::LoginThrottle::default(),
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
 
     // login to get an access token (admin can do everything).
     let (st, v) = login(&app, tenant, &email, PWD).await;

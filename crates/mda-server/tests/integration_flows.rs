@@ -65,7 +65,7 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
     Some(Ctx {
         app,
         token,
@@ -412,7 +412,7 @@ async fn webhook_to_inbound_flow_materializes_via_drain() {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-    });
+        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),    });
 
     // POST a signed inbound event to the webhook receiver.
     let body = json!({"external_id":"D4","name":"Umbrella","tier":"Gold"}).to_string();
