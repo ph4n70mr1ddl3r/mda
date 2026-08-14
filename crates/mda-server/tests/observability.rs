@@ -162,6 +162,62 @@ async fn observability_requires_admin() {
 }
 
 #[tokio::test]
+async fn observability_read_capability_lets_modeler_see_redacted_trail() {
+    // ADR-0018 follow-up: a non-admin principal granted `observability.read`
+    // sees the console, and audit before/after is redacted (field-level
+    // projection) while the rest of the trail (who/what/when) is visible.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    // seed an audit row directly (the console reads sys_audit_log).
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO sys_audit_log (tenant_id, actor_id, entity, record_id, op, before, after)
+         VALUES ($1, $2, 'Customer', $3, 'create', NULL, '{\"secret\":\"shh\"}'::jsonb)",
+    )
+    .bind(ctx.tenant)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // a modeler with the observability.read capability (no other perms).
+    let role_id =
+        common::seed_role(&ctx.pool, ctx.tenant, "ops", &[("*", "observability.read")]).await;
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("o{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(&ctx.pool, ctx.tenant, &email, "ops", &hash).await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, uid, role_id).await;
+    let token = ctx.jwt.issue_access(uid, ctx.tenant, None).unwrap();
+
+    // events surface is readable.
+    let (st, _body) = call(&ctx.app, "GET", "/api/observability/events", &token).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // audit trail is readable, but before/after are redacted for non-superusers.
+    let (st, body) = call(&ctx.app, "GET", "/api/observability/audit", &token).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let item = &body["items"][0];
+    assert_eq!(item["entity"], "Customer");
+    assert!(item["after"].is_null(), "field payload redacted: {item}");
+
+    // a principal without the capability (only a read perm) is still denied.
+    let other = common::seed_role(&ctx.pool, ctx.tenant, "plain", &[("Customer", "read")]).await;
+    let email2 = format!("p{}@test", Uuid::new_v4().simple());
+    let uid2 = common::seed_user(&ctx.pool, ctx.tenant, &email2, "plain", &hash).await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, uid2, other).await;
+    let token2 = ctx.jwt.issue_access(uid2, ctx.tenant, None).unwrap();
+    let (st, body) = call(&ctx.app, "GET", "/api/observability/audit", &token2).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "mda.forbidden");
+}
+
+#[tokio::test]
 async fn observability_surfaces_activity() {
     let ctx = match setup().await {
         Some(c) => c,

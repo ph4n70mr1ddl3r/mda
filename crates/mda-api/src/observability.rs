@@ -12,13 +12,13 @@
 //!   - `GET /api/observability/audit`        — audit trail browse (`sys_audit_log`)
 //!
 //! ## Authorisation
-//! These are operator/modeler views and currently **superuser-only**. The
-//! bootstrap admin (the `(*,*)` principal) qualifies. Audit `before`/`after` is
-//! therefore returned verbatim (a superuser already bypasses field-level
-//! security). A follow-up can introduce a scoped `observability.read`
-//! capability with field-level projection for non-admin tenant modelers; until
-//! then, superuser-gating is the safe default for a console that aggregates
-//! every entity's activity.
+//! A superuser always passes. A non-admin principal passes when granted the
+//! `observability.read` capability (a `("*", "observability.read")` permission) —
+//! this lets a tenant modeler/operator see run/delivery/audit history without
+//! raw DB access. Audit `before`/`after` payloads are redacted for non-superuser
+//! readers (they may carry sensitive field values); superusers see them verbatim.
+//! All other surfaces (events/outbox/migrations) are returned in full to any
+//! reader who passes the gate (they carry no field-level data).
 //!
 //! All queries are filtered by the caller's `tenant_id`; `sys_*` tables carry
 //! no RLS (they are app-layer-isolated), and `md_migration_log` is read under
@@ -114,7 +114,7 @@ async fn events(
     AuthUser(user): AuthUser,
     Query(q): Query<EventQuery>,
 ) -> ApiResult<Json<Value>> {
-    require_admin(&user)?;
+    require_observability(&user)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
 
     let rows: Vec<EventRow> = sqlx::query_as(
@@ -157,7 +157,7 @@ async fn events(
 /// plus the still-pending/failed entries (oldest first) so a stalled delivery is
 /// visible at a glance.
 async fn outbox(State(st): State<AppState>, AuthUser(user): AuthUser) -> ApiResult<Json<Value>> {
-    require_admin(&user)?;
+    require_observability(&user)?;
 
     // Status breakdown (pending / done / failed) with age of the oldest in each.
     let breakdown: Vec<OutboxCountRow> = sqlx::query_as(
@@ -223,7 +223,7 @@ async fn migrations(
     AuthUser(user): AuthUser,
     Query(q): Query<LimitQuery>,
 ) -> ApiResult<Json<Value>> {
-    require_admin(&user)?;
+    require_observability(&user)?;
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
 
     // md_migration_log is RLS-gated (meta.*); read under the tenant GUC.
@@ -300,8 +300,11 @@ async fn audit(
     AuthUser(user): AuthUser,
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<Json<Value>> {
-    require_admin(&user)?;
+    require_observability(&user)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    // Non-superuser observability readers see the trail (who/what/when) but not
+    // the field-level before/after payloads (may carry sensitive values).
+    let redact = !user.is_superuser;
 
     let rows: Vec<AuditRow> = sqlx::query_as(
         "SELECT id, created_at, actor_id, entity, record_id, op, before, after
@@ -334,8 +337,8 @@ async fn audit(
                 "entity": entity,
                 "record_id": record_id,
                 "op": op,
-                "before": before,
-                "after": after,
+                "before": if redact { None } else { before },
+                "after": if redact { None } else { after },
             })
         })
         .collect();
@@ -348,14 +351,24 @@ struct LimitQuery {
     limit: Option<i64>,
 }
 
-/// Gate the console to modelers/operators (superuser only in v1).
-fn require_admin(user: &mda_security::Identity) -> ApiResult<()> {
-    if user.is_superuser {
+/// Gate the console to operators/modelers. A superuser always passes; a
+/// non-admin principal passes when granted the `observability.read` capability
+/// (a `("*", "observability.read")` permission). Non-superuser readers get
+/// audit `before`/`after` redacted (field-level projection; ADR-0018 follow-up).
+fn require_observability(user: &mda_security::Identity) -> ApiResult<()> {
+    if user.is_superuser || user.can("*", "observability.read") {
         Ok(())
     } else {
-        Err(
-            Error::Forbidden("observability console requires modeler/admin privileges".into())
-                .into(),
+        Err(Error::Forbidden(
+            "observability console requires the observability.read capability".into(),
         )
+        .into())
     }
+}
+
+/// `require_admin` is retained as an alias for callers that semantically want
+/// the modeler/operator gate (same check today).
+#[allow(dead_code)]
+fn require_admin(user: &mda_security::Identity) -> ApiResult<()> {
+    require_observability(user)
 }

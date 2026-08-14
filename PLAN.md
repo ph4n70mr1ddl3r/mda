@@ -1070,7 +1070,7 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 > deferred tenant lifecycle).
 
 - **Modeler / tenant observability console** — a tenant-facing view of job / rule / workflow / integration run history and failures (beyond operator `tracing`/OpenTelemetry). Raw material exists (`md_migration_log`, `sys_event_log`); the *surface* is unbuilt.
-  - **✅ closed (ADR-0018):** `/api/observability/{events,outbox,migrations,audit}` surface the run/delivery/audit history. Superuser-gated in v1; a scoped `observability.read` capability + field-level projection for non-admin modelers is the follow-up.
+  - **✅ closed (ADR-0018):** `/api/observability/{events,outbox,migrations,audit}` surface the run/delivery/audit history. The v1 superuser gate is now broadened: a non-admin principal granted the `observability.read` capability (a `("*", "observability.read")` permission) sees the console, with audit `before`/`after` redacted (field-level projection).
 - **Scheduled-job management** for modeler-defined schedules (next-run / last-run / failure state) — scheduled rules and integration schedules exist conceptually but aren't managed as a user surface.
   - **Partially ✅ closed (ADR-0018):** the outbox console surfaces delivery *failure state* (pending/failed counts + oldest age + outstanding list). Full scheduled-rule/integration next-run/last-run management remains open (lands with the Phase 9 scheduler).
 - **Inbound webhook verification** — shared-secret / signature / replay protection for the Phase 9 inbound receiver (parallels the outbound contract in §5.21).
