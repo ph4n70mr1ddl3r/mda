@@ -62,6 +62,7 @@ sha2 = "0.10"
 base64 = "0.22"
 async-graphql = "7"
 async-graphql-axum = "7"
+cron = "0.12"
 
 [profile.release]
 opt-level = 3

@@ -64,6 +64,7 @@ pub async fn run() -> anyhow::Result<()> {
     mda_meta::cache::spawn_listen(app_pool.clone(), cache.clone());
     mda_meta::cache::spawn_poll(app_pool.clone(), cache.clone());
     outbox::spawn_drain(app_pool.clone());
+    mda_api::schedules::spawn_scheduler(app_pool.clone());
     mda_api::notifications::spawn_digest(app_pool.clone());
     mda_api::webhooks::spawn_relay(app_pool.clone());
 

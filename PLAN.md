@@ -1064,9 +1064,10 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 > notifications & messaging (§5.18), templating (§5.19), secrets (§5.20), the
 > outbound webhook contract + inbound verification (§5.21/§14), and the
 > hub-model integration architecture (§5.22 / Phase 9), plus a first-class
-> GraphQL runtime API (ADR-0010, query/traversal-first). Remaining §14 items —
-> full scheduled-job management, tenant-scoped backup/restore + data residency —
-> stay open (they tie to the deferred scheduler and tenant lifecycle).
+> GraphQL runtime API (ADR-0010, query/traversal-first). Scheduled-job
+> management is now **closed** (generic cron scheduler). The remaining §14 item —
+> tenant-scoped backup/restore + data residency — stays open (it ties to the
+> deferred tenant lifecycle).
 
 - **Modeler / tenant observability console** — a tenant-facing view of job / rule / workflow / integration run history and failures (beyond operator `tracing`/OpenTelemetry). Raw material exists (`md_migration_log`, `sys_event_log`); the *surface* is unbuilt.
   - **✅ closed (ADR-0018):** `/api/observability/{events,outbox,migrations,audit}` surface the run/delivery/audit history. Superuser-gated in v1; a scoped `observability.read` capability + field-level projection for non-admin modelers is the follow-up.

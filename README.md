@@ -10,8 +10,9 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
 > notifications, sharing. Platform: secrets, templating, multi-channel
 > notifications + digest, signed webhook contract + inbound verification,
-> hub-model integration (connectors / flows / external-ID registry), and
-> GraphQL. Frontend: login + entity list (WASM).
+> hub-model integration (connectors / flows / external-ID registry),
+> GraphQL, and cron-driven **scheduled-job management** (§14). Frontend: login +
+> entity list (WASM).
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
 > (`/api/data/:entity/:id/{history,as-of}`), a tenant observability console
@@ -124,6 +125,14 @@ curl -X POST localhost:8080/api/flows/$FLOW_ID/run -H "Authorization: Bearer $JW
      -H 'content-type: application/json' \
      -d '{"payload":{"external_id":"A1","name":"Acme","tier":"Gold"}}'
 curl "localhost:8080/api/external-ids/Customer/A1?system=acme" -H "Authorization: Bearer $JWT"
+
+# Scheduled jobs (§14) — cron-driven modeler schedules with next-run/last-run/
+# failure state + per-run history. `report` runs a saved report under the
+# schedule's running user; `custom` is an extensibility hook.
+curl -X POST localhost:8080/api/schedules -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"name":"nightly","kind":"report","target_id":"'$REP_ID'","cron":"0 0 * * * *"}'
+curl localhost:8080/api/schedules/$SCHED_ID/runs -H "Authorization: Bearer $JWT"
 ```
 
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
@@ -142,9 +151,9 @@ DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
   cargo test --test data --test studio --test integration
 # or:  make test   (unit + DB-backed)
 #
-# Platform-capability + GraphQL suites (§5.18–5.22, ADR-0010):
+# Platform-capability + GraphQL + scheduler suites (§5.18–5.22, ADR-0010, §14):
 #   cargo test --test secrets --test templates --test notifications \
-#              --test webhooks --test integration_flows --test graphql
+#              --test webhooks --test integration_flows --test graphql --test scheduler
 ```
 
 The `data`/`studio` suites connect the app as the non-superuser `mda_app` role
@@ -180,7 +189,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
   - §5.15 — retention of high-volume append-only tables (audit/event/outbox)
   - §5.16 — threat model: untrusted metadata
   - §5.17 — reporting query model & security (structured metadata, runner-context AuthZ by construction)
-  - §5.18–5.22 — platform capabilities: notifications & messaging, templating, secrets management, event/webhook contract, integration architecture (hub model)
+  - §5.18–5.22 — platform capabilities: notifications & messaging, templating, secrets management, event/webhook contract, integration architecture (hub model), **scheduled-job management (§14)**
   - §14 — tracked, not yet designed (platform gaps)
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
