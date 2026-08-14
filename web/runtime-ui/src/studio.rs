@@ -1349,7 +1349,10 @@ fn FormsTab() -> impl IntoView {
                 if ent.is_empty() {
                     return view! { <p style="color:#889;">"Pick an entity to design its form."</p> }.into_view();
                 }
-                let n = rows.get().len();
+                // NB: this closure must track ONLY `entity`. Reading `rows`
+                // here would re-run it on every PickRow edit-effect write,
+                // tearing down + recreating the keyed rows in a loop until
+                // the runtime panics (OwnerDisposed) — found by browser test.
                 let rows_c = rows.clone();
                 view! {
                     <div>
@@ -1411,7 +1414,7 @@ fn FormsTab() -> impl IntoView {
                                     });
                                 }>"Delete form"</button>
                             <span style="font-size:12px; color:#667; margin-left:8px;">
-                                {format!("{} of {n} fields included", rows.get().iter().filter(|r| r.included).count())}
+                                {move || format!("{} fields included", rows.get().iter().filter(|r| r.included).count())}
                             </span>
                         </div>
                     </div>
@@ -1482,6 +1485,7 @@ fn ViewsTab() -> impl IntoView {
                 if ent.is_empty() {
                     return view! { <p style="color:#889;">"Pick an entity to design its list view."</p> }.into_view();
                 }
+                // Track ONLY `entity` here (see the FormsTab note above).
                 let rows_c = rows.clone();
                 view! {
                     <div>
