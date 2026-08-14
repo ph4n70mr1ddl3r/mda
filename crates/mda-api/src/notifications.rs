@@ -703,9 +703,12 @@ pub async fn resolve_record_readers(
         readers.insert(owner_id);
     }
     let shares: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT principal_id FROM sec.sec_record_share
-          WHERE tenant_id = $1 AND entity = $2 AND record_id = $3
-            AND access IN ('read','write')",
+        "SELECT principal_id FROM sec.sec_record_share rs
+          WHERE rs.tenant_id = $1 AND rs.entity = $2 AND rs.record_id = $3
+            AND rs.access IN ('read','write')
+            AND (rs.rule_id IS NULL
+                 OR rs.epoch = (SELECT r.epoch FROM sec.sec_share_rule r
+                                WHERE r.id = rs.rule_id AND r.active))",
     )
     .bind(tenant)
     .bind(entity)

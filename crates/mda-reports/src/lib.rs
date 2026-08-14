@@ -4,16 +4,19 @@
 //! filters + group_by + order_by + limit) that the engine compiles to
 //! parameterized SQL over `biz.<table>`. Because the engine builds the SQL, it
 //! enforces the **runner's** object/field/record security by construction:
-//!  - object: needs `read` on the base entity;
+//!  - object: needs `read` on the base entity (and on every entity a reference
+//!    traversal crosses);
 //!  - field (projection): unreadable select fields are dropped;
 //!  - field (semantic): an unreadable field in `filter`/`group_by`/`order_by` is
 //!    a run-time error (a dropped filter/group would change semantics / leak);
-//!  - record: the runner's ownership/OWD predicate is injected into the WHERE.
+//!  - record: the runner's ownership/OWD/sharing predicate (the same one the
+//!    data API injects) is part of the WHERE.
 //!
-//! Phase 7 supports single-entity reports (reference-traversal joins, scheduled
-//! delivery, and PDF/XLSX renderers are follow-ups).
-
-use std::collections::HashSet;
+//! Fields may traverse references (`customer.name`) — compiled to real LEFT
+//! JOINs over the hoisted FK columns (§5.7). Renderers: CSV, HTML, XLSX and PDF
+//! (`render`), so a run can be exported for any audience. Scheduled delivery
+//! rides the §14 scheduler (`kind=report`) with optional `report.completed`
+//! notification delivery.
 
 use mda_core::{Error, Result};
 use mda_data::{Filter, RecordScope, Sort};
@@ -24,8 +27,10 @@ use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod render;
 pub mod template;
 
+pub use render::{to_html, to_pdf, to_xlsx};
 pub use template::{render, render_body, Rendered, Template};
 
 /// Wall-clock cap (ms) on a single synchronous report run (§5.17 cost control).
@@ -34,7 +39,7 @@ pub use template::{render, render_body, Rendered, Template};
 const REPORT_TIMEOUT_MS: &str = "10000";
 
 /// A structured report dataset (the JSON stored in `md_report.dataset`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct Dataset {
     pub base_entity: String,
     #[serde(default)]
@@ -49,7 +54,7 @@ pub struct Dataset {
     pub limit: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct SelectField {
     pub field: String,
     /// count | sum | avg | min | max ; None => plain field.
@@ -66,6 +71,16 @@ pub struct ReportResult {
 }
 
 /// Compile and run a dataset under the runner's identity.
+///
+/// Fields may traverse references (`customer.name`, `customer.region.name`, up
+/// to [`MAX_HOPS`] hops): each hop resolves to a real `LEFT JOIN` over the
+/// hoisted FK column (§5.7 — indexed, no string keys). Security is enforced per
+/// hop: every crossed entity requires object-level `read`, and the leaf field is
+/// field-level checked against the entity it belongs to (select fields are
+/// dropped when unreadable — graceful; filter/group/order paths error —
+/// semantic, §5.11/§5.17). The record-scope predicate is the **same** predicate
+/// the data API injects (owner ∨ shares ∨ team-OWD ∨ role hierarchy), so a
+/// report never sees a record the runner could not read.
 pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<ReportResult> {
     // object grain
     if !identity.can(&ds.base_entity, "read") {
@@ -94,12 +109,8 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         team_id: identity.team_id,
     };
 
-    let scalar: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
-    let fk: HashSet<&str> = def
-        .relationships
-        .iter()
-        .map(|r| r.source_field_name.as_str())
-        .collect();
+    // ---- joins accumulated by reference traversals ----
+    let mut joins: Vec<String> = Vec::new();
 
     // ---- select (jsonb_build_object pairs) + columns ----
     let mut pairs: Vec<String> = Vec::new();
@@ -120,22 +131,21 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
             columns.push(alias);
             continue;
         }
-        if !scalar.contains(f.field.as_str()) && !fk.contains(f.field.as_str()) {
-            return Err(Error::Invalid(format!("unknown field {}", f.field)));
-        }
-        // field grain: drop unreadable select fields (graceful)
-        if identity.field_access(&ds.base_entity, &f.field) == Access::None {
+        let r = resolve_field(pool, identity.tenant_id, &def, &f.field).await?;
+        // field grain: drop unreadable select fields (graceful) — a denied hop
+        // or denied leaf field removes the column rather than failing the run.
+        if !readable(identity, &r) {
             continue;
         }
-        let col_expr = field_expr(&def, &f.field);
+        merge_joins(&mut joins, &r);
         let expr = match f.aggregate.as_deref() {
-            Some("count") => format!("count({col_expr})"),
+            Some("count") => format!("count({})", r.sql),
             Some("sum") | Some("avg") => {
-                format!("{}({col_expr}::numeric)", f.aggregate.as_deref().unwrap())
+                format!("{}({}::numeric)", f.aggregate.as_deref().unwrap(), r.sql)
             }
-            Some("min") | Some("max") => format!("{}({col_expr})", f.aggregate.as_deref().unwrap()),
+            Some("min") | Some("max") => format!("{}({})", f.aggregate.as_deref().unwrap(), r.sql),
             Some(other) => return Err(Error::Invalid(format!("unknown aggregate {other}"))),
-            None => col_expr.to_string(),
+            None => r.sql.to_string(),
         };
         pairs.push(format!("'{alias}', {expr}"));
         columns.push(alias);
@@ -147,23 +157,20 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
     // ---- group_by (semantic: unreadable => error) ----
     let mut group_exprs: Vec<String> = Vec::new();
     for g in &ds.group_by {
-        require_readable(identity, &ds.base_entity, g, &scalar, &fk, "group_by")?;
-        group_exprs.push(field_expr(&def, g).to_string());
+        let r = resolve_field(pool, identity.tenant_id, &def, g).await?;
+        require_readable(identity, &r, "group_by")?;
+        merge_joins(&mut joins, &r);
+        group_exprs.push(r.sql);
     }
 
     // ---- order_by (semantic: must be a known, readable field; never interpolated raw) ----
     let mut order_parts: Vec<String> = Vec::new();
     for s in &ds.order_by {
-        require_readable(
-            identity,
-            &ds.base_entity,
-            &s.field,
-            &scalar,
-            &fk,
-            "order_by",
-        )?;
+        let r = resolve_field(pool, identity.tenant_id, &def, &s.field).await?;
+        require_readable(identity, &r, "order_by")?;
+        merge_joins(&mut joins, &r);
         let d = if s.asc { "ASC" } else { "DESC" };
-        order_parts.push(format!("{} {d}", field_expr(&def, &s.field)));
+        order_parts.push(format!("{} {d}", r.sql));
     }
     let order_sql = if order_parts.is_empty() {
         "1".to_string()
@@ -172,16 +179,21 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
     };
 
     // ---- WHERE: tenant + record scope + filters ----
-    let mut parts: Vec<String> = vec!["tenant_id = $1".into()];
-    let mut binds: Vec<String> = Vec::new();
+    let mut parts: Vec<String> = vec!["t.tenant_id = $1".into()];
+    let mut binds: Vec<RB> = vec![RB::Uuid(identity.tenant_id)];
     let mut n = 2usize;
-    if let Some(u) = read_user(&scope) {
-        parts.push(format!("owner_id = ${n}"));
-        binds.push(u.to_string());
-        n += 1;
+    if let Some(pred) = mda_data::read_predicate(&scope) {
+        let (frag, ub) = mda_data::pred_render(&pred, &scope, n);
+        parts.push(frag);
+        n += ub.len();
+        for u in ub {
+            binds.push(RB::Uuid(u));
+        }
     }
     for f in &ds.filters {
-        require_readable(identity, &ds.base_entity, &f.field, &scalar, &fk, "filter")?;
+        let r = resolve_field(pool, identity.tenant_id, &def, &f.field).await?;
+        require_readable(identity, &r, "filter")?;
+        merge_joins(&mut joins, &r);
         let op = match f.op.as_str() {
             "eq" => "=",
             "ne" => "<>",
@@ -192,23 +204,27 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
             "like" => "ILIKE",
             other => return Err(Error::Invalid(format!("unsupported filter op {other}"))),
         };
-        let (lhs, rhs_cast) = if fk.contains(f.field.as_str()) {
-            (f.field.clone(), "::uuid")
-        } else if matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte") {
-            (field_expr(&def, &f.field).to_string(), "::numeric")
-        } else {
-            (field_expr(&def, &f.field).to_string(), "")
+        let rhs_cast = match r.kind {
+            FieldKind::Fk => "::uuid",
+            FieldKind::System if matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte") => {
+                "::numeric"
+            }
+            FieldKind::Scalar if matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte") => {
+                "::numeric"
+            }
+            _ => "",
         };
-        parts.push(format!("{lhs} {op} ${n}{rhs_cast}"));
-        binds.push(f.value.clone());
+        parts.push(format!("{} {op} ${n}{rhs_cast}", r.sql));
+        binds.push(RB::Text(f.value.clone()));
         n += 1;
     }
 
     let table = &def.entity.table_name;
     let select_clause = format!("SELECT jsonb_build_object({}) AS row", pairs.join(", "));
     let mut sql = format!(
-        "{select_clause} FROM biz.{table} WHERE {}",
-        parts.join(" AND ")
+        "{select_clause} FROM biz.{table} t {join_sql} WHERE {}",
+        parts.join(" AND "),
+        join_sql = joins.join(" ")
     );
     if !group_exprs.is_empty() {
         sql.push_str(&format!(" GROUP BY {}", group_exprs.join(", ")));
@@ -234,9 +250,12 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
-    let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str()).bind(identity.tenant_id);
+    let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str());
     for b in &binds {
-        q = q.bind(b);
+        q = match b {
+            RB::Uuid(u) => q.bind(*u),
+            RB::Text(s) => q.bind(s),
+        };
     }
     let rows: Vec<(Value,)> = q.fetch_all(&mut *tx).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
@@ -252,6 +271,224 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         })
         .collect();
     Ok(ReportResult { columns, rows: out })
+}
+
+/// Mixed report binds (uuid record-scope binds + text filter values).
+enum RB {
+    Uuid(Uuid),
+    Text(String),
+}
+
+/// System columns present on every generated `biz.<table>` (§5.7) that reports
+/// may select/filter/group on in addition to declared fields.
+pub const SYSTEM_FIELDS: [&str; 6] = [
+    "id",
+    "version",
+    "state",
+    "owner_id",
+    "created_at",
+    "updated_at",
+];
+
+/// How the leaf of a field reference is stored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FieldKind {
+    Scalar,
+    Fk,
+    System,
+}
+
+/// Reject aliases that contain characters unsafe in a single-quoted SQL literal.
+fn is_safe_alias(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A resolved field reference: the SQL column expression (base table alias
+/// `t`, traversal join aliases `j_*`), the join fragments each hop needs, the
+/// entities crossed (for per-hop AuthZ), and the leaf (entity, field) the
+/// field-level check applies to.
+struct FieldRef {
+    sql: String,
+    joins: Vec<String>,
+    hop_entities: Vec<String>,
+    leaf_entity: String,
+    leaf_field: String,
+    kind: FieldKind,
+}
+
+/// Maximum reference-traversal depth (`customer.region.name` = 2 hops).
+const MAX_HOPS: usize = 3;
+
+/// Resolve a (possibly dotted) field path against the base entity definition.
+/// Every hop must be a reference field; the join chain is built left-join over
+/// the hoisted FK column so a missing reference yields NULL, not a dropped row.
+async fn resolve_field(
+    pool: &PgPool,
+    tenant: Uuid,
+    base: &EntityDefinition,
+    path: &str,
+) -> Result<FieldRef> {
+    let segments: Vec<&str> = path.split('.').map(str::trim).collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        return Err(Error::Invalid(format!("malformed field path '{path}'")));
+    }
+    if segments.len() > MAX_HOPS + 1 {
+        return Err(Error::Invalid(format!(
+            "field path '{path}' exceeds {MAX_HOPS} reference hops"
+        )));
+    }
+
+    let mut entity = base.entity.name.clone();
+    let mut table = base.entity.table_name.clone();
+    let mut alias = "t".to_string();
+    let mut joins: Vec<String> = Vec::new();
+    let mut hop_entities: Vec<String> = Vec::new();
+
+    for (i, seg) in segments.iter().enumerate() {
+        let last = i == segments.len() - 1;
+        // system columns exist on every table (base or joined target)
+        if last && SYSTEM_FIELDS.contains(seg) {
+            return Ok(FieldRef {
+                sql: format!("{alias}.{seg}"),
+                joins,
+                hop_entities,
+                leaf_entity: entity,
+                leaf_field: (*seg).to_string(),
+                kind: FieldKind::System,
+            });
+        }
+        let current = loaded_def(pool, tenant, &entity).await?;
+        if let Some(rel) = current
+            .relationships
+            .iter()
+            .find(|r| r.source_field_name == *seg)
+        {
+            // a reference — either the leaf (the id itself) or the next hop
+            let leaf_sql = format!("{alias}.{seg}");
+            if last {
+                return Ok(FieldRef {
+                    sql: leaf_sql,
+                    joins,
+                    hop_entities,
+                    leaf_entity: entity,
+                    leaf_field: (*seg).to_string(),
+                    kind: FieldKind::Fk,
+                });
+            }
+            if i == MAX_HOPS {
+                return Err(Error::Invalid(format!(
+                    "field path '{path}' exceeds {MAX_HOPS} reference hops"
+                )));
+            }
+            let target = loader::load_entity_definition(pool, tenant, rel.target_entity_id).await?;
+            if target.entity.status != "active" {
+                return Err(Error::Invalid(format!(
+                    "entity {} is retired",
+                    target.entity.name
+                )));
+            }
+            let jalias = format!(
+                "j_{}",
+                segments[..=i]
+                    .iter()
+                    .map(|s| sanitize_alias(s))
+                    .collect::<Vec<_>>()
+                    .join("_")
+            );
+            // tenant-safe join: a cross-tenant id can never match (belt and
+            // braces on top of the FK, which already guarantees it).
+            joins.push(format!(
+                "LEFT JOIN biz.{tname} {ja} ON {ja}.id = {alias}.{seg} AND {ja}.tenant_id = t.tenant_id",
+                tname = target.entity.table_name,
+                ja = jalias,
+            ));
+            hop_entities.push(target.entity.name.clone());
+            entity = target.entity.name;
+            table = target.entity.table_name;
+            alias = jalias;
+            continue;
+        }
+        // scalar field on the current entity
+        let d = loaded_def(pool, tenant, &entity).await?;
+        if !last || !d.fields.iter().any(|f| f.name == *seg) {
+            return Err(Error::Invalid(format!("unknown field {path}")));
+        }
+        return Ok(FieldRef {
+            sql: format!("({alias}.attributes->>'{seg}')"),
+            joins,
+            hop_entities,
+            leaf_entity: entity,
+            leaf_field: (*seg).to_string(),
+            kind: FieldKind::Scalar,
+        });
+    }
+    let _ = table;
+    Err(Error::Invalid(format!("unknown field {path}")))
+}
+
+/// Look up one entity's definition by name (loads it uncached; reports resolve
+/// a handful of hops per run, so this stays cheap).
+async fn loaded_def(pool: &PgPool, tenant: Uuid, name: &str) -> Result<EntityDefinition> {
+    let id = loader::entity_id_by_name(pool, tenant, name).await?;
+    loader::load_entity_definition(pool, tenant, id).await
+}
+
+/// Per-hop AuthZ: every crossed entity needs object-level read, and the leaf
+/// field must not be field-level denied on the entity it belongs to.
+fn readable(identity: &Identity, r: &FieldRef) -> bool {
+    for e in &r.hop_entities {
+        if !identity.can(e, "read") {
+            return false;
+        }
+    }
+    identity.field_access(&r.leaf_entity, &r.leaf_field) != Access::None
+}
+
+/// Same check as [`readable`] but **errors** — for filter/group_by/order_by,
+/// where silently dropping the reference would change semantics (§5.17).
+fn require_readable(identity: &Identity, r: &FieldRef, position: &str) -> Result<()> {
+    for e in &r.hop_entities {
+        if !identity.can(e, "read") {
+            return Err(Error::Forbidden(format!(
+                "runner cannot read {e} (crossed by {position} path)"
+            )));
+        }
+    }
+    if identity.field_access(&r.leaf_entity, &r.leaf_field) == Access::None {
+        return Err(Error::Forbidden(format!(
+            "runner cannot read {} used in {}",
+            r.leaf_field, position
+        )));
+    }
+    Ok(())
+}
+
+/// Dedupe join fragments already accumulated (two fields sharing a path prefix
+/// join the same target table once).
+fn merge_joins(acc: &mut Vec<String>, r: &FieldRef) {
+    for j in &r.joins {
+        let key = join_key(j);
+        if !acc.iter().any(|e| join_key(e) == key) {
+            acc.push(j.clone());
+        }
+    }
+}
+
+/// Identity of a join fragment = its alias (unique per path prefix).
+fn join_key(j: &str) -> &str {
+    j.split_whitespace().nth(3).unwrap_or_default()
+}
+
+fn sanitize_alias(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Render a result as CSV (header = columns).
@@ -373,50 +610,6 @@ pub fn from_csv(input: &str) -> Result<ReportResult> {
         rows.push(m);
     }
     Ok(ReportResult { columns, rows })
-}
-
-fn field_expr(def: &EntityDefinition, name: &str) -> String {
-    if def
-        .relationships
-        .iter()
-        .any(|r| r.source_field_name == name)
-    {
-        name.to_string()
-    } else {
-        format!("(attributes->>'{name}')")
-    }
-}
-
-/// Reject aliases that contain characters unsafe in a single-quoted SQL literal.
-fn is_safe_alias(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-fn require_readable(
-    id: &Identity,
-    entity: &str,
-    field: &str,
-    scalar: &HashSet<&str>,
-    fk: &HashSet<&str>,
-    position: &str,
-) -> Result<()> {
-    if !scalar.contains(field) && !fk.contains(field) {
-        return Err(Error::Invalid(format!("unknown field {field}")));
-    }
-    if id.field_access(entity, field) == Access::None {
-        return Err(Error::Forbidden(format!(
-            "runner cannot read {field} used in {position}"
-        )));
-    }
-    Ok(())
-}
-
-fn read_user(s: &RecordScope) -> Option<Uuid> {
-    if s.bypass || s.public_read {
-        None
-    } else {
-        Some(s.user_id)
-    }
 }
 
 #[cfg(test)]

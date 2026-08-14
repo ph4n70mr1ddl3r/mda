@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 mda-core = { workspace = true }
 mda-meta = { workspace = true }
+mda-expression = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

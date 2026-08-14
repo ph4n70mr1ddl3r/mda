@@ -909,7 +909,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - **Record-level**: ownership + team baseline (`sec_owd`), app-layer predicate injection in `mda-data`; tenant isolation via Postgres RLS (§5.4)
 - Effective-context caching (roles/teams) per session
 - Audit logging (`sys_audit_log`) on all writes
-- *Deferred to Phase 6:* criteria-based sharing rules, role hierarchy, materialized `sec_record_share` (§5.11 / ADR-0013) — full record-level security for the runtime UI's list views
+- *Deferred to Phase 6:* criteria-based sharing rules, role hierarchy, materialized `sec_record_share` (§5.11 / ADR-0013) — full record-level security for the runtime UI's list views. **✅ closed (ADR-0026):** criteria rules are materialized with epoch-gated enforcement + synchronous per-record recompute in the write txn; role hierarchy is evaluated live (read-only). One visibility predicate now serves CRUD, lists, GraphQL, reports, notifications, and mass actions.
 - **Deliverable:** Login; role-gated object + field + record access; tenant isolation; full audit trail.
 
 ### Phase 4 — Expression Engine & Rules (Weeks 11–14)
@@ -928,7 +928,15 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Notifications (email/webhook) on state changes via the transactional outbox
 - **Deliverable:** An approval workflow on an "Invoice" entity with state, tasks, and email.
 
-### Phase 6 — Form & View Definitions + Runtime UI (Weeks 17–26)
+### Phase 6 — Form & View Definitions + Runtime UI (Weeks 17–26) — ✅ complete
+> All four definition tables ship (`meta.md_form/md_view/md_dashboard/
+> md_navigation`) with render APIs (`/api/forms/:entity`, `/api/views/:entity`,
+> `/api/dashboards[/:id]`, `/api/navigation`) that resolve against the **active
+> model + the caller's security** (FLS-projected forms/views, permission-
+> filtered navigation, per-caller report runs), and the Leptos Runtime UI
+> renders from them (navigation shell, view-driven grids, form-driven editors
+> with reference pickers, dashboards) on top of the SSE replay + conflict
+> banner. The advanced record security bullet is closed by ADR-0026 above.
 - `md_form`, `md_view`, `md_dashboard`, `md_navigation`
 - `/api/forms/:entity`, `/api/views/:entity` return renderable JSON
 - **Build the Runtime UI** (Leptos): dynamic form renderer, list/grid renderer, dashboard, navigation shell
@@ -936,7 +944,14 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - **Advanced record security (deferred from Phase 3):** criteria-based sharing rules, role hierarchy, and materialized `sec_record_share` with epoch invalidation (§5.11 / ADR-0013) — full record-level security behind list/detail views
 - **Deliverable:** A user logs in, sees a menu, opens a list of Customers, creates/edits via a rendered form, and is alerted in real time when another user edits the same record — all from metadata, zero hardcoded pages.
 
-### Phase 7 — Reporting (Weeks 26–29)
+### Phase 7 — Reporting (Weeks 26–29) — ✅ complete
+> Closed out beyond the original bullet list: report **authoring CRUD**
+> (`/api/reports`), **reference-traversal joins** (`customer_id.name` → real
+> LEFT JOINs over hoisted FK columns, per-hop security), **CSV/HTML/XLSX/PDF
+> renderers** (PDF via a dependency-free PDF-1.4 writer), record-scope parity
+> with the data API, **dashboards that run their reports under the caller**
+> (`/api/dashboards`), and **scheduled delivery** (`config.notify` →
+> `report.completed` notification).
 - `md_report`, datasets, grouping, charts
 - Renderers: HTML table, XLSX, PDF, CSV
 - Scheduled reports via job queue + email delivery

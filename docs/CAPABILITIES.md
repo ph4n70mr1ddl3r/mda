@@ -151,3 +151,72 @@ Remaining, still-deferred (lower priority / tied to other work):
   (merge-by-natural-key with FK id-remapping, idempotent; the model stages as a
   Studio draft). Full record-data export/restore + regional placement stay tied
   to tenant lifecycle.
+
+## UI definitions — forms, views, dashboards, navigation (Phase 6)
+
+`meta.md_form` / `md_view` / `md_dashboard` / `md_navigation` + the render APIs
+that resolve them for the Runtime UI:
+
+- `GET /api/forms/:entity[?name=default]` — renderable form: sections with
+  ordered fields (name, label, type, required, widget, options, and
+  `target_entity` for reference pickers). No stored form → a default synthesized
+  from the field registry (widget inferred from the type). **FLS-projected per
+  caller**: a field the caller cannot read is dropped from the payload.
+  `POST/DELETE /api/forms/:entity[/:name]` author/replace/remove.
+- `GET /api/views/:entity[?name=default]` — renderable grid (columns with
+  labels/types, default filters, sort, page size), FLS-projected; unknown
+  columns are rejected at author time. `POST/DELETE` to manage.
+- Dashboards tile saved reports; `GET /api/dashboards/:id` **runs each report
+  under the requesting identity** (object/field/record security per run — a
+  dashboard is a saved lens, not a stored result set). Broken tiles render an
+  inline `error`, never a 500.
+- `GET /api/navigation` — the caller's menu: entity items are permission-
+  filtered (unreadable entities never appear; authored labels win), external
+  items are http(s) links only. `POST /api/navigation` replaces the set.
+
+The Leptos Runtime UI renders from these endpoints: navigation shell home,
+view-driven grids, form-definition-driven inputs (incl. reference pickers
+resolved from the target entity), and dashboard pages with report tables.
+
+## Sharing rules + role hierarchy (ADR-0013 closed / ADR-0026)
+
+- Criteria-based sharing rules: `sec_share_rule` (bounded-DSL condition,
+  user-or-team principal, read/write) materialized into `sec_record_share` with
+  **epoch-gated enforcement** — a rule edit/deactivate bumps the epoch and
+  revokes instantly; per-record recompute runs **synchronously in the write
+  transaction** (create/update/restore/mass actions), so a record's own grants
+  have zero lag. Resumable keyset re-materialization:
+  `POST /api/admin/share-rules/:id/recompute?from=&limit=`.
+- Role hierarchy: `sec_role_hierarchy` parents (multi-parent OK, cycles
+  rejected), evaluated **live** in the read predicate (ADR-0026) — "see records
+  below me", read-only (never write amplification). Instant revoke on re-parent.
+- One visibility predicate (`owner ∨ manual share ∨ rule share ∨ team-OWD ∨
+  role hierarchy`) is now injected into CRUD, lists, GraphQL, **reports**
+  (previously owner-only — a shared record now appears), notifications' record
+  readers, and mass actions. Share principals match user **or team**.
+- Tenant export/import carries share rules (target-tenant principals only) and
+  the role hierarchy (role-id remapped).
+
+## Reporting completion (Phase 7)
+
+- **Authoring API**: `POST/GET/PATCH/DELETE /api/reports[/:id]` on `md_report`,
+  with author-time base-entity validation.
+- **Reference traversal**: dataset fields/filters/group/order may cross
+  references (`customer_id.name`, ≤3 hops) — compiled to real LEFT JOINs over
+  the hoisted FK columns, with per-hop object + leaf-field security (selects
+  drop unreadable; filter/group/order error). System columns (`id`, `version`,
+  `state`, `owner_id`, `created_at`, `updated_at`) are selectable/filterable.
+- **Renderers**: `GET /api/reports/:id/export?format=csv|html|xlsx|pdf` — CSV
+  (RFC-4180), self-contained HTML, XLSX (`rust_xlsxwriter`, typed cells,
+  autofilter), and a **dependency-free PDF 1.4 writer** (base-14 Courier, exact
+  column layout, paginated with repeated headers).
+- **Scheduled delivery**: a `report` schedule with `config.notify=true`
+  dispatches a `report.completed` notification (§5.18; in-app by default, email
+  per the type's channels) to the running user with the run summary.
+
+## Verification (added in this pass)
+
+DB-backed suites (own fresh database each): `sharing_rules` (5), `ui_defs` (4),
+`reports_api` (5). Unit: renderers (7: html escaping, xlsx zip shape, PDF
+structure/pagination/escaping/empty), sharing rule condition matching (2),
+CSV (8 total incl. prior). Plus the full prior suite green.

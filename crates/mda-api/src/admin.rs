@@ -9,13 +9,14 @@
 //! is the trust root, so only an admin may reshape it. All writes run under the
 //! tenant GUC so the `sec.*` RLS policies engage (fail-closed without it).
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use mda_core::Error;
 use mda_security::{hash_password, set_tenant};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -61,6 +62,25 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/admin/users/:id/roles/:role_id", delete(revoke_role))
         .route("/api/admin/users/:id/password", post(reset_password))
+        // ---- sharing rules (ADR-0013) ----
+        .route(
+            "/api/admin/share-rules",
+            get(list_share_rules).post(create_share_rule),
+        )
+        .route(
+            "/api/admin/share-rules/:id",
+            axum::routing::patch(update_share_rule).delete(delete_share_rule),
+        )
+        .route(
+            "/api/admin/share-rules/:id/recompute",
+            post(recompute_share_rule),
+        )
+        // ---- role hierarchy ----
+        .route("/api/admin/roles/:id/parents", get(list_role_parents))
+        .route(
+            "/api/admin/roles/:id/parents/:parent_id",
+            post(add_role_parent).delete(remove_role_parent),
+        )
 }
 
 // ===== gate =====
@@ -974,4 +994,525 @@ async fn ensure_role_visible(
     } else {
         Err(Error::NotFound(format!("role {id}")).into())
     }
+}
+
+// ===== sharing rules (ADR-0013) =====
+//
+// A criteria-based sharing rule materializes "records matching <condition> are
+// visible to <principal>" into sec_record_share. Per-record recompute is
+// synchronous in the write path (mda-data::sharing); this surface manages the
+// rules themselves:
+//   - CREATE: insert + bounded materialization, NO epoch bump (purely additive
+//     grants can never revoke — ADR-0013 rule 3);
+//   - PATCH (condition/access/principal/active): epoch bump (instant revoke of
+//     everything materialized under the old epoch) + re-materialization;
+//   - DELETE: rule row gone → its shares cascade away instantly;
+//   - POST /recompute: resumable keyset-batched catch-up (from=<last scanned id>)
+//     for rules whose automatic pass hit the bound.
+
+#[derive(Debug, sqlx::FromRow, Serialize)]
+struct ShareRuleRow {
+    id: Uuid,
+    entity: String,
+    condition: serde_json::Value,
+    principal_id: Uuid,
+    access: String,
+    epoch: i64,
+    active: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Deserialize)]
+struct CreateShareRule {
+    entity: String,
+    /// Bounded-DSL condition evaluated against the record (§5.2).
+    condition: serde_json::Value,
+    /// A user id or a team id in this tenant.
+    principal_id: Uuid,
+    /// read | write.
+    access: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateShareRule {
+    condition: Option<serde_json::Value>,
+    principal_id: Option<Uuid>,
+    access: Option<String>,
+    active: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct RecomputeQuery {
+    from: Option<Uuid>,
+    #[serde(default = "default_recompute_limit")]
+    limit: i64,
+}
+fn default_recompute_limit() -> i64 {
+    5000
+}
+const MAX_RECOMPUTE_LIMIT: i64 = 50_000;
+/// Keyset batch size for the recompute scan.
+const RECOMPUTE_BATCH: i64 = 500;
+
+async fn list_share_rules(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> ApiResult<Json<Vec<ShareRuleRow>>> {
+    require_admin(&user)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let rows: Vec<ShareRuleRow> = sqlx::query_as(
+        "SELECT id, entity, condition, principal_id, access, epoch, active, created_at \
+         FROM sec.sec_share_rule ORDER BY entity, created_at, id",
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(Json(rows))
+}
+
+async fn create_share_rule(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Json(body): Json<CreateShareRule>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    require_admin(&user)?;
+    validate_share_rule_body(&st, &user, &body.entity, body.principal_id, &body.access).await?;
+    parse_condition(&body.condition)?;
+    parse_condition(&body.condition)?;
+    let def = crate::data::entity_def(&st, user.tenant_id, &body.entity).await?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let row: ShareRuleRow = sqlx::query_as(
+        "INSERT INTO sec.sec_share_rule (tenant_id, entity, condition, principal_id, access) \
+         VALUES ($1, $2, $3, $4, $5) \
+         RETURNING id, entity, condition, principal_id, access, epoch, active, created_at",
+    )
+    .bind(user.tenant_id)
+    .bind(&body.entity)
+    .bind(&body.condition)
+    .bind(body.principal_id)
+    .bind(&body.access)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    // Additive grant: no epoch bump; materialize what we can within the bound.
+    let stats = materialize_rule(
+        &mut tx,
+        user.tenant_id,
+        &def,
+        &row,
+        None,
+        default_recompute_limit(),
+    )
+    .await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"rule": row, "recompute": stats})),
+    ))
+}
+
+async fn update_share_rule(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateShareRule>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&user)?;
+    if let Some(ref access) = body.access {
+        validate_access(access)?;
+    }
+    if let Some(principal) = body.principal_id {
+        ensure_principal_in_tenant(&st.pool, user.tenant_id, principal).await?;
+    }
+    if let Some(ref cond) = body.condition {
+        parse_condition(cond)?;
+    }
+    // the rule's entity (fixed at create) decides which table to materialize
+    let entity: String = {
+        let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+        set_tenant(&mut tx, user.tenant_id).await?;
+        let e: Option<(String,)> = sqlx::query_as(
+            "SELECT entity FROM sec.sec_share_rule WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(user.tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        tx.commit().await.map_err(Error::internal)?;
+        e.ok_or_else(|| Error::NotFound(format!("share rule {id}")))?
+            .0
+    };
+    let def = crate::data::entity_def(&st, user.tenant_id, &entity).await?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let existing: ShareRuleRow = sqlx::query_as(
+        "SELECT id, entity, condition, principal_id, access, epoch, active, created_at \
+         FROM sec.sec_share_rule WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(user.tenant_id)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(|| Error::NotFound(format!("share rule {id}")))?;
+
+    let changed = body.condition.is_some()
+        || body.principal_id.is_some()
+        || body.access.is_some()
+        || body.active.is_some();
+    let row: ShareRuleRow = sqlx::query_as(
+        "UPDATE sec.sec_share_rule SET condition = $3, principal_id = $4, access = $5, active = $6 \
+         WHERE tenant_id = $1 AND id = $2 \
+         RETURNING id, entity, condition, principal_id, access, epoch, active, created_at",
+    )
+    .bind(user.tenant_id)
+    .bind(id)
+    .bind(body.condition.clone().unwrap_or(existing.condition.clone()))
+    .bind(body.principal_id.unwrap_or(existing.principal_id))
+    .bind(body.access.clone().unwrap_or(existing.access.clone()))
+    .bind(body.active.unwrap_or(existing.active))
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+
+    let stats;
+    if !changed {
+        stats = serde_json::json!({"scanned": 0, "materialized": 0, "truncated": false});
+    } else if !row.active {
+        // Deactivation is a pure narrowing: bump the epoch (instant revoke) and
+        // drop everything this rule materialized. Nothing to re-add.
+        mda_data::bump_epoch(&mut tx, user.tenant_id, id).await?;
+        sqlx::query("DELETE FROM sec.sec_record_share WHERE tenant_id = $1 AND rule_id = $2")
+            .bind(user.tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        stats = serde_json::json!({"scanned": 0, "materialized": 0, "truncated": false});
+    } else {
+        // Edit: revoke-safe — bump the epoch, drop the old rows, re-materialize
+        // under the new epoch (bounded; /recompute continues if truncated).
+        mda_data::bump_epoch(&mut tx, user.tenant_id, id).await?;
+        sqlx::query("DELETE FROM sec.sec_record_share WHERE tenant_id = $1 AND rule_id = $2")
+            .bind(user.tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        stats = materialize_rule(
+            &mut tx,
+            user.tenant_id,
+            &def,
+            &row,
+            None,
+            default_recompute_limit(),
+        )
+        .await?;
+    }
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(Json(serde_json::json!({"rule": row, "recompute": stats})))
+}
+
+async fn delete_share_rule(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    require_admin(&user)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let res = sqlx::query("DELETE FROM sec.sec_share_rule WHERE tenant_id = $1 AND id = $2")
+        .bind(user.tenant_id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    if res.rows_affected() == 0 {
+        return Err(Error::NotFound(format!("share rule {id}")).into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/admin/share-rules/:id/recompute?from=<id>&limit=<n>` — resumable
+/// grant-side catch-up. Revocation never needs this (the epoch gate is
+/// authoritative); this only re-materializes current matches, in keyset order,
+/// reporting the last scanned id so a truncated pass can resume.
+async fn recompute_share_rule(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<Uuid>,
+    Query(q): Query<RecomputeQuery>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&user)?;
+    let limit = q.limit.clamp(1, MAX_RECOMPUTE_LIMIT);
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let row: ShareRuleRow = sqlx::query_as(
+        "SELECT id, entity, condition, principal_id, access, epoch, active, created_at \
+         FROM sec.sec_share_rule WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(user.tenant_id)
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(Error::internal)?
+    .ok_or_else(|| Error::NotFound(format!("share rule {id}")))?;
+    if !row.active {
+        return Err(Error::Invalid("cannot recompute an inactive rule".into()).into());
+    }
+    tx.commit().await.map_err(Error::internal)?;
+    // resolve the entity definition (metadata cache) with the tx closed, then
+    // scan under a fresh transaction
+    let def = crate::data::entity_def(&st, user.tenant_id, &row.entity).await?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let stats = materialize_rule(&mut tx, user.tenant_id, &def, &row, q.from, limit).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(Json(stats))
+}
+
+/// Scan the rule's entity table in keyset batches, evaluating the condition in
+/// the bounded DSL and upserting matching shares at the rule's current epoch.
+/// Additive-only (`ON CONFLICT DO NOTHING`) so a manual share's access level is
+/// never downgraded by a rule.
+async fn materialize_rule(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    def: &mda_meta::EntityDefinition,
+    rule: &ShareRuleRow,
+    from: Option<Uuid>,
+    limit: i64,
+) -> ApiResult<serde_json::Value> {
+    let table = def.entity.table_name.clone();
+    let reg = mda_expression::Registry::new();
+    let expr: mda_expression::Expr = serde_json::from_value(rule.condition.clone())
+        .map_err(|e| Error::Invalid(format!("bad condition: {e}")))?;
+
+    let mut cursor = from;
+    let mut scanned: i64 = 0;
+    let mut materialized: i64 = 0;
+    let mut truncated = false;
+    let mut last_id: Option<Uuid> = None;
+    'outer: loop {
+        let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(&format!(
+            "SELECT t.id, to_jsonb(t.*) FROM biz.{table} t WHERE t.tenant_id = $1 AND ($2::uuid IS NULL OR t.id > $2) ORDER BY t.id LIMIT {RECOMPUTE_BATCH}"
+        ))
+        .bind(tenant)
+        .bind(cursor)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        if rows.is_empty() {
+            break;
+        }
+        for (rid, doc) in rows {
+            scanned += 1;
+            cursor = Some(rid);
+            last_id = Some(rid);
+            let record = mda_data::reconstruct(def, doc);
+            let matches = mda_expression::eval(&expr, &record, &reg)
+                .map(|v| mda_expression::truth(&v))
+                .unwrap_or(false);
+            if matches {
+                sqlx::query(
+                    "INSERT INTO sec.sec_record_share \
+                         (tenant_id, entity, record_id, principal_id, access, rule_id, epoch) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                     ON CONFLICT (tenant_id, record_id, principal_id) DO NOTHING",
+                )
+                .bind(tenant)
+                .bind(&rule.entity)
+                .bind(rid)
+                .bind(rule.principal_id)
+                .bind(&rule.access)
+                .bind(rule.id)
+                .bind(rule.epoch)
+                .execute(&mut **tx)
+                .await
+                .map_err(Error::internal)?;
+                materialized += 1;
+            }
+            if scanned >= limit {
+                truncated = true;
+                break 'outer;
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "scanned": scanned,
+        "materialized": materialized,
+        "truncated": truncated,
+        "last_id": last_id,
+    }))
+}
+
+fn validate_access(access: &str) -> ApiResult<()> {
+    match access {
+        "read" | "write" => Ok(()),
+        other => Err(Error::Invalid(format!("access must be read|write, got {other}")).into()),
+    }
+}
+
+async fn ensure_principal_in_tenant(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    principal: Uuid,
+) -> ApiResult<()> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let user: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM sec.sec_user WHERE id = $1")
+        .bind(principal)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    let team: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM sec.sec_team WHERE id = $1")
+        .bind(principal)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    if user.is_some() || team.is_some() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "principal {principal} is not a user or team in this tenant"
+        ))
+        .into())
+    }
+}
+
+async fn validate_share_rule_body(
+    st: &AppState,
+    user: &mda_security::Identity,
+    entity: &str,
+    principal: Uuid,
+    access: &str,
+) -> ApiResult<()> {
+    validate_access(access)?;
+    ensure_principal_in_tenant(&st.pool, user.tenant_id, principal).await?;
+    // the entity must exist (shares are keyed by API entity name)
+    mda_meta::loader::entity_id_by_name(&st.pool, user.tenant_id, entity).await?;
+    Ok(())
+}
+
+// ===== role hierarchy (ADR-0013/ADR-0026) =====
+//
+// `sec_role_hierarchy(role_id, parent_id)` parents one role under another; a
+// user holding a parent role READS records owned by users in descendant roles
+// ("see records below me"). Evaluation is LIVE (recursive CTE in the record
+// read predicate, mirroring ADR-0025's team hierarchy): a re-parent or role
+// removal is effective on the next query — no materialization, no epoch, no
+// revocation lag at all. Writes are never amplified by hierarchy.
+
+/// `GET /api/admin/roles/:id/parents`
+async fn list_role_parents(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&user)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT r.id, r.name FROM sec.sec_role_hierarchy h \
+         JOIN sec.sec_role r ON r.id = h.parent_id \
+         WHERE h.tenant_id = $1 AND h.role_id = $2 ORDER BY r.name",
+    )
+    .bind(user.tenant_id)
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(Json(serde_json::json!({"role_id": id, "parents": rows})))
+}
+
+/// `POST /api/admin/roles/:id/parents/:parent_id` — parent a role (a role may
+/// have several parents; visibility unions them). Self-parenting and cycles are
+/// rejected (the graph must stay a DAG).
+async fn add_role_parent(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((id, parent_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    require_admin(&user)?;
+    if id == parent_id {
+        return Err(Error::Invalid("a role cannot be its own parent".into()).into());
+    }
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    for role in [id, parent_id] {
+        let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM sec.sec_role WHERE id = $1")
+            .bind(role)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+        if exists.is_none() {
+            return Err(Error::NotFound(format!("role {role}")).into());
+        }
+    }
+    // cycle check: walking UP from parent_id must never reach `id`
+    let hits: Option<(i32,)> = sqlx::query_as(
+        "WITH RECURSIVE up(rid) AS ( \
+            SELECT $2::uuid \
+            UNION ALL \
+            SELECT h.parent_id FROM sec.sec_role_hierarchy h JOIN up ON h.role_id = up.rid) \
+         SELECT 1 WHERE $1::uuid IN (SELECT rid FROM up)",
+    )
+    .bind(id)
+    .bind(parent_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    if hits.is_some() {
+        return Err(Error::Invalid("cycle: that role is already an ancestor".into()).into());
+    }
+    sqlx::query(
+        "INSERT INTO sec.sec_role_hierarchy (tenant_id, role_id, parent_id) VALUES ($1, $2, $3) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user.tenant_id)
+    .bind(id)
+    .bind(parent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(StatusCode::CREATED)
+}
+
+/// `DELETE /api/admin/roles/:id/parents/:parent_id` — detach.
+async fn remove_role_parent(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((id, parent_id)): Path<(Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    require_admin(&user)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, user.tenant_id).await?;
+    let res =
+        sqlx::query("DELETE FROM sec.sec_role_hierarchy WHERE tenant_id = $1 AND role_id = $2 AND parent_id = $3")
+            .bind(user.tenant_id)
+            .bind(id)
+            .bind(parent_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    if res.rows_affected() == 0 {
+        return Err(Error::NotFound(format!("parent {parent_id} of role {id}")).into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Validate that a condition is a parseable bounded-DSL expression.
+fn parse_condition(cond: &serde_json::Value) -> ApiResult<()> {
+    serde_json::from_value::<mda_expression::Expr>(cond.clone())
+        .map_err(|e| Error::Invalid(format!("condition is not a valid expression: {e}")).into())
+        .map(|_| ())
 }

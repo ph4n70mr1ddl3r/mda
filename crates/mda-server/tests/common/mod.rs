@@ -166,3 +166,32 @@ pub async fn seed_assignment(
     .expect("seed_assignment insert");
     tx.commit().await.expect("seed_assignment commit");
 }
+
+/// Deny (or set) a field-level permission for a role (`access`: none|read|write).
+/// Runs under the tenant GUC like the other sec seeders.
+pub async fn seed_field_permission(
+    pool: &sqlx::PgPool,
+    tenant: uuid::Uuid,
+    role_id: uuid::Uuid,
+    entity: &str,
+    field: &str,
+    access: &str,
+) {
+    let mut tx = pool.begin().await.expect("seed_field_permission begin");
+    mda_security::set_tenant(&mut tx, tenant)
+        .await
+        .expect("seed_field_permission set_tenant");
+    sqlx::query(
+        "INSERT INTO sec.sec_field_permission (role_id, entity, field, access)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (role_id, entity, field) DO UPDATE SET access = EXCLUDED.access",
+    )
+    .bind(role_id)
+    .bind(entity)
+    .bind(field)
+    .bind(access)
+    .execute(&mut *tx)
+    .await
+    .expect("seed_field_permission insert");
+    tx.commit().await.expect("seed_field_permission commit");
+}

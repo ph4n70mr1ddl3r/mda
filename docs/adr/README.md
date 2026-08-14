@@ -36,6 +36,7 @@ decision and links back.
 | [0023](0023-metadata-ui-i18n-md_translation.md) | Metadata/UI internationalization (`md_translation`) | Accepted |
 | [0024](0024-graphql-schema-hot-invalidation.md) | GraphQL schema hot-invalidation | Accepted |
 | [0025](0025-team-hierarchy-ancestor-visibility.md) | Team hierarchy: ancestor-team visibility (`sec_team.parent_id`) + admin security API | Accepted |
+| [0026](0026-criteria-sharing-rules-and-live-role-hierarchy.md) | Criteria sharing rules (epoch-gated materialization) + live role hierarchy | Accepted |
 
 ## Status legend
 `Proposed` → `Accepted` → `Deprecated` / `Superseded by ADR-NNNN`.

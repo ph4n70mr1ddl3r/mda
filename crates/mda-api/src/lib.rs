@@ -33,6 +33,7 @@ pub mod secrets;
 pub mod studio;
 pub mod templates;
 pub mod tenants;
+pub mod ui;
 pub mod versioning;
 pub mod webhooks;
 
@@ -90,7 +91,8 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(integrations::routes())
         .merge(observability::routes())
         .merge(schedules::routes())
-        .merge(tenants::routes());
+        .merge(tenants::routes())
+        .merge(ui::routes());
 
     // Layer order (last = outermost): body-limit → security headers → access
     // log/metrics → CORS. CORS is outermost so preflight is answered before

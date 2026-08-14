@@ -1,8 +1,9 @@
 //! Generic CRUD + list over the generated `biz.<table>` tables.
 //!
-//! Record-level security (Phase 3): a [`RecordScope`] injects an ownership/OWD
-//! predicate into every query (never post-filtering — §5.11). Team-OWD and
-//! criteria-based sharing arrive in Phase 6 (ADR-0013); here: owner + public OWD.
+//! Record-level security (Phase 3/§5.11 + ADR-0013): a [`RecordScope`] injects
+//! an ownership/OWD/sharing predicate into every query (never post-filtering).
+//! Composition: owner ∨ manual/rule share (epoch-gated) ∨ team-OWD hierarchy
+//! (ADR-0025) ∨ role hierarchy — see [`sharing`] for the materialization side.
 //!
 //! Writes go to `attributes JSONB` (scalars) + the hoisted reference (FK)
 //! columns; GENERATED columns (unique/indexed) populate themselves. Reads use
@@ -61,14 +62,14 @@ impl RecordScope {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct Filter {
     pub field: String,
     pub op: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct Sort {
     pub field: String,
     pub asc: bool,
@@ -102,19 +103,28 @@ enum ListBind {
 }
 
 /// Read-visibility predicate fragment. Uses placeholders `${u}` for the user
-/// bind and, when team-OWD applies, `${t}` for the team bind. Owner OR public is
-/// already handled by the caller; here: owner OR shared-with-me OR (team-OWD:
-/// owner is a member of my team **or a descendant team**). Returns None when the
-/// scope grants broad read (bypass / public_read) — no row filter needed.
-///
-/// The team clause walks the `sec_team.parent_id` tree DOWNWARD from the
-/// viewer's team (`${t}`), so a member of an ancestor (manager) team reads
-/// records owned by members of any descendant team. Flat (no `parent_id` set)
-/// collapses to same-team-only: the recursive descent yields just `${t}`.
-fn read_predicate(s: &RecordScope) -> Option<String> {
+/// bind and, when the viewer has a team, `${t}` for the team bind. Composition
+/// per ADR-0013 (enforcement layering):
+///   owner ∨ manual/rule share ∨ team-OWD ∨ role hierarchy — all **live**.
+/// Rule-derived shares carry an **epoch gate**: honored only while the row's
+/// epoch equals the rule's current epoch and the rule is active, so bumping
+/// `sec_share_rule.epoch` instantly revokes every share materialized under the
+/// old epoch (revoke-safe invalidation). Share principals may be a user **or
+/// the viewer's team**. The team-OWD clause walks the `sec_team.parent_id`
+/// tree DOWNWARD from the viewer's team (ADR-0025), and the role-hierarchy
+/// clause walks `sec_role_hierarchy` downward from the viewer's roles ("see
+/// records below me", read-only — mirroring the team-OWD write rule).
+/// Returns None when the scope grants broad read (bypass / public_read) — no
+/// row filter needed.
+pub fn read_predicate(s: &RecordScope) -> Option<String> {
     if s.bypass || s.public_read {
         return None;
     }
+    let team_principal = if s.team_id.is_some() {
+        " OR rs.principal_id = ${t}"
+    } else {
+        ""
+    };
     let team_clause = if s.team_owd && s.team_id.is_some() {
         " OR EXISTS (\
            WITH RECURSIVE descendant_teams(tid) AS (\
@@ -132,21 +142,51 @@ fn read_predicate(s: &RecordScope) -> Option<String> {
         "(t.owner_id = ${{u}} \
           OR EXISTS (SELECT 1 FROM sec.sec_record_share rs \
            WHERE rs.tenant_id = t.tenant_id AND rs.record_id = t.id \
-             AND rs.principal_id = ${{u}} AND rs.access IN ('read','write')){team_clause})"
+             AND (rs.principal_id = ${{u}}{team_principal}) \
+             AND rs.access IN ('read','write') \
+             AND (rs.rule_id IS NULL \
+                  OR rs.epoch = (SELECT r.epoch FROM sec.sec_share_rule r \
+                                 WHERE r.id = rs.rule_id AND r.active))){team_clause} \
+          OR EXISTS (\
+           WITH RECURSIVE sub_roles(rid) AS (\
+                SELECT a.role_id FROM sec.sec_role_assignment a \
+                  JOIN sec.sec_role r ON r.id = a.role_id AND r.tenant_id = t.tenant_id \
+                 WHERE a.user_id = ${{u}} \
+                UNION \
+                SELECT h.role_id FROM sec.sec_role_hierarchy h \
+                  JOIN sub_roles d ON h.parent_id = d.rid \
+                 WHERE h.tenant_id = t.tenant_id) \
+           SELECT 1 FROM sec.sec_user o \
+             JOIN sec.sec_role_assignment oa ON oa.user_id = o.id \
+            WHERE o.id = t.owner_id AND o.tenant_id = t.tenant_id \
+              AND oa.role_id IN (SELECT rid FROM sub_roles)))"
     ))
 }
 
-/// Write predicate: owner OR shared-with-write-access. Team-OWD grants read
-/// only (mirrors `PublicRead`), so write never adds a team clause.
-fn write_predicate(s: &RecordScope) -> Option<String> {
+/// Write predicate: owner OR shared-with-write (manual or rule-derived under
+/// the same epoch gate; the principal may be the viewer's team). Team-OWD and
+/// role hierarchy grant **read only** (mirroring `PublicRead`), so neither adds
+/// a write clause.
+pub fn write_predicate(s: &RecordScope) -> Option<String> {
     if s.bypass || s.public_write {
         None
     } else {
+        let team_principal = if s.team_id.is_some() {
+            " OR rs.principal_id = ${t}"
+        } else {
+            ""
+        };
         Some(
             "(t.owner_id = ${u} OR EXISTS (SELECT 1 FROM sec.sec_record_share rs \
               WHERE rs.tenant_id = t.tenant_id AND rs.record_id = t.id \
-                AND rs.principal_id = ${u} AND rs.access = 'write'))"
-                .to_string(),
+                AND (rs.principal_id = ${u}"
+                .to_string()
+                + team_principal
+                + ") \
+                AND rs.access = 'write' \
+                AND (rs.rule_id IS NULL \
+                     OR rs.epoch = (SELECT r.epoch FROM sec.sec_share_rule r \
+                                    WHERE r.id = rs.rule_id AND r.active))))",
         )
     }
 }
@@ -154,9 +194,8 @@ fn write_predicate(s: &RecordScope) -> Option<String> {
 /// Substitute a predicate fragment's `{u}` (and optional `{t}`) placeholders
 /// with absolute `$n` indices starting at `start`, returning the rendered SQL
 /// and the ordered Uuid bind values. The team bind is added only when the
-/// fragment carries a `{t}` placeholder (i.e. team-OWD applies *and* the scope
-/// has a team).
-fn pred_render(pred: &str, scope: &RecordScope, start: usize) -> (String, Vec<Uuid>) {
+/// fragment carries a `{t}` placeholder and the scope has a team.
+pub fn pred_render(pred: &str, scope: &RecordScope, start: usize) -> (String, Vec<Uuid>) {
     let mut binds = vec![scope.user_id];
     let mut out = pred.replace("{u}", &start.to_string());
     if out.contains("{t}") {
@@ -260,6 +299,24 @@ pub async fn create(
         q = q.bind(v);
     }
     q.execute(&mut *tx).await.map_err(Error::internal)?;
+    // ADR-0013: materialize this record's criteria-sharing-rule grants
+    // synchronously in the write transaction (the per-record recompute step).
+    let (doc,): (Value,) = sqlx::query_as(&format!(
+        "SELECT to_jsonb(t.*) FROM biz.{} t WHERE t.id = $1",
+        def.entity.table_name
+    ))
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    crate::sharing::recompute_record(
+        &mut tx,
+        tenant,
+        &def.entity.name,
+        id,
+        &reconstruct(def, doc),
+    )
+    .await?;
     tx.commit().await.map_err(Error::internal)?;
 
     read(pool, tenant, def, id, &RecordScope::superuser(owner)).await
@@ -356,9 +413,11 @@ pub async fn update(
         format!("t.tenant_id = ${}", binds.len() + 2),
         format!("t.version = ${}", binds.len() + 3),
     ];
+    let mut rp_binds: Vec<Uuid> = Vec::new();
     if let Some(ref p) = &rp {
-        let idx = binds.len() + 4;
-        where_parts.push(p.replace("{u}", &idx.to_string()));
+        let (frag, pb) = pred_render(p, scope, binds.len() + 4);
+        where_parts.push(frag);
+        rp_binds = pb;
     }
     let sql = format!(
         "UPDATE biz.{} AS t SET {} WHERE {} RETURNING to_jsonb(t.*) AS doc",
@@ -376,14 +435,21 @@ pub async fn update(
         };
     }
     q = q.bind(id).bind(tenant).bind(expected_version);
-    if rp.is_some() {
-        q = q.bind(scope.user_id);
+    for b in &rp_binds {
+        q = q.bind(*b);
     }
 
     let mut tx = pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, tenant).await?;
     let result = match q.fetch_optional(&mut *tx).await.map_err(Error::internal)? {
-        Some((doc,)) => Ok(reconstruct(def, doc)),
+        Some((doc,)) => {
+            let rec = reconstruct(def, doc);
+            // ADR-0013: synchronous per-record share recompute — inside the
+            // write transaction, so a record's own shares are always fresh
+            // immediately after its write (no per-record revocation lag).
+            crate::sharing::recompute_record(&mut tx, tenant, &def.entity.name, id, &rec).await?;
+            Ok(rec)
+        }
         None => distinguish_not_found_or_conflict(&mut tx, def, tenant, id, scope).await,
     };
     tx.commit().await.map_err(Error::internal)?;
@@ -415,14 +481,17 @@ async fn distinguish_not_found_or_conflict(
                 "SELECT 1 FROM biz.{} t WHERE t.id = $1 AND t.tenant_id = $2",
                 def.entity.table_name
             );
+            let mut rp_binds: Vec<Uuid> = Vec::new();
             if let Some(ref p) = &rp {
-                sql.push_str(&format!(" AND {}", p.replace("{u}", "3")));
+                let (frag, pb) = pred_render(p, scope, 3);
+                sql.push_str(&format!(" AND {}", frag));
+                rp_binds = pb;
             }
             let mut q = sqlx::query_as::<_, (i32,)>(sql.as_str())
                 .bind(id)
                 .bind(tenant);
-            if rp.is_some() {
-                q = q.bind(scope.user_id);
+            for b in rp_binds {
+                q = q.bind(b);
             }
             let writable: Option<(i32,)> =
                 q.fetch_optional(&mut **tx).await.map_err(Error::internal)?;
@@ -449,19 +518,28 @@ pub async fn delete(
     ensure_active(def)?;
     let rp = write_predicate(scope);
     let mut sql = format!(
-        "DELETE FROM biz.{} WHERE id = $1 AND tenant_id = $2",
+        "DELETE FROM biz.{} AS t WHERE t.id = $1 AND t.tenant_id = $2",
         def.entity.table_name
     );
+    let mut rp_binds: Vec<Uuid> = Vec::new();
     if let Some(ref p) = &rp {
-        sql.push_str(&format!(" AND {}", p.replace("{u}", "3")));
+        let (frag, pb) = pred_render(p, scope, 3);
+        sql.push_str(&format!(" AND {}", frag));
+        rp_binds = pb;
     }
     let mut q = sqlx::query(&sql).bind(id).bind(tenant);
-    if rp.is_some() {
-        q = q.bind(scope.user_id);
+    for b in &rp_binds {
+        q = q.bind(*b);
     }
     let mut tx = pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, tenant).await?;
     let res = q.execute(&mut *tx).await.map_err(Error::internal)?;
+    if res.rows_affected() > 0 {
+        // Hard delete (the row is archived by trigger, ADR-0006): drop the
+        // materialized visibility rows too — sec_record_share has no FK to
+        // dynamic biz.* tables, so cleanup is explicit.
+        crate::sharing::drop_record_shares(&mut tx, tenant, id).await?;
+    }
     tx.commit().await.map_err(Error::internal)?;
     if res.rows_affected() == 0 {
         return Err(Error::NotFound(format!("record {id}")));
@@ -841,12 +919,26 @@ pub async fn restore(
         .fetch_optional(&mut *tx)
         .await
         .map_err(Error::internal)?;
+    if let Some((doc,)) = &row {
+        // Restoring a record re-materializes its rule-derived visibility
+        // (ADR-0013) — the archived row's shares were dropped at delete time.
+        crate::sharing::recompute_record(
+            &mut tx,
+            tenant,
+            &def.entity.name,
+            id,
+            &reconstruct(def, doc.clone()),
+        )
+        .await?;
+    }
     tx.commit().await.map_err(Error::internal)?;
     let (doc,) = row.ok_or_else(|| Error::NotFound(format!("archived record {id}")))?;
     Ok(reconstruct(def, doc))
 }
 
-fn reconstruct(def: &EntityDefinition, doc: Value) -> Value {
+/// Flatten a `to_jsonb(t.*)` row into the record shape (system columns +
+/// attributes + FK columns) that rules / sharing conditions evaluate against.
+pub fn reconstruct(def: &EntityDefinition, doc: Value) -> Value {
     let Some(obj) = doc.as_object() else {
         return doc;
     };

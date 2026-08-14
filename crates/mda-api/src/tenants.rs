@@ -85,6 +85,18 @@ async fn export_tenant(
     .await;
     let owd = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM sec.sec_owd t").await;
     let teams = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM sec.sec_team t").await;
+    let share_rules = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM sec.sec_share_rule t").await;
+    let role_hierarchy = table_json(
+        &mut tx,
+        "SELECT to_jsonb(t.*) FROM sec.sec_role_hierarchy t",
+    )
+    .await;
+
+    // UI definitions (Phase 6): forms, views, dashboards, navigation.
+    let forms = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM meta.md_form t").await;
+    let views = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM meta.md_view t").await;
+    let dashboards = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM meta.md_dashboard t").await;
+    let navigation = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM meta.md_navigation t").await;
 
     // Integration definitions.
     let connectors = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM int.connector t").await;
@@ -110,11 +122,19 @@ async fn export_tenant(
             "field_permissions": field_permissions,
             "owd": owd,
             "teams": teams,
+            "share_rules": share_rules,
+            "role_hierarchy": role_hierarchy,
         },
         "integrations": {
             "connectors": connectors,
             "flows": flows,
             "value_maps": value_maps,
+        },
+        "ui": {
+            "forms": forms,
+            "views": views,
+            "dashboards": dashboards,
+            "navigation": navigation,
         },
     })))
 }
@@ -239,6 +259,7 @@ async fn import_tenant(
 
     let security = bundle.get("security").cloned().unwrap_or(Value::Null);
     let integrations = bundle.get("integrations").cloned().unwrap_or(Value::Null);
+    let ui = bundle.get("ui").cloned().unwrap_or(Value::Null);
 
     // FK-target id maps: bundle id → actual id in this tenant (existing row when
     // the natural key already existed, else the bundle id after a fresh insert).
@@ -284,6 +305,19 @@ async fn import_tenant(
     )
     .await?;
 
+    let n_share_rules = restore_share_rules(&mut tx, tenant, arr(&security, "share_rules")).await?;
+    let n_role_hierarchy =
+        restore_role_hierarchy(&mut tx, tenant, arr(&security, "role_hierarchy"), &role_map)
+            .await?;
+
+    let n_forms =
+        restore_ui_entity_rows(&mut tx, tenant, arr(&ui, "forms"), "meta.md_form").await?;
+    let n_views =
+        restore_ui_entity_rows(&mut tx, tenant, arr(&ui, "views"), "meta.md_view").await?;
+    let n_dashboards =
+        restore_dashboards(&mut tx, tenant, arr(&ui, "dashboards"), &report_map).await?;
+    let n_navigation = restore_navigation(&mut tx, tenant, arr(&ui, "navigation")).await?;
+
     let n_schedules = restore_schedules(
         &mut tx,
         tenant,
@@ -312,6 +346,12 @@ async fn import_tenant(
             "translations": n_translations,
             "connectors": n_connectors,
             "value_maps": n_value_maps,
+            "share_rules": n_share_rules,
+            "role_hierarchy": n_role_hierarchy,
+            "forms": n_forms,
+            "views": n_views,
+            "dashboards": n_dashboards,
+            "navigation": n_navigation,
             "flows": n_flows,
         },
         "note": "model staged as a Studio draft; POST /api/studio/drafts/:id/publish to materialize biz tables",
@@ -1012,6 +1052,246 @@ async fn restore_schedules(
         .bind(cron)
         .bind(enabled)
         .bind(running_user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Restore sharing rules (ADR-0013). A rule is id-stable security config; the
+/// principal (user or team) must already exist in the target tenant — a rule
+/// naming a user from the source tenant is skipped (inert, never leaky) since
+/// users are deliberately never imported.
+async fn restore_share_rules(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    rows: &[Value],
+) -> Result<usize> {
+    let mut n = 0;
+    for r in rows {
+        let id = j_uuid(r, "id")?;
+        let entity = j_str(r, "entity")?;
+        let principal = j_uuid(r, "principal_id")?;
+        let user: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM sec.sec_user WHERE id = $1")
+            .bind(principal)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+        let team: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM sec.sec_team WHERE id = $1")
+            .bind(principal)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+        if user.is_none() && team.is_none() {
+            continue; // principal not present in this tenant — skip
+        }
+        let condition = r.get("condition").cloned().unwrap_or(Value::Null);
+        let access = j_str(r, "access")?;
+        let active = j_bool(r, "active", true);
+        let epoch: i64 = r.get("epoch").and_then(|e| e.as_i64()).unwrap_or(1);
+        sqlx::query(
+            "INSERT INTO sec.sec_share_rule
+                (id, tenant_id, entity, condition, principal_id, access, epoch, active)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (id) DO UPDATE SET entity = EXCLUDED.entity,
+                 condition = EXCLUDED.condition, principal_id = EXCLUDED.principal_id,
+                 access = EXCLUDED.access, epoch = EXCLUDED.epoch, active = EXCLUDED.active",
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(entity)
+        .bind(&condition)
+        .bind(principal)
+        .bind(access)
+        .bind(epoch)
+        .bind(active)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Restore the role hierarchy, remapping both role ids through the role map
+/// (pairs naming a role absent from the bundle+target are skipped).
+async fn restore_role_hierarchy(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    rows: &[Value],
+    role_map: &HashMap<Uuid, Uuid>,
+) -> Result<usize> {
+    let mut n = 0;
+    for r in rows {
+        let Some(role) = j_opt_uuid(r, "role_id").map(|id| remap(role_map, id)) else {
+            continue;
+        };
+        let Some(parent) = j_opt_uuid(r, "parent_id").map(|id| remap(role_map, id)) else {
+            continue;
+        };
+        if role == parent {
+            continue;
+        }
+        let res = sqlx::query(
+            "INSERT INTO sec.sec_role_hierarchy (tenant_id, role_id, parent_id)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(role)
+        .bind(parent)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        n += res.rows_affected() as usize;
+    }
+    Ok(n)
+}
+
+/// Restore md_form / md_view rows (natural key: entity + name).
+async fn restore_ui_entity_rows(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    rows: &[Value],
+    table: &str,
+) -> Result<usize> {
+    let mut n = 0;
+    for r in rows {
+        let id = j_uuid(r, "id")?;
+        let entity = j_str(r, "entity")?;
+        let name = j_str(r, "name")?;
+        let label: Option<&str> = r.get("label").and_then(|x| x.as_str());
+        let active = j_bool(r, "active", true);
+        // column sets differ per table (forms carry `layout`; views carry the
+        // list shape) — table is a literal chosen here, never user input
+        if table == "meta.md_form" {
+            let layout = r.get("layout").cloned().unwrap_or(Value::Null);
+            sqlx::query(
+                "INSERT INTO meta.md_form (id, tenant_id, entity, name, label, layout, active) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (tenant_id, entity, name) DO UPDATE SET \
+                     label = EXCLUDED.label, layout = EXCLUDED.layout, \
+                     active = EXCLUDED.active, updated_at = now()",
+            )
+            .bind(id)
+            .bind(tenant)
+            .bind(entity)
+            .bind(name)
+            .bind(label)
+            .bind(&layout)
+            .bind(active)
+            .execute(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+        } else {
+            let columns = r.get("columns").cloned().unwrap_or(Value::Null);
+            let filters = r.get("filters").cloned().unwrap_or(Value::Null);
+            let sort = r.get("sort").cloned().unwrap_or(Value::Null);
+            let page_size: Option<i32> = r
+                .get("page_size")
+                .and_then(|x| x.as_i64())
+                .map(|v| v as i32);
+            sqlx::query(
+                "INSERT INTO meta.md_view (id, tenant_id, entity, name, label, columns, filters, sort, page_size, active) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                 ON CONFLICT (tenant_id, entity, name) DO UPDATE SET \
+                     label = EXCLUDED.label, columns = EXCLUDED.columns, \
+                     filters = EXCLUDED.filters, sort = EXCLUDED.sort, \
+                     page_size = EXCLUDED.page_size, active = EXCLUDED.active, \
+                     updated_at = now()",
+            )
+            .bind(id)
+            .bind(tenant)
+            .bind(entity)
+            .bind(name)
+            .bind(label)
+            .bind(&columns)
+            .bind(&filters)
+            .bind(&sort)
+            .bind(page_size)
+            .bind(active)
+            .execute(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+        }
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Restore dashboards (natural key: name), remapping tile report ids through
+/// the report map so a dashboard survives re-import into a tenant whose
+/// reports were merged under new ids.
+async fn restore_dashboards(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    rows: &[Value],
+    report_map: &HashMap<Uuid, Uuid>,
+) -> Result<usize> {
+    let mut n = 0;
+    for r in rows {
+        let id = j_uuid(r, "id")?;
+        let name = j_str(r, "name")?;
+        let label: Option<&str> = r.get("label").and_then(|x| x.as_str());
+        let active = j_bool(r, "active", true);
+        let mut items = r.get("items").cloned().unwrap_or_else(|| json!([]));
+        if let Some(tiles) = items.as_array_mut() {
+            for tile in tiles {
+                if let Some(rid) = tile.get("report_id").and_then(|x| x.as_str()) {
+                    if let Ok(parsed) = Uuid::parse_str(rid) {
+                        tile["report_id"] = json!(remap(report_map, parsed).to_string());
+                    }
+                }
+            }
+        }
+        sqlx::query(
+            "INSERT INTO meta.md_dashboard (id, tenant_id, name, label, items, active)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (tenant_id, name) DO UPDATE SET
+                 label = EXCLUDED.label, items = EXCLUDED.items,
+                 active = EXCLUDED.active, updated_at = now()",
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(name)
+        .bind(label)
+        .bind(&items)
+        .bind(active)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Restore navigation sets (natural key: name).
+async fn restore_navigation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    rows: &[Value],
+) -> Result<usize> {
+    let mut n = 0;
+    for r in rows {
+        let id = j_uuid(r, "id")?;
+        let name = j_str(r, "name")?;
+        let label: Option<&str> = r.get("label").and_then(|x| x.as_str());
+        let active = j_bool(r, "active", true);
+        let items = r.get("items").cloned().unwrap_or_else(|| json!([]));
+        sqlx::query(
+            "INSERT INTO meta.md_navigation (id, tenant_id, name, label, items, active)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (tenant_id, name) DO UPDATE SET
+                 label = EXCLUDED.label, items = EXCLUDED.items,
+                 active = EXCLUDED.active, updated_at = now()",
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(name)
+        .bind(label)
+        .bind(&items)
+        .bind(active)
         .execute(&mut **tx)
         .await
         .map_err(Error::internal)?;

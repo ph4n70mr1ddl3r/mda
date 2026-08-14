@@ -14,8 +14,10 @@
 pub mod coerce;
 pub mod crud;
 pub mod ddl;
+pub mod sharing;
 
 pub use crud::{
-    create, delete, list, mass_target_ids, read, restore, update, Filter, ListParams, ListResult,
-    RecordScope, Sort,
+    create, delete, list, mass_target_ids, pred_render, read, read_predicate, reconstruct, restore,
+    update, write_predicate, Filter, ListParams, ListResult, RecordScope, Sort,
 };
+pub use sharing::{bump_epoch, drop_record_shares, load_rules, recompute_record, ShareRule};

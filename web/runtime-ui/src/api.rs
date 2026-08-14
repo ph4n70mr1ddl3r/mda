@@ -211,3 +211,147 @@ pub fn local_remove(key: &str) {
         }
     }
 }
+
+// ===== UI definitions (Phase 6): navigation, views, forms, dashboards =====
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct NavItem {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub entity: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    pub label: String,
+}
+
+pub async fn get_navigation(token: &str) -> Result<Vec<NavItem>, String> {
+    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/navigation"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    serde_json::from_value(body["items"].clone()).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct ViewColumn {
+    pub field: String,
+    pub label: String,
+    #[serde(default)]
+    pub r#type: String,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct ViewInfo {
+    pub columns: Vec<ViewColumn>,
+}
+
+/// The default list-view definition (None when the API has no view — the
+/// caller falls back to the raw model fields).
+pub async fn get_view(token: &str, entity: &str) -> Result<Option<ViewInfo>, String> {
+    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/views/{entity}"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Ok(None);
+    }
+    resp.json::<ViewInfo>().await.map(Some).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct FormField {
+    pub name: String,
+    pub label: String,
+    #[serde(rename = "type", default)]
+    pub field_type: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub widget: String,
+    #[serde(default)]
+    pub options: serde_json::Value,
+    #[serde(default)]
+    pub target_entity: Option<String>,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct FormSection {
+    pub title: Option<String>,
+    pub fields: Vec<FormField>,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct FormInfo {
+    pub label: serde_json::Value,
+    pub sections: Vec<FormSection>,
+}
+
+pub async fn get_form(token: &str, entity: &str) -> Result<Option<FormInfo>, String> {
+    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/forms/{entity}"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Ok(None);
+    }
+    resp.json::<FormInfo>().await.map(Some).map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct DashSummary {
+    pub id: String,
+    pub name: String,
+    pub label: String,
+}
+
+pub async fn list_dashboards(token: &str) -> Result<Vec<DashSummary>, String> {
+    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/dashboards"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Ok(vec![]);
+    }
+    resp.json::<Vec<DashSummary>>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct DashTile {
+    pub title: serde_json::Value,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub result: Option<ReportResult>,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct ReportResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize, Clone, serde::Serialize)]
+pub struct DashboardInfo {
+    pub id: String,
+    pub label: String,
+    pub items: Vec<DashTile>,
+}
+
+pub async fn get_dashboard(token: &str, id: &str) -> Result<DashboardInfo, String> {
+    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/dashboards/{id}"))
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    resp.json::<DashboardInfo>()
+        .await
+        .map_err(|e| e.to_string())
+}

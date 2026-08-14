@@ -1,6 +1,12 @@
 //! MDA Runtime UI — metadata-driven Leptos CSR app (Phase 6).
-//! Login → entity menu → list → form (create/edit) with a real-time conflict
-//! banner over the SSE event channel.
+//! Login → navigation shell → list (view definitions) → form (form
+//! definitions) with a real-time conflict banner over the SSE event channel,
+//! plus dashboards that run their reports under the logged-in user.
+//!
+//! Everything renders from server-resolved metadata (`/api/navigation`,
+//! `/api/views/:entity`, `/api/forms/:entity`, `/api/dashboards`) — the server
+//! applies the caller's object/field security when resolving, so the client
+//! never has to (and never can) widen it.
 
 mod api;
 
@@ -11,7 +17,10 @@ use std::rc::Rc;
 use leptos::*;
 use wasm_bindgen::{closure::Closure, JsCast};
 
-use api::{local_get, local_remove, local_set, EntityInfo, ModelInfo};
+use api::{
+    local_get, local_remove, local_set, DashSummary, EntityInfo, FormField, FormSection,
+    ListResult, ModelInfo, NavItem, ReportResult, ViewColumn,
+};
 
 /// Owns an SSE `EventSource` and its `onmessage` closure for a record form, so
 /// both can be dropped (→ connection closed) when the form unmounts.
@@ -31,6 +40,10 @@ pub struct AppState {
     pub token: RwSignal<Option<String>>,
     pub page: RwSignal<Page>,
     pub model: RwSignal<Option<ModelInfo>>,
+    /// The permission-filtered navigation tree (`/api/navigation`).
+    pub nav: RwSignal<Vec<NavItem>>,
+    /// Available dashboards (`/api/dashboards`).
+    pub dashboards: RwSignal<Vec<DashSummary>>,
     /// Bumped after a create/update/delete so list views refetch on return
     /// (doesn't rely on SPA component remount to pick up changes).
     pub refresh: RwSignal<u64>,
@@ -38,7 +51,8 @@ pub struct AppState {
 
 #[derive(Clone, PartialEq)]
 pub enum Page {
-    Dashboard,
+    Home,
+    Dashboard(String),
     List(String),
     /// Edit an existing record (Some id) or create one (None).
     Form {
@@ -52,24 +66,36 @@ pub enum Page {
 #[component]
 pub fn App() -> impl IntoView {
     let token = create_rw_signal(local_get("mda_token"));
-    let page = create_rw_signal(Page::Dashboard);
+    let page = create_rw_signal(Page::Home);
     let model = create_rw_signal(None);
+    let nav = create_rw_signal(Vec::new());
+    let dashboards = create_rw_signal(Vec::new());
     let refresh = create_rw_signal(0u64);
     let state = AppState {
         token,
         page,
         model,
+        nav,
+        dashboards,
         refresh,
     };
     provide_context(state);
 
     let token_for_effect = token;
     let model_for_effect = model;
+    let nav_for_effect = nav;
+    let dash_for_effect = dashboards;
     create_effect(move |_| {
         if let Some(t) = token_for_effect.get() {
             spawn_local(async move {
                 if let Ok(m) = api::get_model(&t).await {
                     model_for_effect.set(Some(m));
+                }
+                if let Ok(items) = api::get_navigation(&t).await {
+                    nav_for_effect.set(items);
+                }
+                if let Ok(d) = api::list_dashboards(&t).await {
+                    dash_for_effect.set(d);
                 }
             });
         }
@@ -77,9 +103,13 @@ pub fn App() -> impl IntoView {
 
     let state = use_context::<AppState>().unwrap();
     view! {
-        <div style="font-family: system-ui, sans-serif; max-width: 900px; margin: 1rem auto;">
+        <div style="font-family: system-ui, sans-serif; max-width: 1100px; margin: 1rem auto;">
             <header style="display:flex; justify-content:space-between; align-items:center; padding:0.5rem 0; border-bottom:1px solid #ccc;">
-                <strong style="font-size:1.2rem;">"MDA"</strong>
+                <strong
+                    style="font-size:1.2rem; cursor:pointer;"
+                    on:click=move |_: leptos::ev::MouseEvent| state.page.set(Page::Home)>
+                    "MDA"
+                </strong>
                 {move || if state.token.get().is_some() {
                     let s = state;
                     view! {
@@ -87,7 +117,10 @@ pub fn App() -> impl IntoView {
                             on:click=move |_: leptos::ev::MouseEvent| {
                                 local_remove("mda_token");
                                 s.token.set(None);
-                                s.page.set(Page::Dashboard);
+                                s.page.set(Page::Home);
+                                s.nav.set(Vec::new());
+                                s.dashboards.set(Vec::new());
+                                s.model.set(None);
                             }>
                             "Logout"
                         </button>
@@ -101,7 +134,8 @@ pub fn App() -> impl IntoView {
                         view! { <Login/> }.into_view()
                     } else {
                         match s.page.get() {
-                            Page::Dashboard => view! { <Dashboard/> }.into_view(),
+                            Page::Home => view! { <Home/> }.into_view(),
+                            Page::Dashboard(id) => view! { <DashboardView id/> }.into_view(),
                             Page::List(name) => view! { <EntityList entity=name/> }.into_view(),
                             Page::Form { entity, id } => {
                                 view! { <RecordForm entity id/> }.into_view()
@@ -155,7 +189,13 @@ fn Login() -> impl IntoView {
                                 if let Ok(m) = api::get_model(&token).await {
                                     s.model.set(Some(m));
                                 }
-                                s.page.set(Page::Dashboard);
+                                if let Ok(items) = api::get_navigation(&token).await {
+                                    s.nav.set(items);
+                                }
+                                if let Ok(d) = api::list_dashboards(&token).await {
+                                    s.dashboards.set(d);
+                                }
+                                s.page.set(Page::Home);
                             }
                             Err(err) => set_error.set(err),
                         }
@@ -174,57 +214,198 @@ fn Login() -> impl IntoView {
     }
 }
 
-// ===== dashboard =====
+// ===== home: navigation shell + dashboards =====
 
 #[component]
-fn Dashboard() -> impl IntoView {
+fn Home() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let s = state;
     view! {
         <div>
-            <h2>"Entities"</h2>
-            <For each=move || s.model.get().map(|m| m.entities).unwrap_or_default()
-                 key=|e| e.name.clone()
-                 children=move |e: EntityInfo| {
+            <h2>"Home"</h2>
+
+            <h3>"Navigation"</h3>
+            <For each=move || s.nav.get()
+                 key=|i| format!("{}-{}-{}", i.kind, i.label, i.url.clone().unwrap_or_default())
+                 children=move |item: NavItem| {
                      let s2 = s;
-                     let name = e.name.clone();
-                     let label = e.label.clone().unwrap_or_else(|| name.clone());
-                     let count = e.fields.len();
-                     view! {
-                         <div style="padding:8px; margin:4px 0; border:1px solid #ddd; border-radius:4px; cursor:pointer;"
-                             on:click=move |_: leptos::ev::MouseEvent| {
-                                 s2.page.set(Page::List(name.clone()));
-                             }>
-                             <strong>{label}</strong>
-                             <span style="color:#888; margin-left:8px;">
-                                 {format!("{} fields", count)}
-                             </span>
-                         </div>
+                     match item.kind.as_str() {
+                         "entity" => {
+                             let entity = item.entity.clone().unwrap_or_default();
+                             view! {
+                                 <div style="padding:8px; margin:4px 0; border:1px solid #ddd; border-radius:4px; cursor:pointer;"
+                                     on:click=move |_: leptos::ev::MouseEvent| {
+                                         s2.page.set(Page::List(entity.clone()));
+                                     }>
+                                     <strong>{item.label.clone()}</strong>
+                                 </div>
+                             }.into_view()
+                         }
+                         _ => {
+                             let url = item.url.clone().unwrap_or_default();
+                             view! {
+                                 <div style="padding:8px; margin:4px 0; border:1px solid #ddd; border-radius:4px;">
+                                     <a href=url.clone() target="_blank" rel="noopener noreferrer">{item.label.clone()}</a>
+                                 </div>
+                             }.into_view()
+                         }
                      }
                  }/>
+
             {move || {
-                let empty = s.model.get().map(|m| m.entities.is_empty()).unwrap_or(true);
-                if empty { view!{ <p style="color:#888;">"No entities published yet."</p> }.into_view() }
-                else { ().into_view() }
+                let d = s.dashboards.get();
+                if d.is_empty() { ().into_view() }
+                else {
+                    view! {
+                        <h3 style="margin-top:1.5rem;">"Dashboards"</h3>
+                        <For each=move || s.dashboards.get()
+                             key=|d| d.id.clone()
+                             children=move |d: DashSummary| {
+                                 let s2 = s;
+                                 view! {
+                                     <div style="padding:8px; margin:4px 0; border:1px solid #ddd; border-radius:4px; cursor:pointer;"
+                                         on:click=move |_: leptos::ev::MouseEvent| {
+                                             s2.page.set(Page::Dashboard(d.id.clone()));
+                                         }>
+                                         <strong>{d.label.clone()}</strong>
+                                     </div>
+                                 }
+                             }/>
+                    }.into_view()
+                }
             }}
         </div>
     }
 }
 
-// ===== entity list =====
+// ===== dashboard: reports run under the logged-in user =====
+
+#[component]
+fn DashboardView(id: String) -> impl IntoView {
+    let state = use_context::<AppState>().unwrap();
+    let token = state.token;
+    let id_fetch = id.clone();
+    let resource = create_resource(
+        || (),
+        move |_| {
+            let token = token.get().unwrap_or_default();
+            let id = id_fetch.clone();
+            async move { api::get_dashboard(&token, &id).await }
+        },
+    );
+    let s = state;
+    view! {
+        <div>
+            <div style="display:flex; align-items:center; gap:1rem; margin:1rem 0;">
+                <button on:click=move |_: leptos::ev::MouseEvent| s.page.set(Page::Home)
+                    style="cursor:pointer;">"← Back"</button>
+            </div>
+            <Suspense fallback=move || view!{ <p>"Loading…"</p> }>
+                {move || match resource.get() {
+                    Some(Ok(d)) => view! {
+                        <div>
+                            <h2 style="margin-top:0;">{d.label.clone()}</h2>
+                            <For each=move || d.items.clone()
+                                 key=|t| t.title.to_string()
+                                 children=move |tile| view! { <DashTileView tile/> } />
+                        </div>
+                    }.into_view(),
+                    Some(Err(e)) => view!{ <p style="color:red;">{format!("Error: {e}")}</p> }.into_view(),
+                    None => ().into_view(),
+                }}
+            </Suspense>
+        </div>
+    }
+}
+
+#[component]
+fn DashTileView(tile: api::DashTile) -> impl IntoView {
+    let title = tile.title.as_str().unwrap_or("Report").to_string();
+    match (tile.error, tile.result) {
+        (Some(err), _) => view! {
+            <div style="border:1px solid #ddd; border-radius:4px; padding:8px; margin:8px 0;">
+                <strong>{title}</strong>
+                <p style="color:#a00; margin:4px 0 0;">{err}</p>
+            </div>
+        }.into_view(),
+        (None, Some(res)) => view! {
+            <div style="border:1px solid #ddd; border-radius:4px; padding:8px; margin:8px 0;">
+                <strong>{title}</strong>
+                <ReportTable res/>
+            </div>
+        }.into_view(),
+        (None, None) => view! {
+            <div style="border:1px solid #ddd; border-radius:4px; padding:8px; margin:8px 0;">
+                <strong>{title}</strong>
+                <p style="color:#888; margin:4px 0 0;">"no result"</p>
+            </div>
+        }.into_view(),
+    }
+}
+
+#[component]
+fn ReportTable(res: ReportResult) -> impl IntoView {
+    let cols = res.columns.clone();
+    view! {
+        <div style="overflow-x:auto;">
+            <table border="0" cellpadding="4" cellspacing="0"
+                   style="border-collapse:collapse; margin-top:6px; font-size:13px;">
+                <thead>
+                    <tr>
+                        <For each=move || cols.clone()
+                             key=|c| c.clone()
+                             children=move |c| view! {
+                                 <th style="border:1px solid #ddd; background:#f4f4f4; text-align:left;">{c}</th>
+                             }/>
+                    </tr>
+                </thead>
+                <tbody>
+                    <For each=move || res.rows.clone()
+                         key=|r| r.to_string()
+                         children=move |row| {
+                             let cols2 = res.columns.clone();
+                             view! {
+                                 <tr>
+                                     <For each=move || cols2.clone()
+                                          key=|c| c.clone()
+                                          children=move |c| view! {
+                                              <td style="border:1px solid #eee;">{cell_text(&row, &c)}</td>
+                                          }/>
+                                 </tr>
+                             }
+                         }/>
+                </tbody>
+            </table>
+        </div>
+    }
+}
+
+fn cell_text(row: &serde_json::Value, col: &str) -> String {
+    match row.get(col) {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+// ===== entity list (view-definition driven grid) =====
 
 #[component]
 fn EntityList(entity: String) -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let token = state.token;
-    let entity_fetch = entity.clone();
     let refresh = state.refresh;
+    let entity_fetch = entity.clone();
     let resource = create_resource(
         move || refresh.get(),
         move |_| {
             let token = token.get().unwrap_or_default();
             let entity = entity_fetch.clone();
-            async move { api::list_records(&token, &entity).await }
+            async move {
+                let view = api::get_view(&token, &entity).await.ok().flatten();
+                let data = api::list_records(&token, &entity).await;
+                (view, data)
+            }
         },
     );
     let s = state;
@@ -234,7 +415,7 @@ fn EntityList(entity: String) -> impl IntoView {
     view! {
         <div>
             <div style="display:flex; align-items:center; gap:1rem; margin:1rem 0;">
-                <button on:click=move |_: leptos::ev::MouseEvent| s.page.set(Page::Dashboard)
+                <button on:click=move |_: leptos::ev::MouseEvent| s.page.set(Page::Home)
                     style="cursor:pointer;">"← Back"</button>
                 <h2 style="margin:0;">{move || ent_sig.get()}</h2>
                 <button style="cursor:pointer; margin-left:auto;"
@@ -246,57 +427,92 @@ fn EntityList(entity: String) -> impl IntoView {
             </div>
             <Suspense fallback=move || view!{ <p>"Loading…"</p> }>
                 {move || match resource.get() {
-                    Some(Ok(data)) => {
+                    Some((view, Ok(data))) => {
                         if data.items.is_empty() {
                             view! { <p style="color:#888;">"No records."</p> }.into_view()
                         } else {
-                            data.items.into_iter().map(move |row| {
-                                let id = row["id"].as_str().unwrap_or("").to_string();
-                                let display = row.as_object()
-                                    .and_then(|o| o.iter()
-                                        .find(|(k,_)| k.as_str() != "id" && k.as_str() != "version"
-                                            && k.as_str() != "owner_id" && k.as_str() != "state"
-                                            && k.as_str() != "created_at" && k.as_str() != "updated_at")
-                                        .map(|(_,v)| match v {
-                                            serde_json::Value::String(s) => s.clone(),
-                                            o => o.to_string(),
-                                        }))
-                                    .unwrap_or_else(|| id.clone());
-                                let s_edit = s;
-                                let id_edit = id.clone();
-                                let id_del = id.clone();
-                                let token_del = token;
-                                let ent_sig_edit = ent_sig;
-                                let ent_sig_del = ent_sig;
-                                let res_ref = resource;
-                                view! {
-                                    <div style="padding:6px; margin:4px 0; border:1px solid #eee; border-radius:4px; display:flex; align-items:center;">
-                                        <span style="flex:1;">{display}</span>
-                                        <span style="color:#aaa; margin:0 8px; font-size:12px;">{format!("{:.8}", id)}</span>
-                                        <button style="cursor:pointer; margin-left:4px;"
-                                            on:click=move |_: leptos::ev::MouseEvent| {
-                                                s_edit.page.set(Page::Form {
-                                                    entity: ent_sig_edit.get(),
-                                                    id: Some(id_edit.clone()),
-                                                });
-                                            }>"Edit"</button>
-                                        <button style="cursor:pointer; margin-left:4px; color:#a00;"
-                                            on:click=move |_: leptos::ev::MouseEvent| {
-                                                let tok = token_del.get().unwrap_or_default();
-                                                let ent = ent_sig_del.get();
-                                                let idd = id_del.clone();
-                                                let res = res_ref;
-                                                spawn_local(async move {
-                                                    let _ = api::delete_record(&tok, &ent, &idd).await;
-                                                    res.refetch();
-                                                });
-                                            }>"Delete"</button>
-                                    </div>
-                                }
-                            }).collect_view()
+                            let columns: Vec<ViewColumn> = view
+                                .map(|v| v.columns)
+                                .unwrap_or_else(|| fallback_columns(&data));
+                            let columns3 = columns.clone();
+                            view! {
+                                <div style="overflow-x:auto;">
+                                    <table border="0" cellpadding="4" cellspacing="0"
+                                           style="border-collapse:collapse; width:100%; font-size:13px;">
+                                        <thead>
+                                            <tr>
+                                                <For each=move || columns3.clone()
+                                                     key=|c| c.field.clone()
+                                                     children=move |c| view! {
+                                                         <th style="border:1px solid #ddd; background:#f4f4f4; text-align:left;">
+                                                             {c.label.clone()}
+                                                         </th>
+                                                     }/>
+                                                <th></th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {data.items.iter().map(|row| {
+                                                let id = row["id"].as_str().unwrap_or("").to_string();
+                                                let s_edit = s;
+                                                let id_edit = id.clone();
+                                                let id_edit2 = id.clone();
+                                                let id_del = id.clone();
+                                                let token_del = token;
+                                                let ent_sig_edit = ent_sig;
+                                                let ent_sig_del = ent_sig;
+                                                let res_ref = resource;
+                                                let cols = columns.clone();
+                                                view! {
+                                                    <tr>
+                                                        {cols.clone().iter().map(|c| {
+                                                            let txt = cell_text(row, &c.field);
+                                                            view! {
+                                                                <td style="border:1px solid #eee; cursor:pointer;"
+                                                                    on:click={
+                                                                        let s_edit = s_edit;
+                                                                        let id_edit2 = id_edit2.clone();
+                                                                        move |_: leptos::ev::MouseEvent| {
+                                                                            s_edit.page.set(Page::Form {
+                                                                                entity: ent_sig_edit.get(),
+                                                                                id: Some(id_edit2.clone()),
+                                                                            });
+                                                                        }
+                                                                    }>
+                                                                    {txt}
+                                                                </td>
+                                                            }
+                                                        }).collect_view()}
+                                                        <td style="border:1px solid #eee; white-space:nowrap;">
+                                                            <button style="cursor:pointer; margin-left:4px;"
+                                                                on:click=move |_: leptos::ev::MouseEvent| {
+                                                                    s_edit.page.set(Page::Form {
+                                                                        entity: ent_sig_edit.get(),
+                                                                        id: Some(id_edit.clone()),
+                                                                    });
+                                                                }>"Edit"</button>
+                                                            <button style="cursor:pointer; margin-left:4px; color:#a00;"
+                                                                on:click=move |_: leptos::ev::MouseEvent| {
+                                                                    let tok = token_del.get().unwrap_or_default();
+                                                                    let ent = ent_sig_del.get();
+                                                                    let idd = id_del.clone();
+                                                                    let res = res_ref;
+                                                                    spawn_local(async move {
+                                                                        let _ = api::delete_record(&tok, &ent, &idd).await;
+                                                                        res.refetch();
+                                                                    });
+                                                                }>"Delete"</button>
+                                                        </td>
+                                                    </tr>
+                                                }
+                                            }).collect_view()}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            }.into_view()
                         }
                     }
-                    Some(Err(e)) => view!{ <p style="color:red;">{format!("Error: {e}")}</p> }.into_view(),
+                    Some((_, Err(e))) => view!{ <p style="color:red;">{format!("Error: {e}")}</p> }.into_view(),
                     None => ().into_view(),
                 }}
             </Suspense>
@@ -304,7 +520,35 @@ fn EntityList(entity: String) -> impl IntoView {
     }
 }
 
-// ===== record form (create / edit) + real-time conflict banner =====
+/// Without a view definition, show the id + the first non-system column per row.
+fn fallback_columns(data: &ListResult) -> Vec<ViewColumn> {
+    let mut cols = vec![ViewColumn {
+        field: "id".to_string(),
+        label: "Id".to_string(),
+        r#type: "string".to_string(),
+    }];
+    if let Some(first) = data.items.first() {
+        if let Some(obj) = first.as_object() {
+            for (k, _) in obj.iter() {
+                if matches!(
+                    k.as_str(),
+                    "id" | "version" | "owner_id" | "state" | "created_at" | "updated_at"
+                ) {
+                    continue;
+                }
+                cols.push(ViewColumn {
+                    field: k.clone(),
+                    label: k.clone(),
+                    r#type: "string".to_string(),
+                });
+                break;
+            }
+        }
+    }
+    cols
+}
+
+// ===== record form (form-definition driven) + real-time conflict banner =====
 
 #[component]
 fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
@@ -312,61 +556,102 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     let token = state.token;
     let s = state;
 
-    // field definitions from the cached active model
-    let entity_for_fields = entity.clone();
-    let fields_of = move || {
-        s.model
-            .get()
-            .and_then(|m| {
-                m.entities
-                    .into_iter()
-                    .find(|e| e.name == entity_for_fields)
-                    .map(|e| e.fields)
-            })
-            .unwrap_or_default()
-    };
-
     let values: RwSignal<HashMap<String, String>> = create_rw_signal(HashMap::new());
     let version = create_rw_signal::<Option<i64>>(None);
     let loaded = create_rw_signal(false);
     let error = create_rw_signal(String::new());
     // remote new version from the SSE channel (None = no concurrent change).
     let conflict = create_rw_signal::<Option<i64>>(None);
+    // the resolved form definition (None until fetched; None+loaded => fall back to the model)
+    let form = create_rw_signal::<Option<Vec<FormSection>>>(None);
+    // reference-field option lists (entity -> (label list, id list))
+    let ref_options: RwSignal<HashMap<String, Vec<(String, String)>>> = create_rw_signal(HashMap::new());
 
-    // load the record on edit
-    let id_load = id.clone();
+    // load the form definition + reference options + the record (on edit)
     let entity_load = entity.clone();
+    let id_load = id.clone();
     create_effect(move |_| {
         if loaded.get() {
             return;
         }
         let tok = token.get().unwrap_or_default();
-        if let Some(rid) = id_load.clone() {
-            let ent = entity_load.clone();
-            spawn_local(async move {
-                match api::get_record(&tok, &ent, &rid).await {
-                    Ok(rec) => {
-                        if let Some(obj) = rec.as_object() {
-                            let mut m = HashMap::new();
-                            for (k, v) in obj {
-                                let txt = match v {
-                                    serde_json::Value::Null => String::new(),
-                                    serde_json::Value::String(x) => x.to_string(),
-                                    other => other.to_string(),
-                                };
-                                m.insert(k.clone(), txt);
+        let ent = entity_load.clone();
+        let rid = id_load.clone();
+        spawn_local(async move {
+            // form definition (falls back to the model when absent)
+            let f = api::get_form(&tok, &ent).await.ok().flatten();
+            let sections = f.map(|f| f.sections);
+            // gather reference targets and fetch their option lists
+            if let Some(sections) = &sections {
+                let mut targets: Vec<String> = Vec::new();
+                for sec in sections {
+                    for fld in &sec.fields {
+                        if fld.widget == "reference" {
+                            if let Some(t) = &fld.target_entity {
+                                if !targets.contains(t) {
+                                    targets.push(t.clone());
+                                }
                             }
-                            values.set(m);
                         }
-                        version.set(rec["version"].as_i64());
                     }
-                    Err(e) => error.set(e),
                 }
-                loaded.set(true);
-            });
-        } else {
+                let mut opts: HashMap<String, Vec<(String, String)>> = HashMap::new();
+                for t in targets {
+                    if let Ok(list) = api::list_records(&tok, &t).await {
+                        opts.insert(
+                            t,
+                            list.items
+                                .iter()
+                                .map(|r| {
+                                    let label = r
+                                        .as_object()
+                                        .and_then(|o| {
+                                            o.iter().find(|(k, _)| {
+                                                !matches!(
+                                                    k.as_str(),
+                                                    "id" | "version" | "owner_id" | "state"
+                                                        | "created_at" | "updated_at"
+                                                )
+                                            })
+                                        })
+                                        .map(|(_, v)| match v {
+                                            serde_json::Value::String(x) => x.clone(),
+                                            o => o.to_string(),
+                                        })
+                                        .unwrap_or_else(|| {
+                                            r["id"].as_str().unwrap_or("?").to_string()
+                                        });
+                                    let id = r["id"].as_str().unwrap_or("").to_string();
+                                    (label, id)
+                                })
+                                .collect(),
+                        );
+                    }
+                }
+                ref_options.set(opts);
+            }
+            form.set(sections);
+
+            // load the record itself on edit
+            if let Some(rid) = rid {
+                if let Ok(rec) = api::get_record(&tok, &ent, &rid).await {
+                    if let Some(obj) = rec.as_object() {
+                        let mut m = HashMap::new();
+                        for (k, v) in obj {
+                            let txt = match v {
+                                serde_json::Value::Null => String::new(),
+                                serde_json::Value::String(x) => x.clone(),
+                                other => other.to_string(),
+                            };
+                            m.insert(k.clone(), txt);
+                        }
+                        values.set(m);
+                    }
+                    version.set(rec["version"].as_i64());
+                }
+            }
             loaded.set(true);
-        }
+        });
     });
 
     // SSE: watch this record for remote changes (edit only) → conflict banner.
@@ -485,7 +770,6 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     };
 
     let entity_cancel = entity.clone();
-    let entity_cancel2 = entity.clone();
     let s_back = s;
     let on_cancel = move |_: leptos::ev::MouseEvent| {
         s.page.set(Page::List(entity_cancel.clone()));
@@ -499,7 +783,10 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     view! {
         <div>
             <div style="display:flex; align-items:center; gap:1rem; margin:1rem 0;">
-                <button on:click=move |_: leptos::ev::MouseEvent| s_back.page.set(Page::List(entity_cancel2.clone())) style="cursor:pointer;">"← Back"</button>
+                <button on:click={
+                    let entity = entity.clone();
+                    move |_: leptos::ev::MouseEvent| s_back.page.set(Page::List(entity.clone()))
+                } style="cursor:pointer;">"← Back"</button>
                 <h2 style="margin:0;">{title}</h2>
             </div>
 
@@ -516,73 +803,19 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                 if !loaded.get() {
                     return view! { <p>"Loading…"</p> }.into_view();
                 }
-                let vals = values.get();
-                fields_of().iter().map(|f| {
-                    let fname = f.name.clone();
-                    let flabel = f.label.clone().unwrap_or_else(|| f.name.clone());
-                    let init = vals.get(&f.name).cloned().unwrap_or_default();
-                    let ftype = f.field_type.clone();
-                    let opts: Vec<String> = f.config.get("options")
-                        .and_then(|o| o.as_array())
-                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                        .unwrap_or_default();
-                    let values_ref = values;
-                    let key_for_input = fname.clone();
-                    let input = match ftype.as_str() {
-                        "bool" => {
-                            let k = fname.clone();
-                            view! {
-                                <input type="checkbox" prop:checked=init == "true"
-                                    on:input=move |ev| {
-                                        let val = event_target_checked(&ev).to_string();
-                                        values_ref.update(|m| { m.insert(k.clone(), val); });
-                                    }/>
-                            }.into_view()
-                        }
-                        "enum" if !opts.is_empty() => {
-                            let k = fname.clone();
-                            let opts_view = opts.clone().into_iter().map(|o| {
-                                view! { <option value=o.clone() selected=o == init>{o}</option> }
-                            }).collect_view();
-                            view! {
-                                <select style="width:100%; padding:4px;"
-                                    on:input=move |ev| {
-                                        values_ref.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
-                                    }>
-                                    {opts_view}
-                                </select>
-                            }.into_view()
-                        }
-                        "text" => {
-                            let k = fname.clone();
-                            view! {
-                                <textarea prop:value=init rows="3" style="width:100%; padding:4px;"
-                                    on:input=move |ev| {
-                                        values_ref.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
-                                    }></textarea>
-                            }.into_view()
-                        }
-                        _ => {
-                            let k = fname.clone();
-                            view! {
-                                <input prop:value=init
-                                    on:input=move |ev| {
-                                        values_ref.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
-                                    }
-                                    style="width:100%; padding:4px;"/>
-                            }.into_view()
-                        }
-                    };
-                    let _ = key_for_input;
-                    view! {
-                        <p>
-                            <label>{flabel}</label>
-                            { if f.required { view!{ <span style="color:#c00;">"*"</span> }.into_view() } else { ().into_view() } }
-                            <br/>
-                            {input}
-                        </p>
-                    }
-                }).collect_view()
+                match form.get() {
+                    Some(sections) => sections
+                        .iter()
+                        .map(|sec| view! {
+                            <FormSectionView
+                                section=sec.clone()
+                                values=values
+                                ref_options=ref_options />
+                        })
+                        .collect_view(),
+                    // No form definition (or the API is unreachable): render from the model.
+                    None => model_fields(&s, &entity, values).into_view(),
+                }
             }.into_view()}
 
             <div style="margin-top:1rem;">
@@ -594,6 +827,218 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                 if e.is_empty() { ().into_view() } else { view!{ <p style="color:red;">{e}</p> }.into_view() }
             }}
         </div>
+    }
+}
+
+/// One rendered form section (title + fields, widget-driven inputs).
+#[component]
+fn FormSectionView(
+    section: FormSection,
+    values: RwSignal<HashMap<String, String>>,
+    ref_options: RwSignal<HashMap<String, Vec<(String, String)>>>,
+) -> impl IntoView {
+    let title = section.title.clone();
+    view! {
+        <fieldset style="border:1px solid #ddd; border-radius:4px; margin:8px 0; padding:8px 12px;">
+            {move || match &title {
+                Some(t) if !t.is_empty() => view! {
+                    <legend style="font-weight:600; padding:0 4px;">{t.clone()}</legend>
+                }.into_view(),
+                _ => ().into_view(),
+            }}
+            <For each=move || section.fields.clone()
+                 key=|f| f.name.clone()
+                 children=move |f: FormField| {
+                     view! { <FieldInput field=f values=values ref_options=ref_options /> }
+                 }/>
+        </fieldset>
+    }
+}
+
+/// One form field: the input widget comes from the resolved definition
+/// (authored override or inferred from the field type).
+#[component]
+fn FieldInput(
+    field: FormField,
+    values: RwSignal<HashMap<String, String>>,
+    ref_options: RwSignal<HashMap<String, Vec<(String, String)>>>,
+) -> impl IntoView {
+    let fname = field.name.clone();
+    let flabel = field.label.clone();
+    let init = {
+        let fname = fname.clone();
+        move || {
+            values
+                .get_untracked()
+                .get(&fname)
+                .cloned()
+                .unwrap_or_default()
+        }
+    };
+    let opts: Vec<String> = field
+        .options
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let input = match field.widget.as_str() {
+        "checkbox" => {
+            let k = fname.clone();
+            view! {
+                <input type="checkbox" prop:checked=init() == "true"
+                    on:input=move |ev| {
+                        let val = event_target_checked(&ev).to_string();
+                        values.update(|m| { m.insert(k.clone(), val); });
+                    }/>
+            }.into_view()
+        }
+        "select" if !opts.is_empty() => {
+            let k = fname.clone();
+            let cur = init();
+            let opts_view = opts.clone().into_iter().map(move |o| {
+                let selected = o == cur;
+                view! { <option value=o.clone() selected=selected>{o}</option> }
+            }).collect_view();
+            view! {
+                <select style="width:100%; padding:4px;"
+                    on:input=move |ev| {
+                        values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
+                    }>
+                    {opts_view}
+                </select>
+            }.into_view()
+        }
+        // reference picker: options resolved from the target entity by the server
+        "reference" => {
+            let k = fname.clone();
+            let cur = init();
+            let target = field.target_entity.clone().unwrap_or_default();
+            let options = move || {
+                ref_options
+                    .get()
+                    .get(&target)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            view! {
+                <select style="width:100%; padding:4px;"
+                    on:input=move |ev| {
+                        values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
+                    }>
+                    <option value="" selected=cur.is_empty()>"— none —"</option>
+                    <For each=options
+                         key=|(label, id)| format!("{id}-{label}")
+                         children=move |(label, oid)| {
+                             let selected = oid == cur;
+                             view! { <option value=oid.clone() selected=selected>{label}</option> }
+                         }/>
+                </select>
+            }.into_view()
+        }
+        "textarea" => {
+            let k = fname.clone();
+            let v = init();
+            view! {
+                <textarea prop:value=v rows="3" style="width:100%; padding:4px;"
+                    on:input=move |ev| {
+                        values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
+                    }></textarea>
+            }.into_view()
+        }
+        "number" => {
+            let k = fname.clone();
+            let v = init();
+            view! {
+                <input type="number" prop:value=v
+                    on:input=move |ev| {
+                        values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
+                    }
+                    style="width:100%; padding:4px;"/>
+            }.into_view()
+        }
+        "date" | "datetime" => {
+            let k = fname.clone();
+            let v = init();
+            let t = if field.widget == "date" { "date" } else { "datetime-local" };
+            view! {
+                <input type=t prop:value=v
+                    on:input=move |ev| {
+                        values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
+                    }
+                    style="width:100%; padding:4px;"/>
+            }.into_view()
+        }
+        _ => {
+            let k = fname.clone();
+            let v = init();
+            view! {
+                <input prop:value=v
+                    on:input=move |ev| {
+                        values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
+                    }
+                    style="width:100%; padding:4px;"/>
+            }.into_view()
+        }
+    };
+    view! {
+        <p>
+            <label>{flabel}</label>
+            { if field.required { view!{ <span style="color:#c00;">"*"</span> }.into_view() } else { ().into_view() } }
+            <br/>
+            {input}
+        </p>
+    }
+}
+
+/// Fallback: render the form straight from the cached active model (used when
+/// no form definition is stored server-side).
+fn model_fields(
+    s: &AppState,
+    entity: &str,
+    values: RwSignal<HashMap<String, String>>,
+) -> impl IntoView {
+    let model = s.model.get().unwrap_or(api::ModelInfo { entities: Vec::new() });
+    let entity_fields: Vec<EntityInfo> = model
+        .entities
+        .into_iter()
+        .filter(|e| e.name == entity)
+        .collect();
+    let fields = entity_fields
+        .first()
+        .map(|e| e.fields.clone())
+        .unwrap_or_default();
+    fields
+        .iter()
+        .map(|f| {
+            let field = FormField {
+                name: f.name.clone(),
+                label: f.label.clone().unwrap_or_else(|| f.name.clone()),
+                field_type: f.field_type.clone(),
+                required: f.required,
+                widget: infer_widget(&f.field_type).to_string(),
+                options: f.config.get("options").cloned().unwrap_or(serde_json::Value::Null),
+                target_entity: None,
+            };
+            let ref_options = create_rw_signal(HashMap::<String, Vec<(String, String)>>::new());
+            view! { <FieldInput field=field values=values ref_options=ref_options /> }
+        })
+        .collect_view()
+}
+
+fn infer_widget(field_type: &str) -> &'static str {
+    match field_type {
+        "bool" => "checkbox",
+        "enum" => "select",
+        "text" => "textarea",
+        "date" => "date",
+        "datetime" => "datetime",
+        "integer" | "decimal" | "money" | "auto_number" => "number",
+        "reference" => "reference",
+        "attachment" => "attachment",
+        _ => "text",
     }
 }
 

@@ -4,12 +4,16 @@ A declarative, data-driven, model-driven **no-code enterprise system** built in 
 Everything — entities, forms, screens, reports, workflows, rules, integrations — is
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
-> **Status:** Phases 0–7, 9, 10 implemented + Phase 6 Runtime UI (Leptos),
+> **Status:** Phases 0–7, 9, 10 implemented + the Phase 6 Runtime UI (Leptos)
+> **rendering from metadata** (navigation / view / form / dashboard definitions),
 > plus the full §5.18–5.22 platform-capability cluster and a first-class GraphQL
 > runtime API (ADR-0010).
 > Server: auth, CRUD, security, rules, workflows, reporting, bulk (CSV+JSON import with dry-run / create·update·upsert by key / on_error abort+continue), attachments,
-> notifications, sharing (incl. **team-OWD record visibility + team hierarchy**
-> — ADR-0013 `owd_visible` / ADR-0025 `sec_team.parent_id`). Platform: secrets, templating, multi-channel
+> notifications, sharing — now the **complete §5.11.3 composition** (ADR-0013
+> closed, ADR-0026): manual shares, **criteria-based sharing rules** (epoch-
+> gated materialization + synchronous per-record recompute), team-OWD record
+> visibility, team hierarchy (ADR-0025 `sec_team.parent_id`), and **role
+> hierarchy** (live, read-only "see records below me"). Platform: secrets, templating, multi-channel
 > notifications + digest (with record-reader recipient resolution +
 > FLS-under-recipient rendering + SMTP send), signed webhook contract + inbound
 > verification, hub-model integration (connectors / flows / external-ID registry,
@@ -20,10 +24,16 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > backup/restore), **mass actions** (bulk update/delete by filter — ADR-0021),
 > **API versioning & deprecation** with `Sunset`/`Deprecation` headers
 > (ADR-0022), and **metadata/UI i18n** (`md_translation`, best-match locale —
-> ADR-0023). **Team hierarchy** (ancestor-team visibility — ADR-0025) ships
-> with a superuser **admin security API** (`/api/admin/{teams,roles,owd,users}`)
-> that makes the whole security graph operable.
-> Frontend: login + entity list (WASM).
+> ADR-0023). **Team hierarchy** (ancestor-team visibility — ADR-0025) and the
+> **role hierarchy / sharing rules** (ADR-0026) ship with a superuser **admin
+> security API** (`/api/admin/{teams,roles,owd,users,share-rules}` +
+> `/api/admin/roles/:id/parents`) that makes the whole security graph operable.
+> Reporting is complete: **authoring CRUD**, **reference-traversal joins**
+> (`customer_id.name` over hoisted FKs), and **CSV/HTML/XLSX/PDF export** —
+> with scheduled delivery (`report.completed` notification).
+> Frontend (WASM): login, navigation shell, view-driven grids,
+> form-definition-driven editors (incl. reference pickers), dashboards, and the
+> real-time conflict banner.
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
 > (`/api/data/:entity/:id/{history,as-of}`), a tenant observability console
@@ -97,6 +107,24 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 #   POST   /api/attachments         (raw bytes) -> {id, filename, mime, size, checksum}
 #   GET    /api/attachments/:id                  -> bytes (owner/superuser)
 #   DELETE /api/attachments/:id                  -> 204 (reclaims bytes only when last ref)
+
+# UI definitions (Phase 6) — renderable metadata for the Runtime UI (FLS-projected):
+#   GET  /api/forms/:entity[?name=]   sections+fields (widgets, options, reference targets)
+#   GET  /api/views/:entity[?name=]   grid columns + default filters/sort/page size
+#   GET  /api/dashboards[/:id]        definitions; :id RUNS each report under the caller
+#   GET  /api/navigation              the caller's permission-filtered menu
+#   (POST/PATCH/DELETE on the same paths author the definitions)
+
+# Reports (§5.17) — author, run, export (csv|html|xlsx|pdf); fields may traverse
+# references (customer_id.name) via real LEFT JOINs over the hoisted FK columns:
+#   POST/GET /api/reports[/:id]       CRUD on meta.md_report
+#   GET  /api/reports/:id/run         run under the caller's full security
+#   GET  /api/reports/:id/export?format=pdf
+
+# Sharing rules + role hierarchy (ADR-0013 closed / ADR-0026):
+#   POST/GET/PATCH/DELETE /api/admin/share-rules[/:id]       criteria rules (user|team principal)
+#   POST /api/admin/share-rules/:id/recompute?from=&limit=   resumable re-materialization
+#   POST/GET/DELETE  /api/admin/roles/:id/parents[/:parent]  role hierarchy (read-only visibility)
 ```
 
 Platform surfaces (ADR-0018) — record history & as-of, and the tenant

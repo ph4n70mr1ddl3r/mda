@@ -67,6 +67,10 @@ struct ScheduleRow {
     last_run: Option<DateTime<Utc>>,
     last_status: Option<String>,
     last_error: Option<String>,
+    /// Per-kind options. `report`: `{"notify": true}` dispatches a
+    /// `report.completed` notification (§5.18) to the running user.
+    #[serde(default)]
+    config: serde_json::Value,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -81,6 +85,8 @@ struct CreateSchedule {
     cron: String,
     #[serde(default)]
     running_user_id: Option<Uuid>,
+    #[serde(default)]
+    config: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -93,6 +99,8 @@ struct UpdateSchedule {
     enabled: Option<bool>,
     #[serde(default)]
     running_user_id: Option<Uuid>,
+    #[serde(default)]
+    config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,8 +172,8 @@ async fn create_schedule(
     set_tenant(&mut tx, user.tenant_id).await?;
     let row: ScheduleRow = sqlx::query_as(
         "INSERT INTO sys_schedule
-            (tenant_id, name, kind, target_id, cron, enabled, running_user_id, next_run)
-         VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7)
+            (tenant_id, name, kind, target_id, cron, enabled, running_user_id, next_run, config)
+         VALUES ($1, $2, $3, $4, $5, TRUE, $6, $7, $8)
          RETURNING *",
     )
     .bind(user.tenant_id)
@@ -175,6 +183,7 @@ async fn create_schedule(
     .bind(&body.cron)
     .bind(running_user)
     .bind(next_run)
+    .bind(&body.config)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| match e {
@@ -209,6 +218,7 @@ async fn update_schedule(
     let cron = parse_cron(&cron_str)?;
     let enabled = body.enabled.unwrap_or(existing.enabled);
     let running_user = body.running_user_id.or(existing.running_user_id);
+    let config = body.config.unwrap_or(existing.config);
     // Re-arm on cron change or (re-)enable; a cron-only edit keeps cadence honest.
     let rearm = body.cron.is_some() || (enabled && existing.next_run.is_none());
     let next_run = if enabled {
@@ -224,7 +234,7 @@ async fn update_schedule(
     let row: ScheduleRow = sqlx::query_as(
         "UPDATE sys_schedule
             SET name = $3, cron = $4, enabled = $5, running_user_id = $6,
-                next_run = $7, updated_at = now()
+                next_run = $7, config = $8, updated_at = now()
           WHERE id = $1 AND tenant_id = $2
          RETURNING *",
     )
@@ -235,6 +245,7 @@ async fn update_schedule(
     .bind(enabled)
     .bind(running_user)
     .bind(next_run)
+    .bind(&config)
     .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?
@@ -342,6 +353,7 @@ struct DueRow {
     kind: String,
     cron: String,
     next_run: DateTime<Utc>,
+    config: serde_json::Value,
 }
 
 /// One scheduling pass: claim all due rows, dispatch each, record the outcome.
@@ -352,7 +364,7 @@ async fn tick(pool: &PgPool, secrets: &dyn SecretStore) -> Result<(), sqlx::Erro
         // the lock is held only across the bookkeeping, not the (possibly slow)
         // job execution.
         let claimed: Option<DueRow> = sqlx::query_as(
-            "SELECT id, tenant_id, name, target_id, running_user_id, kind, cron, next_run
+            "SELECT id, tenant_id, name, target_id, running_user_id, kind, cron, next_run, config
                FROM sys_schedule
               WHERE enabled AND next_run IS NOT NULL AND next_run <= now()
               ORDER BY next_run
@@ -391,6 +403,7 @@ async fn tick(pool: &PgPool, secrets: &dyn SecretStore) -> Result<(), sqlx::Erro
             kind: due_row.kind,
             target_id: due_row.target_id,
             running_user_id: due_row.running_user_id,
+            config: due_row.config,
         };
         let res = dispatch(pool, secrets, &sched).await;
         record_run(pool, sched.id, sched.tenant, &res).await;
@@ -406,19 +419,29 @@ struct DispatchTarget {
     kind: String,
     target_id: Uuid,
     running_user_id: Option<Uuid>,
+    config: serde_json::Value,
 }
 
 /// Fetch a schedule by id for dispatch (used by the manual trigger).
 async fn fetch_for_dispatch(pool: &PgPool, id: Uuid) -> Result<DispatchTarget> {
-    let row: Option<(Uuid, Uuid, String, Uuid, Option<Uuid>, String)> = sqlx::query_as(
-        "SELECT id, tenant_id, name, target_id, running_user_id, kind
-           FROM sys_schedule WHERE id = $1",
+    type DueTuple = (
+        Uuid,
+        Uuid,
+        String,
+        Uuid,
+        Option<Uuid>,
+        String,
+        serde_json::Value,
+    );
+    let row: Option<DueTuple> = sqlx::query_as(
+        "SELECT id, tenant_id, name, target_id, running_user_id, kind, config
+               FROM sys_schedule WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
     .await
     .map_err(Error::internal)?;
-    let (id, tenant, name, target_id, running_user_id, kind) =
+    let (id, tenant, name, target_id, running_user_id, kind, config) =
         row.ok_or_else(|| Error::NotFound(format!("schedule {id}")))?;
     Ok(DispatchTarget {
         id,
@@ -427,6 +450,7 @@ async fn fetch_for_dispatch(pool: &PgPool, id: Uuid) -> Result<DispatchTarget> {
         kind,
         target_id,
         running_user_id,
+        config,
     })
 }
 
@@ -465,7 +489,7 @@ async fn dispatch(pool: &PgPool, secrets: &dyn SecretStore, sched: &DispatchTarg
     };
 
     let result = match sched.kind.as_str() {
-        "report" => run_report(pool, &identity, sched.target_id).await,
+        "report" => run_report(pool, &identity, sched.target_id, &sched.config).await,
         // `integration` pulls an inbound flow from its connector and
         // materializes the fetched records into the canonical biz entity
         // (scheduled sync, §5.22). Returns the count materialized.
@@ -491,16 +515,21 @@ async fn dispatch(pool: &PgPool, secrets: &dyn SecretStore, sched: &DispatchTarg
     }
 }
 
-/// Run a saved report under `identity` and return its row count.
+/// Run a saved report under `identity` and return its row count. When the
+/// schedule's `config.notify` is set, a `report.completed` notification
+/// (§5.18, in-app channel by default) is dispatched to the running user with
+/// the run summary — the "scheduled report delivery" half of PLAN Phase 7
+/// (email routing follows the notification type's channels as usual).
 async fn run_report(
     pool: &PgPool,
     identity: &mda_security::Identity,
     report_id: Uuid,
+    config: &serde_json::Value,
 ) -> Result<i64> {
     let mut tx = pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, identity.tenant_id).await?;
-    let (dataset,): (serde_json::Value,) =
-        sqlx::query_as("SELECT dataset FROM meta.md_report WHERE id = $1 AND tenant_id = $2")
+    let (name, dataset): (String, serde_json::Value) =
+        sqlx::query_as("SELECT name, dataset FROM meta.md_report WHERE id = $1 AND tenant_id = $2")
             .bind(report_id)
             .bind(identity.tenant_id)
             .fetch_optional(&mut *tx)
@@ -512,6 +541,31 @@ async fn run_report(
     let ds: mda_reports::Dataset =
         serde_json::from_value(dataset).map_err(|e| Error::Invalid(format!("bad dataset: {e}")))?;
     let res = mda_reports::run(pool, identity, &ds).await?;
+    if config
+        .get("notify")
+        .and_then(|n| n.as_bool())
+        .unwrap_or(false)
+    {
+        let context = serde_json::json!({
+            "report": name,
+            "report_id": report_id,
+            "rows": res.rows.len(),
+            "columns": res.columns,
+        });
+        let mut tx = pool.begin().await.map_err(Error::internal)?;
+        set_tenant(&mut tx, identity.tenant_id).await?;
+        crate::notifications::dispatch(
+            &mut tx,
+            identity.tenant_id,
+            "report.completed",
+            &[identity.user_id],
+            None,
+            None,
+            &context,
+        )
+        .await?;
+        tx.commit().await.map_err(Error::internal)?;
+    }
     Ok(res.rows.len() as i64)
 }
 
