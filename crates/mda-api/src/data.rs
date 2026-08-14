@@ -88,31 +88,41 @@ async fn create_record(
     Path(entity): Path<String>,
     Json(body): Json<Value>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    authorize(&user, &entity, "create")?;
-    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    let rec = create_record_service(&st, &user, &entity, body).await?;
+    Ok((StatusCode::CREATED, Json(rec)))
+}
+
+/// Shared create write-path used by both REST and GraphQL (ADR-0010 mutations
+/// reach REST parity by construction): RBAC + FLS write-check + rules +
+/// calculated fields + audit, then FLS read-projection of the result.
+pub(crate) async fn create_record_service(
+    st: &AppState,
+    user: &Identity,
+    entity: &str,
+    body: Value,
+) -> ApiResult<Value> {
+    authorize(user, entity, "create")?;
+    let def = entity_def(st, user.tenant_id, entity).await?;
     let mut ctx = into_object(body)?;
-    assert_writable(&user, &entity, &def, &ctx)?;
+    assert_writable(user, entity, &def, &ctx)?;
     // Phase 4: fire set-field rules + calculated fields (synchronous, in-write).
     let reg = mda_rules::Registry::new();
-    let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
+    let rules = mda_rules::load_active(&st.pool, user.tenant_id, entity).await?;
     mda_rules::fire(&rules, "after_create", &mut ctx, &reg)?;
     mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
     let rec = mda_data::create(&st.pool, user.tenant_id, &def, ctx, user.user_id).await?;
     audit(
-        &st,
+        st,
         user.tenant_id,
         user.user_id,
-        &entity,
+        entity,
         rec["id"].as_str().unwrap_or("").parse::<Uuid>().ok(),
         "create",
         None,
         Some(rec.clone()),
     )
     .await;
-    Ok((
-        StatusCode::CREATED,
-        Json(project(&user, &entity, &def, rec)),
-    ))
+    Ok(project(user, entity, &def, rec))
 }
 
 async fn read_record(
@@ -134,12 +144,27 @@ async fn update_record(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    authorize(&user, &entity, "update")?;
     let expected = version_from_headers(&headers)?;
-    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    let rec = update_record_service(&st, &user, &entity, id, expected, body).await?;
+    Ok(Json(rec))
+}
+
+/// Shared update write-path (REST + GraphQL). Carries the OCC `version`, merges
+/// the before-image for rule/condition context, fires rules + calculated fields,
+/// and audits before/after — identical to a hand-typed REST PATCH.
+pub(crate) async fn update_record_service(
+    st: &AppState,
+    user: &Identity,
+    entity: &str,
+    id: Uuid,
+    expected_version: i64,
+    body: Value,
+) -> ApiResult<Value> {
+    authorize(user, entity, "update")?;
+    let def = entity_def(st, user.tenant_id, entity).await?;
     let mut ctx = into_object(body)?;
-    assert_writable(&user, &entity, &def, &ctx)?;
-    let scope = scope_for(&st, &user, &entity).await?;
+    assert_writable(user, entity, &def, &ctx)?;
+    let scope = scope_for(st, user, entity).await?;
     // before-image for audit + condition context (existing merged with the patch).
     let before = mda_data::read(
         &st.pool,
@@ -165,7 +190,7 @@ async fn update_record(
     }
     // Phase 4: fire set-field rules + calculated fields.
     let reg = mda_rules::Registry::new();
-    let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
+    let rules = mda_rules::load_active(&st.pool, user.tenant_id, entity).await?;
     mda_rules::fire(&rules, "after_update", &mut ctx, &reg)?;
     mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
     let after = mda_data::update(
@@ -173,24 +198,24 @@ async fn update_record(
         user.tenant_id,
         &def,
         id,
-        expected,
+        expected_version,
         ctx,
         &scope,
         None,
     )
     .await?;
     audit(
-        &st,
+        st,
         user.tenant_id,
         user.user_id,
-        &entity,
+        entity,
         Some(id),
         "update",
         before,
         Some(after.clone()),
     )
     .await;
-    Ok(Json(project(&user, &entity, &def, after)))
+    Ok(project(user, entity, &def, after))
 }
 
 // ===== restore from archive (ADR-0006 / ADR-0015) =====
@@ -225,9 +250,21 @@ async fn delete_record(
     AuthUser(user): AuthUser,
     Path((entity, id)): Path<(String, Uuid)>,
 ) -> ApiResult<Response> {
-    authorize(&user, &entity, "delete")?;
-    let def = entity_def(&st, user.tenant_id, &entity).await?;
-    let scope = scope_for(&st, &user, &entity).await?;
+    delete_record_service(&st, &user, &entity, id).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Shared delete write-path (REST + GraphQL): RBAC + record-scope delete + audit
+/// before-image. Returns the before-image so a GraphQL mutation can echo it back.
+pub(crate) async fn delete_record_service(
+    st: &AppState,
+    user: &Identity,
+    entity: &str,
+    id: Uuid,
+) -> ApiResult<()> {
+    authorize(user, entity, "delete")?;
+    let def = entity_def(st, user.tenant_id, entity).await?;
+    let scope = scope_for(st, user, entity).await?;
     let before = mda_data::read(
         &st.pool,
         user.tenant_id,
@@ -239,17 +276,17 @@ async fn delete_record(
     .ok();
     mda_data::delete(&st.pool, user.tenant_id, &def, id, &scope).await?;
     audit(
-        &st,
+        st,
         user.tenant_id,
         user.user_id,
-        &entity,
+        entity,
         Some(id),
         "delete",
         before,
         None,
     )
     .await;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    Ok(())
 }
 
 /// `POST /api/data/:entity/:id/:transition` — run a workflow transition

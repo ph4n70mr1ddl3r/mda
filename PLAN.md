@@ -1061,18 +1061,20 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 >
 > **Further progress (§5.18–5.22 + ADR-0010):** the scoped platform-capability
 > design sections are now **implemented** (see `docs/CAPABILITIES.md`):
-> notifications & messaging (§5.18), templating (§5.19), secrets (§5.20), the
-> outbound webhook contract + inbound verification (§5.21/§14), and the
-> hub-model integration architecture (§5.22 / Phase 9), plus a first-class
-> GraphQL runtime API (ADR-0010, query/traversal-first). Scheduled-job
-> management is now **closed** (generic cron scheduler). The remaining §14 item —
-> tenant-scoped backup/restore + data residency — stays open (it ties to the
-> deferred tenant lifecycle).
+> notifications & messaging (§5.18, incl. record-reader recipient resolution +
+> FLS-under-recipient rendering + SMTP send), templating (§5.19), secrets
+> (§5.20), the outbound webhook contract + inbound verification (§5.21/§14),
+> and the hub-model integration architecture (§5.22 / Phase 9, incl.
+> `field_level_sor` conflict policy, debatching, per-flow running user, and
+> cron-scheduled pulls), plus a first-class GraphQL runtime API (ADR-0010,
+> reads **and** mutations). Scheduled-job management is now **closed** (generic
+> cron scheduler, ADR-0019). The remaining §14 item — tenant-scoped backup/restore
+> + data residency — stays open (it ties to the deferred tenant lifecycle).
 
 - **Modeler / tenant observability console** — a tenant-facing view of job / rule / workflow / integration run history and failures (beyond operator `tracing`/OpenTelemetry). Raw material exists (`md_migration_log`, `sys_event_log`); the *surface* is unbuilt.
   - **✅ closed (ADR-0018):** `/api/observability/{events,outbox,migrations,audit}` surface the run/delivery/audit history. The v1 superuser gate is now broadened: a non-admin principal granted the `observability.read` capability (a `("*", "observability.read")` permission) sees the console, with audit `before`/`after` redacted (field-level projection).
 - **Scheduled-job management** for modeler-defined schedules (next-run / last-run / failure state) — scheduled rules and integration schedules exist conceptually but aren't managed as a user surface.
-  - **Partially ✅ closed (ADR-0018):** the outbox console surfaces delivery *failure state* (pending/failed counts + oldest age + outstanding list). Full scheduled-rule/integration next-run/last-run management remains open (lands with the Phase 9 scheduler).
+  - **✅ closed (ADR-0019):** `POST/GET/PATCH/DELETE /api/schedules` + `/runs` expose next-run / last-run / last-status / failure state + a per-run history, driven by a multi-instance-safe `FOR UPDATE SKIP LOCKED` worker. Dispatch is by `kind`: `report` runs a saved report under the running user, `integration` pulls an inbound `int.flow` from its connector on cadence (scheduled sync, §5.22), `custom` is an extensibility hook. The outbox console still surfaces delivery failure state (ADR-0018).
 - **Inbound webhook verification** — shared-secret / signature / replay protection for the Phase 9 inbound receiver (parallels the outbound contract in §5.21).
 - **Record / field history as a surfaced capability** — `sys_audit_log` stores before/after for compliance, but "timeline of this record" and "as-of" queries are not yet framed as a platform API.
   - **✅ closed (ADR-0018):** `GET /api/data/:entity/:id/history` (per-field diffs, FLS-projected) and `GET /api/data/:entity/:id/as-of?version=|at=` reconstruct from audit snapshots, gated like a live read.

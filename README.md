@@ -9,10 +9,13 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > runtime API (ADR-0010).
 > Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
 > notifications, sharing. Platform: secrets, templating, multi-channel
-> notifications + digest, signed webhook contract + inbound verification,
-> hub-model integration (connectors / flows / external-ID registry),
-> GraphQL, and cron-driven **scheduled-job management** (§14). Frontend: login +
-> entity list (WASM).
+> notifications + digest (with record-reader recipient resolution +
+> FLS-under-recipient rendering + SMTP send), signed webhook contract + inbound
+> verification, hub-model integration (connectors / flows / external-ID registry,
+> with `field_level_sor` conflict policy, debatching, per-flow running user, and
+> cron-scheduled pulls), GraphQL (reads **and** mutations), and cron-driven
+> **scheduled-job management** (§14, including scheduled integration pulls).
+> Frontend: login + entity list (WASM).
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
 > (`/api/data/:entity/:id/{history,as-of}`), a tenant observability console
@@ -95,11 +98,16 @@ Platform capabilities (§5.18–5.22) + GraphQL (ADR-0010) — all driven by met
 AuthZ-enforced, sharing REST's service layer:
 
 ```bash
-# GraphQL — schema generated from the active model; reads + nested traversal;
+# GraphQL — schema generated from the active model; reads + nested traversal
+# + create/update/delete mutations (sharing REST's write service), all with
 # object/field/record security enforced per field.
 curl -X POST localhost:8080/api/graphql -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
-     -d '{"query":"{ customer(id:\"…\") { name customer { name } } }"}'
+     -d '{"query":"{ customer(id:\"…\") { name customer { name } } }"}
+# mutation createCustomer(input: {name: "Acme"}) { id name version } }'
+curl -X POST localhost:8080/api/graphql -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"query":"mutation { createCustomer(input: {name:\"Acme\"}) { id name version } }"}'
 
 # Secrets (§5.20) — only the reference is stored; values resolve server-side and
 # are never returned by any API.
@@ -110,17 +118,25 @@ curl -X POST localhost:8080/api/secrets -H "Authorization: Bearer $JWT" \
 curl -X POST localhost:8080/api/templates/welcome/render?entity=Customer&id=$ID \
      -H "Authorization: Bearer $JWT" -H 'content-type: application/json' -d '{}'
 
-# Notifications (§5.18) — types, per-user preferences, multi-channel fan-out + digest.
+# Notifications (§5.18) — types, per-user preferences, multi-channel fan-out +
+# digest. Recipients may be explicit or resolved as “everyone who can read this
+# record” (recipient_strategy=record_readers); email bodies are FLS-projected
+# per recipient and delivered via the pluggable SMTP MailSender.
 curl -X POST localhost:8080/api/notifications/dispatch -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
      -d '{"type_key":"invoice.overdue","recipients":["$USER_ID"],"context":{"record":{"name":"Acme"}}}'
+curl -X POST localhost:8080/api/notifications/dispatch -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"type_key":"record.changed","recipient_strategy":"record_readers","entity":"Customer","record_id":"$ID","context":{"record":{"name":"Acme"}}}'
 
 # Webhooks (§5.21) — versioned HMAC-signed envelope; inbound receiver verifies + dedupes.
 curl -X POST localhost:8080/api/webhooks -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
      -d '{"name":"sync","url":"https://ext/hook","event_types":["record.created"],"secret_ref":"wh_secret"}'
 
-# Integration (§5.22) — hub model: inbound materializes into biz.*, keyed by external id.
+# Integration (§5.22) — hub model: inbound materializes into biz.*, keyed by
+# external id. Conflict policies: last_write_wins | manual | field_level_sor;
+# a `debatch` flow step fans one payload into many records.
 curl -X POST localhost:8080/api/flows/$FLOW_ID/run -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
      -d '{"payload":{"external_id":"A1","name":"Acme","tier":"Gold"}}'
@@ -128,7 +144,8 @@ curl "localhost:8080/api/external-ids/Customer/A1?system=acme" -H "Authorization
 
 # Scheduled jobs (§14) — cron-driven modeler schedules with next-run/last-run/
 # failure state + per-run history. `report` runs a saved report under the
-# schedule's running user; `custom` is an extensibility hook.
+# schedule's running user; `integration` pulls an inbound flow from its connector
+# on cadence (scheduled sync); `custom` is an extensibility hook.
 curl -X POST localhost:8080/api/schedules -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
      -d '{"name":"nightly","kind":"report","target_id":"'$REP_ID'","cron":"0 0 * * * *"}'

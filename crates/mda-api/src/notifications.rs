@@ -28,6 +28,7 @@ use mda_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -421,11 +422,57 @@ impl Channel for InAppChannel {
     }
 }
 
+/// FLS-under-recipient (§5.18 follow-up): produce a render context for this
+/// recipient where any `record` field they may not read is dropped, so an email
+/// body can never leak an unreadable field. Falls back to the original context
+/// when there's no record, no entity, or the identity can't be resolved.
+async fn project_context_for_recipient(pool: &PgPool, d: &Delivery) -> Value {
+    let (Some(entity), Some(rec)) = (d.entity.as_deref(), d.context.get("record")) else {
+        return d.context.clone();
+    };
+    let Some(rec_obj) = rec.as_object() else {
+        return d.context.clone();
+    };
+    let Ok(identity) = mda_security::load_identity(pool, d.recipient, d.tenant).await else {
+        return d.context.clone(); // best-effort: render as-is
+    };
+    let mut projected = d.context.clone();
+    if let Some(out) = projected.get_mut("record").and_then(|v| v.as_object_mut()) {
+        let kept: serde_json::Map<String, Value> = rec_obj
+            .iter()
+            .filter(|(k, _)| identity.field_access(entity, k) != mda_security::Access::None)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        *out = kept;
+    }
+    projected
+}
+
 /// Email: render the linked template (§5.19) under the render context and record
 /// a `sys_message` (delivered-message log). The recipient address is resolved
-/// from `sec_user.email`. SMTP transport is a follow-up; the message is recorded
-/// here for audit + delivery retries.
-pub struct EmailChannel;
+/// from `sec_user.email`. The render context is FLS-projected under the
+/// recipient so a field they may not read is never emitted. The message is then
+/// handed to the pluggable [`crate::mail::MailSender`] (a real SMTP relay when
+/// configured, else a safe no-op — the `sys_message` row is the audit/retry
+/// record either way).
+pub struct EmailChannel {
+    sender: std::sync::Arc<dyn crate::mail::MailSender>,
+}
+
+impl EmailChannel {
+    /// Build an email channel with an explicit mail sender (tests).
+    pub fn new(sender: std::sync::Arc<dyn crate::mail::MailSender>) -> Self {
+        Self { sender }
+    }
+}
+
+impl Default for EmailChannel {
+    fn default() -> Self {
+        Self {
+            sender: crate::mail::sender_from_env(),
+        }
+    }
+}
 
 #[async_trait]
 impl Channel for EmailChannel {
@@ -434,6 +481,7 @@ impl Channel for EmailChannel {
     }
     async fn deliver(&self, pool: &PgPool, d: &Delivery) -> Result<()> {
         // resolve recipient email under the tenant GUC (sec_user is RLS-gated).
+        let render_context = project_context_for_recipient(pool, d).await;
         let (to_addr, body, content_type) = {
             let mut tx = pool.begin().await.map_err(Error::internal)?;
             mda_security::set_tenant(&mut tx, d.tenant).await?;
@@ -466,14 +514,14 @@ impl Channel for EmailChannel {
                                 locale: None,
                             };
                             let reg = mda_expression::Registry::new();
-                            let rendered = mda_reports::render(&tpl, &d.context, &reg)
+                            let rendered = mda_reports::render(&tpl, &render_context, &reg)
                                 .map_err(Error::internal)?;
                             (rendered.body, rendered.content_type)
                         }
-                        None => (d.context.to_string(), "application/json".to_string()),
+                        None => (render_context.to_string(), "application/json".to_string()),
                     }
                 }
-                None => (d.context.to_string(), "application/json".to_string()),
+                None => (render_context.to_string(), "application/json".to_string()),
             };
             tx.commit().await.map_err(Error::internal)?;
             (to, body, content_type)
@@ -494,14 +542,36 @@ impl Channel for EmailChannel {
         .execute(pool)
         .await
         .map_err(Error::internal)?;
+
+        // Hand the rendered message to the transport (record-then-send: a send
+        // failure is logged but does not fail the delivery — `sys_message` is
+        // the durable record a retry worker re-sends from).
+        if let Some(to) = to_addr {
+            let from =
+                std::env::var("MDA_SMTP_FROM").unwrap_or_else(|_| "no-reply@mda.local".into());
+            if let Err(e) = self
+                .sender
+                .send(&crate::mail::OutgoingEmail {
+                    from,
+                    to,
+                    subject: d.label.clone(),
+                    body,
+                    content_type,
+                })
+                .await
+            {
+                tracing::warn!(?e, %d.recipient, "smtp send failed (message still recorded)");
+            }
+        }
         Ok(())
     }
 }
 
-/// The default channel set (in-app + email). The webhook channel is added by the
-/// integration/webhook layer (§5.21).
+/// The default channel set (in-app + email). The email channel uses the
+/// env-configured mail sender (SMTP relay when configured, else a no-op). The
+/// webhook channel is added by the integration/webhook layer (§5.21).
 pub fn default_channels() -> Vec<Box<dyn Channel>> {
-    vec![Box::new(InAppChannel), Box::new(EmailChannel)]
+    vec![Box::new(InAppChannel), Box::new(EmailChannel::default())]
 }
 
 // ===== fan-out (driven by the outbox drain) =====
@@ -576,6 +646,76 @@ pub async fn fanout(pool: &PgPool, channels: &[Box<dyn Channel>], payload: &Valu
     Ok(())
 }
 
+// ===== recipient resolution (ADR-0013 record-share materialization) =====
+
+/// Resolve every user who can READ a given record — the §5.18 "notify everyone
+/// who can read this record" recipient set. Combines:
+/// - **object-level**: an active user whose role grants `read` on the entity
+///   (the wildcard `*/*` counts) — always required (the gate to read any record);
+/// - **record-level**: the owner + anyone with a direct share, OR — when the
+///   entity's OWD grants org-wide read — every object-level reader.
+///
+/// Team-OWD (sub-team materialization) is treated like `private` here (owner +
+/// shares); full team-hierarchy traversal is a deeper ADR-0013 refinement.
+pub async fn resolve_record_readers(
+    pool: &PgPool,
+    tenant: Uuid,
+    entity: &str,
+    owner_id: Uuid,
+    record_id: Uuid,
+) -> Result<Vec<Uuid>> {
+    let owd = mda_security::resolve_owd(pool, tenant, entity).await?;
+    let public_read = owd.allows_read_for_all();
+
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    // object-level readers: any active user with a role granting read on the
+    // entity (or the wildcard).
+    let object_readers: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT u.id FROM sec.sec_user u
+          JOIN sec.sec_role_assignment a ON a.user_id = u.id
+          JOIN sec.sec_permission p ON p.role_id = a.role_id
+         WHERE u.tenant_id = $1 AND u.active
+           AND (p.entity = $2 OR p.entity = '*')
+           AND (p.verb = 'read' OR p.verb = '*')",
+    )
+    .bind(tenant)
+    .bind(entity)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+
+    if public_read {
+        tx.commit().await.map_err(Error::internal)?;
+        return Ok(object_readers);
+    }
+    // private/team: owner + direct share principals, intersected with the
+    // object-level read gate (no object-level read → can't read any record).
+    let allowed: HashSet<Uuid> = object_readers.iter().copied().collect();
+    let mut readers: HashSet<Uuid> = HashSet::new();
+    if allowed.contains(&owner_id) {
+        readers.insert(owner_id);
+    }
+    let shares: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT principal_id FROM sec.sec_record_share
+          WHERE tenant_id = $1 AND entity = $2 AND record_id = $3
+            AND access IN ('read','write')",
+    )
+    .bind(tenant)
+    .bind(entity)
+    .bind(record_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    for p in shares {
+        if allowed.contains(&p) {
+            readers.insert(p);
+        }
+    }
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(readers.into_iter().collect())
+}
+
 // ===== dispatch (enqueue from the write path) =====
 
 /// Enqueue a `notification.fanout` outbox row transactionally. Call this from a
@@ -611,11 +751,18 @@ pub async fn dispatch(
 
 /// `POST /api/notifications/dispatch` — system-triggered fan-out (also the
 /// testable entry point). Enqueues a `notification.fanout` row; the drain
-/// delivers it.
+/// delivers it. With `recipient_strategy: "record_readers"` the recipients are
+/// resolved as "everyone who can read this record" (ADR-0013 materialization)
+/// instead of being listed explicitly.
 #[derive(Debug, Deserialize)]
 struct DispatchBody {
     type_key: String,
+    #[serde(default)]
     recipients: Vec<Uuid>,
+    /// `explicit` (default — use `recipients`) | `record_readers` (resolve
+    /// everyone who can read `entity`/`record_id`).
+    #[serde(default)]
+    recipient_strategy: Option<String>,
     entity: Option<String>,
     record_id: Option<Uuid>,
     #[serde(default)]
@@ -627,12 +774,46 @@ async fn dispatch_endpoint(
     AuthUser(user): AuthUser,
     Json(body): Json<DispatchBody>,
 ) -> ApiResult<StatusCode> {
+    // Resolve the effective recipient set up-front (before the dispatch tx) so
+    // the resolution reads (record + sec graph) don't hold the outbox tx open.
+    let recipients = match body.recipient_strategy.as_deref() {
+        Some("record_readers") => {
+            let entity = body
+                .entity
+                .as_deref()
+                .ok_or_else(|| Error::Invalid("record_readers strategy needs `entity`".into()))?;
+            let record_id = body.record_id.ok_or_else(|| {
+                Error::Invalid("record_readers strategy needs `record_id`".into())
+            })?;
+            let entity_id =
+                mda_meta::loader::entity_id_by_name(&st.pool, user.tenant_id, entity).await?;
+            let def = mda_meta::loader::load_entity_definition(&st.pool, user.tenant_id, entity_id)
+                .await?;
+            // read under a superuser scope to learn the owner (the resolution
+            // itself re-applies record-level visibility per recipient).
+            let rec = mda_data::read(
+                &st.pool,
+                user.tenant_id,
+                &def,
+                record_id,
+                &mda_data::RecordScope::superuser(user.user_id),
+            )
+            .await?;
+            let owner = rec["owner_id"]
+                .as_str()
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .ok_or_else(|| Error::internal(anyhow::anyhow!("record missing owner_id")))?;
+            resolve_record_readers(&st.pool, user.tenant_id, entity, owner, record_id).await?
+        }
+        _ => body.recipients.clone(),
+    };
+
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     dispatch(
         &mut tx,
         user.tenant_id,
         &body.type_key,
-        &body.recipients,
+        &recipients,
         body.entity.as_deref(),
         body.record_id,
         &body.context,

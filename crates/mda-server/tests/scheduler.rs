@@ -420,3 +420,99 @@ async fn manual_trigger_runs_report_and_counts_rows() {
     assert_eq!(runs[0]["status"], "ok");
     assert!(runs[0]["rows_affected"].as_i64().unwrap() >= 1);
 }
+
+/// A mock external source serving a fixed JSON array at `/customers`.
+async fn mock_source(records: Value) -> String {
+    let app = axum::Router::new().route(
+        "/customers",
+        axum::routing::get(move || {
+            let r = records.clone();
+            async move { axum::Json(r) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn integration_schedule_pulls_flow_from_connector() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    let base = mock_source(json!([
+        {"external_id":"A1","name":"Acme","tier":"Gold"},
+        {"external_id":"B2","name":"Globex","tier":"Silver"}
+    ]))
+    .await;
+
+    // connector + inbound pull flow bound to it.
+    let (_, c) = call(
+        &ctx.app,
+        "POST",
+        "/api/connectors",
+        &ctx.token,
+        Some(
+            json!({"name":"src","transport":"http","base_url":base,"auth":{"kind":"none"}})
+                .to_string(),
+        ),
+    )
+    .await;
+    let connector_id = c["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let (_, f) = call(
+        &ctx.app,
+        "POST",
+        "/api/flows",
+        &ctx.token,
+        Some(
+            json!({"name":"pull","direction":"inbound","entity":"Customer",
+                   "connector_id":connector_id,"endpoint_path":"/customers",
+                   "mapping":{"name":"name","tier":"tier"},
+                   "external_key_field":"external_id","system":"acme"})
+            .to_string(),
+        ),
+    )
+    .await;
+    let flow_id = f["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // schedule the flow (the `integration` kind pulls on cadence).
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/schedules",
+        &ctx.token,
+        Some(
+            json!({"name":"nightly_pull","kind":"integration","target_id":flow_id,"cron":"0 0 * * * *"})
+                .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "create schedule: {v}");
+    let sched_id = v["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // manual trigger pulls from the connector and materializes.
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/schedules/{sched_id}/run"),
+        &ctx.token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "trigger: {v}");
+    assert_eq!(v["status"], "ok", "pull ran: {v}");
+    assert_eq!(v["rows"].as_i64().unwrap(), 2, "two records pulled: {v}");
+
+    // the Customers were materialized into the canonical entity.
+    let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
+    assert_eq!(list["items"].as_array().unwrap().len(), 2);
+}

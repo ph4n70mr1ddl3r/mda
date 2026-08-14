@@ -22,6 +22,7 @@ pub mod extract;
 pub mod graphql;
 pub mod history;
 pub mod integrations;
+pub mod mail;
 pub mod notifications;
 pub mod observability;
 pub mod reports;

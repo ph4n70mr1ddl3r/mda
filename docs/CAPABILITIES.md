@@ -76,27 +76,60 @@ so object / field / record security applies by construction on every surface.
   layer as REST → object/field/record AuthZ by construction (needs `read` else
   nothing returned; FLS projects unreadable fields; ownership/OWD predicate
   injected; a nested reference loads only if the caller can read the target).
+- `Mutation.create/update/delete<Entity>` (now implemented — reads + writes reach
+  REST parity): each mutation calls the **same** write service as REST
+  (`create/update/delete_record_service`) so RBAC + FLS write-check + rules +
+  calculated fields + audit all fire identically. OCC conflicts and AuthZ denials
+  surface as GraphQL errors carrying the stable `code` extension (`mda.conflict`,
+  `mda.forbidden`, …) — the same keys as the REST envelope.
 - Depth + complexity limits deny expensive nested queries (§5.17).
-- MVP scope (ADR-0010): **query/traversal-first**; mutations reach REST parity
-  progressively (clients mutate via `/api/data/:entity/*` for now).
 
 ## Verification
 
-- Unit: secrets n/a (trait); templating (6); expression (6); integration (5).
+- Unit: secrets n/a (trait); templating (6); expression (6); integration (7);
+  mail (3).
 - DB-backed (each its own fresh database, fully parallel):
-  secrets (2) · templates (2) · notifications (4) · webhooks (4) ·
-  integration_flows (4) · graphql (3). Plus the full prior suite green.
+  secrets (2) · templates (2) · notifications (6) · webhooks (4) ·
+  integration_flows (6) · graphql (5) · scheduler (4). Plus the full prior suite
+  green.
 
 ## Decisions / deferrals
 
-- **Notification recipients are explicit** in `dispatch` (the rule/workflow knows
-  who — assignee/owner/named user). Full "notify everyone who can read this
-  record" (record-share materialization, ADR-0013) + FLS-under-recipient for
-  email rendering are follow-ups.
-- **Integration running_user** uses a system principal (superuser scope); a
-  per-flow `running_user` with scoped AuthZ is a follow-up. SMTP send + scheduled
-  (cron) flow execution (apalis) are follow-ups (event/webhook-triggered is the
-  v1 path); debatching/batching steps + `field_level_sor` conflict policy land
-  with them.
-- **GraphQL** returns reads; mutations + GraphQL-side FLS-under-different-recipient
-  are progressive. Schema is cached per version (not hot-reloaded on invalidation).
+The earlier follow-ups are now **implemented** (each with a DB-backed test):
+
+- **Notification recipients — “notify everyone who can read this record”** is
+  now resolvable. `recipient_strategy: "record_readers"` on
+  `POST /api/notifications/dispatch` resolves the owner + direct shares +, when
+  the entity's OWD grants org-wide read, every active user whose role grants
+  object-level `read` (ADR-0013 record-share materialization).
+  `resolve_record_readers` is the reusable helper (call from a rule/workflow).
+- **FLS-under-recipient for email rendering** — the email channel now FLS-
+  projects the render context per recipient (`record` fields the recipient may
+  not read are dropped before the template renders), so a notification email can
+  never leak an unreadable field.
+- **Email transport (SMTP send)** — a pluggable `MailSender` boundary
+  (`mda-api::mail`) with a minimal SMTP relay client (`SmtpMailSender`,
+  env-configured `MDA_SMTP_*`) and a safe `NoopMailSender` default. The message
+  is recorded in `sys_message` either way (audit + a retry worker re-sends).
+  TLS/SMTP-AUTH/`lettre` plug in behind the same trait.
+- **Integration `field_level_sor` conflict policy** — a per-flow `config.sor_fields`
+  list declares which canonical fields an external system owns; on update the
+  hub writes only those, preserving fields owned by other systems.
+- **Integration debatching** — a `debatch` flow step fans one inbound payload
+  (an array field) into N canonical records (the parent context propagates).
+- **Integration per-flow `running_user`** — `int.flow.running_user_id` makes new
+  records owned by a scoped principal instead of a blanket system superuser.
+- **Integration scheduled (cron) execution** — the scheduler's `integration`
+  kind pulls an inbound flow from its connector on cadence and materializes the
+  fetched records (`fetch_and_run_inbound`; the same path a webhook trigger uses).
+
+Remaining, still-deferred (lower priority / tied to other work):
+
+- **GraphQL** schema is cached per version (not hot-reloaded on invalidation);
+  a publish advances the version, which rebuilds it.
+- **Team-OWD** sub-team materialization for recipient resolution treats `team`
+  like `private` (owner + shares); full team-hierarchy traversal is a deeper
+  ADR-0013 refinement.
+- **Tenant-scoped data export/restore + data residency** remain tied to the
+tenant lifecycle (§5.4) and HA (U9); tenant *configuration* export already
+ships (`GET /api/tenants/export`).

@@ -30,6 +30,7 @@ decision and links back.
 | [0017](0017-rollup-summaries-incremental-sync-default-async-opt-out.md) | Rollup summaries: incremental sync by default, async opt-out for hot parents | Accepted |
 | [0018](0018-surfaced-capabilities-history-observability-error-taxonomy.md) | Surfaced platform capabilities: record history/as-of, observability console, error taxonomy | Accepted |
 | [0019](0019-scheduled-job-management.md) | Scheduled-job management: cron-driven scheduler | Accepted |
+| [0020](0020-platform-followups-graphql-mutations-recipient-resolution-integration-completeness.md) | Platform follow-ups: GraphQL mutations, recipient resolution, integration completeness | Accepted |
 
 ## Status legend
 `Proposed` → `Accepted` → `Deprecated` / `Superseded by ADR-NNNN`.

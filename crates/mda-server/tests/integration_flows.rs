@@ -196,7 +196,11 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let rec1 = v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let rec1 = v["record_ids"][0]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
 
     // second delivery, same key, different tier: update (no duplicate).
     let (st, v) = call(
@@ -208,7 +212,11 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let rec2 = v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let rec2 = v["record_ids"][0]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
     assert_eq!(rec1, rec2, "same external key → same record");
 
     // one Customer row, tier Silver.
@@ -240,7 +248,11 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(
-        v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
+        v["record_ids"][0]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
         rec1
     );
 
@@ -253,7 +265,11 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
         Some(json!({"payload":{"external_id":"B2","name":"Globex","tier":"Bronze"}}).to_string()),
     )
     .await;
-    let rec3 = v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let rec3 = v["record_ids"][0]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
     assert_ne!(rec3, rec1);
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
     assert_eq!(list["items"].as_array().unwrap().len(), 2);
@@ -376,7 +392,7 @@ async fn inbound_value_map_step_translates_codes() {
         ),
     )
     .await;
-    assert!(v["record_id"].as_str().is_some());
+    assert!(v["record_ids"][0].as_str().is_some());
 
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
     let row = &list["items"].as_array().unwrap()[0];
@@ -477,4 +493,157 @@ async fn webhook_to_inbound_flow_materializes_via_drain() {
         .unwrap();
     assert_eq!(n, 1, "external id registered");
     let _ = flow_id;
+}
+
+#[tokio::test]
+async fn field_level_sor_preserves_non_owned_fields() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // inbound flow: this external system owns only `name` (not `tier").
+    let (_, f) = call(
+        &ctx.app,
+        "POST",
+        "/api/flows",
+        &ctx.token,
+        Some(
+            json!({"name":"sor_in","direction":"inbound","entity":"Customer",
+                   "mapping":{"name":"name","tier":"tier"},
+                   "external_key_field":"external_id","system":"acme",
+                   "conflict_policy":"field_level_sor","config":{"sor_fields":["name"]}})
+            .to_string(),
+        ),
+    )
+    .await;
+    let flow_id = f["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // first delivery creates a Customer.
+    let (_, v) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/flows/{flow_id}/run"),
+        &ctx.token,
+        Some(json!({"payload":{"external_id":"A1","name":"Acme","tier":"Gold"}}).to_string()),
+    )
+    .await;
+    let rec = v["record_ids"][0]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+
+    // an internal edit to a NON-SOR field (tier → Silver): something the hub
+    // owns, which the external system must not clobber.
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/data/Customer/{rec}"))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", ctx.token),
+        )
+        .header("if-match", "\"1\"")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"tier":"Silver"}).to_string()))
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // second delivery (same key): external wants name=Globex, tier=Bronze.
+    let (_, v) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/flows/{flow_id}/run"),
+        &ctx.token,
+        Some(json!({"payload":{"external_id":"A1","name":"Globex","tier":"Bronze"}}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        v["record_ids"][0]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap(),
+        rec
+    );
+
+    // name (SOR) was overwritten; tier (non-SOR) is preserved.
+    let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
+    let row = &list["items"].as_array().unwrap()[0];
+    assert_eq!(row["name"], "Globex", "SOR field overwritten by external");
+    assert_eq!(
+        row["tier"], "Silver",
+        "non-SOR field preserved (not Bronze)"
+    );
+}
+
+#[tokio::test]
+async fn debatch_step_materializes_array_into_records() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // inbound flow with a `debatch` step (field=items) + identity mapping.
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    let (flow_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO int.flow (tenant_id, name, direction, entity, mapping, external_key_field, system)
+         VALUES ($1,'deb_in','inbound','Customer',$2,'external_id','acme') RETURNING id",
+    )
+    .bind(ctx.tenant)
+    .bind(json!({"name":"name","tier":"tier"}))
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO int.flow_step (flow_id, seq, kind, config) VALUES ($1, 1, 'debatch', $2)",
+    )
+    .bind(flow_id)
+    .bind(json!({"field":"items"}))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // one payload carrying two items + a shared batch field.
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/flows/{flow_id}/run"),
+        &ctx.token,
+        Some(
+            json!({"payload":{
+                "source":"ERP",
+                "items":[
+                    {"external_id":"A1","name":"Acme","tier":"Gold"},
+                    {"external_id":"B2","name":"Globex","tier":"Silver"}
+                ]
+            }})
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["record_ids"].as_array().unwrap().len(),
+        2,
+        "two records: {v}"
+    );
+
+    let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
+    assert_eq!(
+        list["items"].as_array().unwrap().len(),
+        2,
+        "both materialized"
+    );
 }

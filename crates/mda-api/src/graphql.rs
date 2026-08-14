@@ -18,8 +18,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_graphql::dynamic::{
-    Field, FieldFuture, FieldValue, Object, Schema, SchemaBuilder, TypeRef,
+    Field, FieldFuture, FieldValue, InputObject, InputValue, Object, Schema, SchemaBuilder, TypeRef,
 };
+use async_graphql::ErrorExtensions;
 use async_graphql::Value as GqlValue;
 use axum::extract::State;
 use axum::routing::post;
@@ -83,7 +84,7 @@ async fn schema_for(st: &AppState, tenant: Uuid) -> Result<Schema, Error> {
     if let Some(s) = st.gql.read().await.get(&(tenant, version)) {
         return Ok(s.clone());
     }
-    let schema = build_schema(&st.pool, tenant).await?;
+    let schema = build_schema(st, tenant).await?;
     st.gql
         .write()
         .await
@@ -185,7 +186,8 @@ fn field_of<'a>(v: &'a GqlValue, name: &str) -> Option<&'a GqlValue> {
 }
 
 /// Build the dynamic schema for a tenant from its active model.
-async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error> {
+async fn build_schema(st: &AppState, tenant: Uuid) -> Result<Schema, Error> {
+    let pool = &st.pool;
     let entity_ids = loader::entity_ids_for_tenant(pool, tenant).await?;
     let mut defs: Vec<EntityDefinition> = Vec::new();
     for id in entity_ids {
@@ -199,7 +201,8 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
     );
 
     let mut query = Object::new("Query");
-    let mut builder: SchemaBuilder = Schema::build("Query", None, None);
+    let mut mutation = Object::new("Mutation");
+    let mut builder: SchemaBuilder = Schema::build("Query", Some("Mutation"), None);
 
     for def in &defs {
         let entity_name = def.entity.name.clone();
@@ -275,6 +278,105 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
             ));
         }
         builder = builder.register(obj);
+
+        // ===== input type for create/update mutations =====
+        // One nullable scalar field per data field + relationship FK. Keeping
+        // fields nullable lets a client set only the subset they care about on a
+        // PATCH; required-ness is enforced by the shared write service.
+        let input_name = format!("{entity_name}Input");
+        let mut input_obj = InputObject::new(input_name.clone());
+        for f in &def.fields {
+            input_obj = input_obj.field(InputValue::new(f.name.clone(), gql_type(&f.field_type)));
+        }
+        for rel in &def.relationships {
+            input_obj = input_obj.field(InputValue::new(
+                rel.source_field_name.clone(),
+                TypeRef::named(TypeRef::STRING),
+            ));
+        }
+        builder = builder.register(input_obj);
+
+        // ===== mutation: create<Entity>(input): <Entity> =====
+        let st_c = st.clone();
+        let en_c = entity_name.clone();
+        mutation = mutation.field(
+            Field::new(
+                format!("create{entity_name}"),
+                TypeRef::named(&entity_name),
+                move |ctx| {
+                    let st = st_c.clone();
+                    let entity = en_c.clone();
+                    FieldFuture::new(async move {
+                        let user = ctx.data::<Identity>()?.clone();
+                        let body = gql_input_to_json(ctx.args.get("input"))?;
+                        let rec = crate::data::create_record_service(&st, &user, &entity, body)
+                            .await
+                            .map_err(api_err_to_gql)?;
+                        Ok(Some(FieldValue::value(record_to_gql(&rec))))
+                    })
+                },
+            )
+            .argument(InputValue::new(
+                "input",
+                TypeRef::named_nn(input_name.clone()),
+            )),
+        );
+
+        // ===== mutation: update<Entity>(id, version, input): <Entity> =====
+        let st_u = st.clone();
+        let en_u = entity_name.clone();
+        let in_u = input_name.clone();
+        mutation = mutation.field(
+            Field::new(
+                format!("update{entity_name}"),
+                TypeRef::named(&entity_name),
+                move |ctx| {
+                    let st = st_u.clone();
+                    let entity = en_u.clone();
+                    FieldFuture::new(async move {
+                        let user = ctx.data::<Identity>()?.clone();
+                        let id = parse_id(ctx.args.get("id"))?;
+                        let version = ctx.args.get("version").and_then(|a| a.i64().ok());
+                        let Some(version) = version else {
+                            return Err(async_graphql::Error::new("version is required"));
+                        };
+                        let body = gql_input_to_json(ctx.args.get("input"))?;
+                        let rec = crate::data::update_record_service(
+                            &st, &user, &entity, id, version, body,
+                        )
+                        .await
+                        .map_err(api_err_to_gql)?;
+                        Ok(Some(FieldValue::value(record_to_gql(&rec))))
+                    })
+                },
+            )
+            .argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID)))
+            .argument(InputValue::new("version", TypeRef::named_nn(TypeRef::INT)))
+            .argument(InputValue::new("input", TypeRef::named_nn(in_u))),
+        );
+
+        // ===== mutation: delete<Entity>(id): Boolean =====
+        let st_d = st.clone();
+        let en_d = entity_name.clone();
+        mutation = mutation.field(
+            Field::new(
+                format!("delete{entity_name}"),
+                TypeRef::named(TypeRef::BOOLEAN),
+                move |ctx| {
+                    let st = st_d.clone();
+                    let entity = en_d.clone();
+                    FieldFuture::new(async move {
+                        let user = ctx.data::<Identity>()?.clone();
+                        let id = parse_id(ctx.args.get("id"))?;
+                        crate::data::delete_record_service(&st, &user, &entity, id)
+                            .await
+                            .map_err(api_err_to_gql)?;
+                        Ok(Some(FieldValue::value(true)))
+                    })
+                },
+            )
+            .argument(InputValue::new("id", TypeRef::named_nn(TypeRef::ID))),
+        );
 
         // ===== query: <entity>(id: ID!): <Entity> =====
         let pool1 = pool.clone();
@@ -366,12 +468,45 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
         );
     }
 
-    builder = builder.register(query);
+    builder = builder.register(query).register(mutation);
     builder
         .limit_depth(MAX_DEPTH)
         .limit_complexity(MAX_COMPLEXITY)
         .finish()
         .map_err(|e| Error::internal(anyhow::anyhow!("graphql schema build failed: {e}")))
+}
+
+/// Read a GraphQL input-object argument into a serde_json object for the write
+/// service. `as_value()` is the underlying async_graphql::Value, which
+/// serializes to its JSON form — so a typed input object round-trips into a
+/// serde object the shared write service re-validates + coerces.
+fn gql_input_to_json(
+    arg: Option<async_graphql::dynamic::ValueAccessor<'_>>,
+) -> async_graphql::Result<Value> {
+    let Some(a) = arg else {
+        return Ok(Value::Object(serde_json::Map::new()));
+    };
+    serde_json::to_value(a.as_value())
+        .map_err(|e| async_graphql::Error::new(format!("could not read mutation input: {e}")))
+}
+
+/// Parse a GraphQL `id` argument (`ID` → uuid string) into a [`Uuid`].
+fn parse_id(arg: Option<async_graphql::dynamic::ValueAccessor<'_>>) -> async_graphql::Result<Uuid> {
+    let Some(a) = arg else {
+        return Err(async_graphql::Error::new("id is required"));
+    };
+    a.string()
+        .ok()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| async_graphql::Error::new("id must be a UUID"))
+}
+
+/// Map an API-layer error (wrapping the canonical `mda.<kind>` code) into a
+/// GraphQL error. The `code` is preserved as a GraphQL extension so SDK/i18n
+/// clients can branch on it just like the REST envelope.
+fn api_err_to_gql(e: crate::error::ApiError) -> async_graphql::Error {
+    let code = e.0.code();
+    async_graphql::Error::new(e.0.to_string()).extend_with(move |_, v| v.set("code", code))
 }
 
 /// `PascalCase` → `camelCase` for query field names.

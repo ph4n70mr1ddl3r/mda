@@ -113,6 +113,13 @@ struct CreateFlow {
     #[serde(default = "default_lww")]
     conflict_policy: String,
     system: Option<String>,
+    /// Per-flow scoped principal: newly created records are owned by this user
+    /// instead of a blanket system superuser (§5.22 follow-up).
+    #[serde(default)]
+    running_user_id: Option<Uuid>,
+    /// Flow-level config (e.g. `sor_fields` for the `field_level_sor` policy).
+    #[serde(default = "default_empty_obj")]
+    config: Value,
 }
 fn default_empty_obj() -> Value {
     json!({})
@@ -137,8 +144,8 @@ async fn create_flow(
     let row: Option<(Uuid,)> = sqlx::query_as(
         "INSERT INTO int.flow
             (tenant_id, name, direction, entity, connector_id, webhook_id, endpoint_path,
-             mapping, external_key_field, conflict_policy, system)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             mapping, external_key_field, conflict_policy, system, running_user_id, config)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (tenant_id, name) DO NOTHING RETURNING id",
     )
     .bind(user.tenant_id)
@@ -152,6 +159,8 @@ async fn create_flow(
     .bind(&body.external_key_field)
     .bind(&body.conflict_policy)
     .bind(&body.system)
+    .bind(body.running_user_id)
+    .bind(&body.config)
     .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
@@ -223,9 +232,10 @@ async fn run_flow(
             let external = body
                 .payload
                 .ok_or_else(|| Error::Invalid("inbound run needs {\"payload\":{...}}".into()))?;
-            let rid = mda_integration::run_inbound(&st.pool, &def, &flow, &external, user.user_id)
-                .await?;
-            Ok(Json(json!({"record_id": rid})))
+            let ids =
+                mda_integration::run_inbound_batch(&st.pool, &def, &flow, &external, user.user_id)
+                    .await?;
+            Ok(Json(json!({"record_ids": ids})))
         }
         "outbound" => {
             let record = body

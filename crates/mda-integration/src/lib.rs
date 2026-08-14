@@ -211,6 +211,12 @@ pub struct Flow {
     pub external_key_field: String,
     pub conflict_policy: String,
     pub system: Option<String>,
+    /// Per-flow scoped principal (§5.22 follow-up): newly created records are
+    /// owned by this user when set, instead of a blanket system superuser.
+    pub running_user_id: Option<Uuid>,
+    /// Flow-level config (currently `sor_fields` for the `field_level_sor`
+    /// conflict policy: the canonical fields this external system owns).
+    pub config: Value,
 }
 
 /// A transform step loaded from `int.flow_step` (ordered by seq).
@@ -243,10 +249,12 @@ pub async fn flow_for_webhook(
         String,
         String,
         Option<String>,
+        Option<Uuid>,
+        Value,
     );
     let row: Option<FlowRow> = sqlx::query_as(
         "SELECT id, name, direction, entity, connector_id, webhook_id, endpoint_path,
-                mapping, external_key_field, conflict_policy, system
+                mapping, external_key_field, conflict_policy, system, running_user_id, config
            FROM int.flow
           WHERE tenant_id = $1 AND webhook_id = $2 AND active = TRUE AND direction = 'inbound'",
     )
@@ -269,6 +277,8 @@ pub async fn flow_for_webhook(
         external_key_field: r.8,
         conflict_policy: r.9,
         system: r.10,
+        running_user_id: r.11,
+        config: r.12,
     }))
 }
 
@@ -289,10 +299,12 @@ pub async fn flow_by_id(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<Flow> {
         String,
         String,
         Option<String>,
+        Option<Uuid>,
+        Value,
     );
     let row: Option<Row> = sqlx::query_as(
         "SELECT id, name, direction, entity, connector_id, webhook_id, endpoint_path,
-                mapping, external_key_field, conflict_policy, system
+                mapping, external_key_field, conflict_policy, system, running_user_id, config
            FROM int.flow WHERE tenant_id = $1 AND id = $2",
     )
     .bind(tenant)
@@ -315,6 +327,8 @@ pub async fn flow_by_id(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<Flow> {
         external_key_field: r.8,
         conflict_policy: r.9,
         system: r.10,
+        running_user_id: r.11,
+        config: r.12,
     })
 }
 
@@ -508,18 +522,74 @@ async fn upsert_external(
     Ok(())
 }
 
-/// Run an inbound flow: map the external payload → biz record, apply transforms,
-/// and upsert by external key (idempotent). Returns the materialized record id.
-/// `system_user` is the owner assigned to newly created records (the hub applies
-/// its own logic; a per-flow running_user with scoped AuthZ is a follow-up).
-pub async fn run_inbound(
+/// The fields this flow's external system is the authoritative source for (the
+/// `field_level_sor` conflict policy config, §5.22.4). Empty → no SOR declared.
+fn sor_fields_of(flow: &Flow) -> Vec<String> {
+    flow.config
+        .get("sor_fields")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Expand an inbound payload using any `debatch` step: one payload carrying an
+/// array fans out into one payload per element (the parent's non-array context
+/// is overlaid so a batch header propagates to each child). No debatch step →
+/// the single payload is returned unchanged.
+fn expand_debatch(external: &Value, steps: &[FlowStep]) -> Vec<Value> {
+    let Some(step) = steps.iter().find(|s| s.kind == "debatch") else {
+        return vec![external.clone()];
+    };
+    let Some(field) = step.config.get("field").and_then(|v| v.as_str()) else {
+        return vec![external.clone()];
+    };
+    let Some(items) = external.get(field).and_then(|v| v.as_array()) else {
+        return vec![external.clone()];
+    };
+    // parent context minus the debatched array field.
+    let parent = {
+        let mut p = external.clone();
+        if let Some(obj) = p.as_object_mut() {
+            obj.remove(field);
+        }
+        p
+    };
+    items
+        .iter()
+        .map(|item| {
+            if let (Some(_), Some(mi)) = (parent.as_object(), item.as_object()) {
+                let mut merged = parent.clone();
+                let m = merged.as_object_mut().unwrap();
+                for (k, v) in mi {
+                    m.insert(k.clone(), v.clone());
+                }
+                merged
+            } else {
+                item.clone()
+            }
+        })
+        .collect()
+}
+
+/// Process one external payload → one canonical record (map → transform steps →
+/// upsert by external key). Pre-loads nothing: callers pass the already-loaded
+/// steps + value maps so a batched/debatched run loads them once. Returns
+/// `Ok(None)` when a `filter` step rejected the record.
+#[allow(clippy::too_many_arguments)]
+async fn process_one(
     pool: &PgPool,
     def: &EntityDefinition,
     flow: &Flow,
     external: &Value,
-    system_user: Uuid,
-) -> Result<Uuid> {
-    let reg = Registry::new();
+    owner: Uuid,
+    steps: &[FlowStep],
+    value_maps: &HashMap<String, Value>,
+    reg: &Registry,
+) -> Result<Option<Uuid>> {
     let tenant = flow.tenant_id;
     let system = flow.system.clone().unwrap_or_else(|| flow.name.clone());
 
@@ -537,25 +607,30 @@ pub async fn run_inbound(
         })?;
 
     let mut rec = apply_mapping(&flow.mapping, external);
-    let steps = flow_steps(pool, flow.id).await?;
-    let value_maps = load_value_maps(pool, tenant, &steps).await?;
-    if !apply_steps(&steps, &mut rec, &value_maps, &reg)? {
+    if !apply_steps(steps, &mut rec, value_maps, reg)? {
         // a filter step rejected this record — skip (no materialization).
         record_run(pool, tenant, flow, "ok", 0, Some(&external_key), None).await?;
-        return Err(Error::Invalid("record filtered by flow step".into()));
+        return Ok(None);
     }
 
     let existing = lookup_external(pool, tenant, &flow.entity, &system, &external_key).await?;
-
+    let sor_fields = sor_fields_of(flow);
     let record_id = match existing {
         Some(id) => {
-            // update — conflict policy. last_write_wins: apply with the current
-            // version (one retry on OCC conflict). `manual`: a conflict → DLQ.
-            apply_update(pool, tenant, def, id, &rec, &flow.conflict_policy).await?;
+            apply_update(
+                pool,
+                tenant,
+                def,
+                id,
+                &rec,
+                &flow.conflict_policy,
+                &sor_fields,
+            )
+            .await?;
             id
         }
         None => {
-            let created = mda_data::create(pool, tenant, def, rec, system_user).await?;
+            let created = mda_data::create(pool, tenant, def, rec, owner).await?;
             let id = created
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -574,11 +649,95 @@ pub async fn run_inbound(
     )
     .await?;
     record_run(pool, tenant, flow, "ok", 1, Some(&external_key), None).await?;
-    Ok(record_id)
+    Ok(Some(record_id))
 }
 
-/// Apply an inbound update honoring the conflict policy. last_write_wins re-reads
-/// the current version and retries once on OCC conflict.
+/// Run an inbound flow: map the external payload → biz record, apply transforms,
+/// and upsert by external key (idempotent). Returns the materialized record id.
+/// `system_user` is the fallback owner; a per-flow `running_user_id` (if set)
+/// takes precedence so the hub writes under a scoped principal.
+pub async fn run_inbound(
+    pool: &PgPool,
+    def: &EntityDefinition,
+    flow: &Flow,
+    external: &Value,
+    system_user: Uuid,
+) -> Result<Uuid> {
+    let owner = flow.running_user_id.unwrap_or(system_user);
+    let steps = flow_steps(pool, flow.id).await?;
+    let value_maps = load_value_maps(pool, flow.tenant_id, &steps).await?;
+    let reg = Registry::new();
+    process_one(pool, def, flow, external, owner, &steps, &value_maps, &reg)
+        .await?
+        .ok_or_else(|| Error::Invalid("record filtered by flow step".into()))
+}
+
+/// Run an inbound flow over a payload that may carry a batch (a `debatch` step
+/// fans one array into many records). Returns the materialized record ids
+/// (filtered records are simply omitted).
+pub async fn run_inbound_batch(
+    pool: &PgPool,
+    def: &EntityDefinition,
+    flow: &Flow,
+    external: &Value,
+    system_user: Uuid,
+) -> Result<Vec<Uuid>> {
+    let owner = flow.running_user_id.unwrap_or(system_user);
+    let steps = flow_steps(pool, flow.id).await?;
+    let value_maps = load_value_maps(pool, flow.tenant_id, &steps).await?;
+    let reg = Registry::new();
+    let mut ids = Vec::new();
+    for payload in expand_debatch(external, &steps) {
+        if let Some(id) =
+            process_one(pool, def, flow, &payload, owner, &steps, &value_maps, &reg).await?
+        {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Scheduled pull: fetch external records from the flow's connector and
+/// materialize each through the inbound pipeline (the `integration` schedule
+/// kind, §5.22). A single bad record is logged + skipped — it must not abort the
+/// whole pull (at-least-once with a per-record failure surface).
+pub async fn fetch_and_run_inbound(
+    pool: &PgPool,
+    secrets: &dyn SecretStore,
+    def: &EntityDefinition,
+    flow: &Flow,
+    system_user: Uuid,
+) -> Result<Vec<Uuid>> {
+    let connector_id = flow
+        .connector_id
+        .ok_or_else(|| Error::Invalid("inbound pull flow has no connector".into()))?;
+    let (base_url, auth) = connector_for(pool, flow.tenant_id, connector_id).await?;
+    let connector = HttpConnector::new(base_url, auth);
+    let path = flow.endpoint_path.as_deref().unwrap_or("/");
+    let fetched = connector.fetch(path, secrets, flow.tenant_id).await?;
+
+    let owner = flow.running_user_id.unwrap_or(system_user);
+    let steps = flow_steps(pool, flow.id).await?;
+    let value_maps = load_value_maps(pool, flow.tenant_id, &steps).await?;
+    let reg = Registry::new();
+    let mut ids = Vec::new();
+    for external in fetched {
+        for payload in expand_debatch(&external, &steps) {
+            match process_one(pool, def, flow, &payload, owner, &steps, &value_maps, &reg).await {
+                Ok(Some(id)) => ids.push(id),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(%flow.id, err = %e, "inbound pull: record skipped"),
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Apply an inbound update honoring the conflict policy:
+/// - `last_write_wins`: apply the full record, retry once on OCC conflict;
+/// - `manual`: a cross-system OCC conflict is quarantined for a human;
+/// - `field_level_sor`: apply only the fields this system owns (`sor_fields`),
+///   preserving fields owned by other systems, retry once on OCC conflict.
 async fn apply_update(
     pool: &PgPool,
     tenant: Uuid,
@@ -586,6 +745,7 @@ async fn apply_update(
     id: Uuid,
     rec: &Map<String, Value>,
     policy: &str,
+    sor_fields: &[String],
 ) -> Result<()> {
     let scope = RecordScope::superuser(Uuid::nil());
     for _attempt in 0..2 {
@@ -594,11 +754,21 @@ async fn apply_update(
             .get("version")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| Error::internal(anyhow::anyhow!("record missing version")))?;
-        match mda_data::update(pool, tenant, def, id, version, rec.clone(), &scope, None).await {
+        // field_level_sor narrows the write to the fields this system owns.
+        let to_write: Map<String, Value> = if policy == "field_level_sor" && !sor_fields.is_empty()
+        {
+            rec.iter()
+                .filter(|(k, _)| sor_fields.iter().any(|f| f == k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        } else {
+            rec.clone()
+        };
+        match mda_data::update(pool, tenant, def, id, version, to_write, &scope, None).await {
             Ok(_) => return Ok(()),
             Err(e) => {
                 let is_conflict = matches!(e, mda_core::Error::Conflict(_));
-                if is_conflict && policy == "last_write_wins" {
+                if is_conflict && (policy == "last_write_wins" || policy == "field_level_sor") {
                     continue; // retry with the fresh version
                 }
                 if is_conflict && policy == "manual" {
@@ -777,5 +947,63 @@ mod tests {
         let reg = Registry::new();
         assert!(apply_steps(&steps, &mut rec, &HashMap::new(), &reg).unwrap());
         assert_eq!(rec["total"].as_f64().unwrap(), 30.0);
+    }
+
+    #[test]
+    fn debatch_step_fans_array_into_payloads() {
+        // one payload carrying an array of items + a shared batch field.
+        let external = json!({
+            "source": "ERP",
+            "items": [
+                {"external_id": "A1", "name": "Acme"},
+                {"external_id": "B2", "name": "Globex"}
+            ]
+        });
+        let steps = vec![FlowStep {
+            seq: 1,
+            kind: "debatch".into(),
+            config: json!({"field": "items"}),
+        }];
+        let payloads = expand_debatch(&external, &steps);
+        assert_eq!(payloads.len(), 2, "fanned into two payloads");
+        // each child carries its own keys + the shared parent context, but NOT
+        // the debatched array field.
+        assert_eq!(payloads[0]["external_id"], "A1");
+        assert_eq!(payloads[0]["name"], "Acme");
+        assert_eq!(payloads[0]["source"], "ERP", "parent context propagated");
+        assert!(payloads[0].get("items").is_none(), "array field stripped");
+        assert_eq!(payloads[1]["external_id"], "B2");
+
+        // no debatch step → single payload unchanged.
+        let payloads = expand_debatch(&external, &[]);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0], external);
+    }
+
+    #[test]
+    fn sor_fields_filter_to_owned_fields() {
+        // a flow whose external system owns only `name` (not `tier`).
+        let flow = Flow {
+            id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            name: "sor".into(),
+            direction: "inbound".into(),
+            entity: "Customer".into(),
+            connector_id: None,
+            webhook_id: None,
+            endpoint_path: None,
+            mapping: json!({}),
+            external_key_field: "external_id".into(),
+            conflict_policy: "field_level_sor".into(),
+            system: None,
+            running_user_id: None,
+            config: json!({"sor_fields": ["name"]}),
+        };
+        assert_eq!(sor_fields_of(&flow), vec!["name".to_string()]);
+
+        // empty config → no SOR declared.
+        let mut flow2 = flow.clone();
+        flow2.config = json!({});
+        assert!(sor_fields_of(&flow2).is_empty());
     }
 }

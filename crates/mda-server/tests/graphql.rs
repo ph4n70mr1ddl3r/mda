@@ -319,3 +319,152 @@ async fn graphql_depth_limit_denies_deep_query() {
     let v = gql(&ctx, "{ __schema { queryType { name } } }").await;
     assert_eq!(v["data"]["__schema"]["queryType"]["name"], "Query");
 }
+
+#[tokio::test]
+async fn graphql_mutations_create_update_delete() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        model(
+            &format!("c_{}", Uuid::new_v4().simple()),
+            &format!("i_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+
+    // create via mutation — shares the REST write service, so rules + audit fire.
+    let q = "mutation { createCustomer(input: {name: \"Acme\"}) { id name version } }";
+    let v = gql(&ctx, q).await;
+    assert!(
+        v["errors"].as_array().is_none() || v["errors"].as_array().unwrap().is_empty(),
+        "create error: {v}"
+    );
+    let id = v["data"]["createCustomer"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(v["data"]["createCustomer"]["name"], "Acme");
+    let v0 = v["data"]["createCustomer"]["version"].as_i64().unwrap();
+    assert_eq!(v0, 1);
+
+    // read it back via query to confirm the mutation actually persisted.
+    let q = format!("{{ customer(id: \"{id}\") {{ name }} }}");
+    let v = gql(&ctx, &q).await;
+    assert_eq!(v["data"]["customer"]["name"], "Acme");
+
+    // update via mutation — OCC version carried; the version must advance.
+    let q = format!(
+        "mutation {{ updateCustomer(id: \"{id}\", version: {v0}, input: {{name: \"Globex\"}}) {{ name version }} }}"
+    );
+    let v = gql(&ctx, &q).await;
+    assert_eq!(v["data"]["updateCustomer"]["name"], "Globex");
+    assert_eq!(v["data"]["updateCustomer"]["version"].as_i64().unwrap(), 2);
+
+    // a stale version (OCC) surfaces a conflict GraphQL error with the code ext.
+    let q = format!(
+        "mutation {{ updateCustomer(id: \"{id}\", version: {v0}, input: {{name: \"stale\"}}) {{ version }} }}"
+    );
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/graphql",
+        &ctx.token,
+        Some(json!({"query": q}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let errs = v["errors"].as_array().unwrap();
+    assert_eq!(errs.len(), 1);
+    assert_eq!(errs[0]["extensions"]["code"], "mda.conflict", "{v}");
+
+    // delete via mutation, then confirm the record is gone.
+    let q = format!("mutation {{ deleteCustomer(id: \"{id}\") }}");
+    let v = gql(&ctx, &q).await;
+    assert_eq!(v["data"]["deleteCustomer"], true);
+    let q = format!("{{ customer(id: \"{id}\") {{ name }} }}");
+    let v = gql(&ctx, &q).await;
+    assert!(v["data"]["customer"].is_null(), "deleted → null read: {v}");
+}
+
+#[tokio::test]
+async fn graphql_mutation_enforces_authorization() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        model(
+            &format!("c_{}", Uuid::new_v4().simple()),
+            &format!("i_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+
+    // seed a record as admin so a read-only user has something to attempt on.
+    let q = "mutation { createCustomer(input: {name: \"Acme\"}) { id name } }";
+    let v = gql(&ctx, q).await;
+    let id = v["data"]["createCustomer"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // a user with only `read` on Customer — no create/update/delete.
+    let role_id = common::seed_role(&ctx.pool, ctx.tenant, "reader", &[("Customer", "read")]).await;
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let ro_user = common::seed_user(&ctx.pool, ctx.tenant, &email, "reader", &hash).await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, ro_user, role_id).await;
+    let ro_token = JwtConfig::from_env()
+        .issue_access(ro_user, ctx.tenant, None)
+        .unwrap();
+
+    // create is denied (missing `create`) → GraphQL error with the code ext.
+    let q = "mutation { createCustomer(input: {name: \"no\"}) { id } }";
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/graphql",
+        &ro_token,
+        Some(json!({"query": q}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let errs = v["errors"].as_array().unwrap();
+    assert_eq!(errs[0]["extensions"]["code"], "mda.forbidden", "{v}");
+    // data is null — nothing was created
+    assert!(
+        v["data"].is_null() || v["data"]["createCustomer"].is_null(),
+        "{v}"
+    );
+
+    // update is denied too (missing `update`).
+    let q = format!(
+        "mutation {{ updateCustomer(id: \"{id}\", version: 1, input: {{name: \"hack\"}}) {{ name }} }}"
+    );
+    let (_, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/graphql",
+        &ro_token,
+        Some(json!({"query": q}).to_string()),
+    )
+    .await;
+    assert_eq!(v["errors"][0]["extensions"]["code"], "mda.forbidden", "{v}");
+
+    // delete is denied (missing `delete`); the record survives.
+    let q = format!("mutation {{ deleteCustomer(id: \"{id}\") }}");
+    let (_, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/graphql",
+        &ro_token,
+        Some(json!({"query": q}).to_string()),
+    )
+    .await;
+    assert_eq!(v["errors"][0]["extensions"]["code"], "mda.forbidden", "{v}");
+    let q = format!("{{ customer(id: \"{id}\") {{ name }} }}");
+    let v = gql(&ctx, &q).await;
+    assert_eq!(v["data"]["customer"]["name"], "Acme", "record survived");
+}

@@ -15,8 +15,10 @@
 //!   transient failure never blocks the schedule, then runs the job and records
 //!   `sys_schedule_run` + `last_status`/`last_error`.
 //! - Dispatch is by `kind`: `report` runs a saved report under the running user;
-//!   `custom` is a no-op hook (extensibility + the scheduler test). Additional
-//!   kinds (`integration` pull, scheduled `rule`) follow the same shape.
+//!   `integration` pulls an inbound `int.flow` from its connector and
+//!   materializes it (scheduled sync, §5.22); `custom` is a no-op hook
+//!   (extensibility + the scheduler test). A scheduled `rule` kind follows the
+//!   same shape.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -24,7 +26,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use cron::Schedule;
-use mda_core::{Error, Result};
+use mda_core::{Error, Result, SecretStore};
 use mda_security::{load_identity, set_tenant};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -272,7 +274,7 @@ async fn trigger_schedule(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let sched = fetch_for_dispatch(&st.pool, id).await?;
-    let res = dispatch(&st.pool, &sched).await;
+    let res = dispatch(&st.pool, st.secrets.as_ref(), &sched).await;
     // A manual trigger records history too, so the run surface is the same
     // whether the job fired on cadence or by hand.
     record_run(&st.pool, sched.id, sched.tenant, &res).await;
@@ -309,12 +311,20 @@ const TICK: Duration = Duration::from_secs(5);
 /// Spawn the scheduler worker. Multi-instance safe: due rows are claimed with
 /// `FOR UPDATE SKIP LOCKED`. Like the outbox drain, it drains *first* then sleeps
 /// so a freshly-armed schedule is picked up on the next tick, not a full interval
-/// later.
+/// later. Uses a default secret store (env / file) for connector auth.
 pub fn spawn_scheduler(pool: PgPool) {
+    let secrets: std::sync::Arc<dyn SecretStore> =
+        std::sync::Arc::new(crate::secrets::LocalSecretStore::from_env());
+    spawn_scheduler_with(pool, secrets);
+}
+
+/// Spawn the scheduler worker with an explicit secret store (connector auth for
+/// scheduled integration pulls; injectable in tests).
+pub fn spawn_scheduler_with(pool: PgPool, secrets: std::sync::Arc<dyn SecretStore>) {
     tokio::spawn(async move {
         tracing::info!("scheduler worker started");
         loop {
-            if let Err(e) = tick(&pool).await {
+            if let Err(e) = tick(&pool, secrets.as_ref()).await {
                 tracing::warn!(?e, "scheduler tick failed");
             }
             tokio::time::sleep(TICK).await;
@@ -335,7 +345,7 @@ struct DueRow {
 }
 
 /// One scheduling pass: claim all due rows, dispatch each, record the outcome.
-async fn tick(pool: &PgPool) -> Result<(), sqlx::Error> {
+async fn tick(pool: &PgPool, secrets: &dyn SecretStore) -> Result<(), sqlx::Error> {
     loop {
         let mut tx = pool.begin().await?;
         // Claim one due row and advance its next_run inside this transaction so
@@ -382,7 +392,7 @@ async fn tick(pool: &PgPool) -> Result<(), sqlx::Error> {
             target_id: due_row.target_id,
             running_user_id: due_row.running_user_id,
         };
-        let res = dispatch(pool, &sched).await;
+        let res = dispatch(pool, secrets, &sched).await;
         record_run(pool, sched.id, sched.tenant, &res).await;
     }
     Ok(())
@@ -428,7 +438,7 @@ struct RunOutcome {
 }
 
 /// Execute the scheduled job under its running user's AuthZ.
-async fn dispatch(pool: &PgPool, sched: &DispatchTarget) -> RunOutcome {
+async fn dispatch(pool: &PgPool, secrets: &dyn SecretStore, sched: &DispatchTarget) -> RunOutcome {
     let span = tracing::info_span!(
         "schedule_dispatch",
         schedule = %sched.id,
@@ -456,6 +466,10 @@ async fn dispatch(pool: &PgPool, sched: &DispatchTarget) -> RunOutcome {
 
     let result = match sched.kind.as_str() {
         "report" => run_report(pool, &identity, sched.target_id).await,
+        // `integration` pulls an inbound flow from its connector and
+        // materializes the fetched records into the canonical biz entity
+        // (scheduled sync, §5.22). Returns the count materialized.
+        "integration" => run_integration_pull(pool, secrets, &identity, sched.target_id).await,
         // `custom` is an extensibility hook: it succeeds with no rows, letting
         // operators test the scheduler end-to-end and external integrations
         // observe the run via sys_schedule_run.
@@ -499,6 +513,30 @@ async fn run_report(
         serde_json::from_value(dataset).map_err(|e| Error::Invalid(format!("bad dataset: {e}")))?;
     let res = mda_reports::run(pool, identity, &ds).await?;
     Ok(res.rows.len() as i64)
+}
+
+/// Run an inbound `int.flow` pull under `identity` (the `integration` schedule
+/// kind): fetch external records from the connector and materialize each. The
+/// flow's own `running_user_id` (if set) takes precedence as the record owner.
+async fn run_integration_pull(
+    pool: &PgPool,
+    secrets: &dyn SecretStore,
+    identity: &mda_security::Identity,
+    flow_id: Uuid,
+) -> Result<i64> {
+    let flow = mda_integration::flow_by_id(pool, identity.tenant_id, flow_id).await?;
+    if flow.direction != "inbound" {
+        return Err(Error::Invalid(format!(
+            "schedule targets a {} flow; only an inbound flow can be pulled",
+            flow.direction
+        )));
+    }
+    let entity_id =
+        mda_meta::loader::entity_id_by_name(pool, identity.tenant_id, &flow.entity).await?;
+    let def = mda_meta::loader::load_entity_definition(pool, identity.tenant_id, entity_id).await?;
+    let ids = mda_integration::fetch_and_run_inbound(pool, secrets, &def, &flow, identity.user_id)
+        .await?;
+    Ok(ids.len() as i64)
 }
 
 /// Record a run row and update the schedule's last_status/last_error.
@@ -551,9 +589,9 @@ fn parse_cron(expr: &str) -> Result<Schedule> {
 
 fn validate_kind(kind: &str) -> Result<()> {
     match kind {
-        "report" | "custom" => Ok(()),
+        "report" | "integration" | "custom" => Ok(()),
         other => Err(Error::Invalid(format!(
-            "unknown schedule kind '{other}' (supported: report, custom)"
+            "unknown schedule kind '{other}' (supported: report, integration, custom)"
         ))),
     }
 }
@@ -585,6 +623,7 @@ mod tests {
     #[test]
     fn kind_validation() {
         assert!(validate_kind("report").is_ok());
+        assert!(validate_kind("integration").is_ok());
         assert!(validate_kind("custom").is_ok());
         assert!(validate_kind("bogus").is_err());
     }

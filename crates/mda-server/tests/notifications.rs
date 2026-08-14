@@ -359,3 +359,275 @@ async fn digest_rolls_up_digestible_notifications() {
     .unwrap();
     assert_eq!(summary, 1);
 }
+
+/// A Customer model with a `name` (readable) + `secret` (FLS-restrictable) field.
+fn customer_model(table: &str) -> Value {
+    json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null, "name": "Customer",
+            "table_name": table, "label": "Customer", "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(), "name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"secret","label":"Secret","field_type":"string","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+            ],
+            "relationships": []
+        }]
+    })
+}
+
+async fn publish(ctx: &Ctx, model: Value) {
+    let (_, d) = call(
+        &ctx.app,
+        "POST",
+        "/api/studio/drafts",
+        &ctx.token,
+        Some(json!({"name":"p"}).to_string()),
+    )
+    .await;
+    let id = d["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let etag = d["version_etag"].as_str().unwrap();
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/api/studio/drafts/{id}/model"))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", ctx.token),
+        )
+        .header("if-match", etag)
+        .header("content-type", "application/json")
+        .body(Body::from(model.to_string()))
+        .unwrap();
+    let _ = ctx.app.clone().oneshot(req).await.unwrap();
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/studio/drafts/{id}/publish"),
+        &ctx.token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+/// Seed a user with a given role (already created) and return its id.
+async fn seed_user_with_role(pool: &PgPool, tenant: Uuid, role_id: Uuid) -> Uuid {
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(pool, tenant, &email, "n", &hash).await;
+    common::seed_assignment(pool, tenant, uid, role_id).await;
+    uid
+}
+
+#[tokio::test]
+async fn record_readers_strategy_notifies_owner_and_share_not_others() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // an in-app-only notification type.
+    call(
+        &ctx.app,
+        "POST",
+        "/api/notification-types",
+        &ctx.token,
+        Some(
+            json!({"key":"cust.changed","label":"Changed","default_channels":["in_app"]})
+                .to_string(),
+        ),
+    )
+    .await;
+
+    // a reader (read on Customer) + an outsider (no Customer access).
+    let reader_role =
+        common::seed_role(&ctx.pool, ctx.tenant, "reader", &[("Customer", "read")]).await;
+    let reader = seed_user_with_role(&ctx.pool, ctx.tenant, reader_role).await;
+    let outsider_role =
+        common::seed_role(&ctx.pool, ctx.tenant, "outsider", &[("Invoice", "read")]).await;
+    let outsider = seed_user_with_role(&ctx.pool, ctx.tenant, outsider_role).await;
+
+    // a private Customer owned by the admin.
+    let (_, c) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","secret":"shh"}).to_string()),
+    )
+    .await;
+    let rec_id = c["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // share the record with the reader (not the outsider).
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)
+         VALUES ($1, 'Customer', $2, $3, 'read')",
+    )
+    .bind(ctx.tenant)
+    .bind(rec_id)
+    .bind(reader)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // dispatch to "everyone who can read this record".
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        "/api/notifications/dispatch",
+        &ctx.token,
+        Some(
+            json!({"type_key":"cust.changed","recipient_strategy":"record_readers",
+                   "entity":"Customer","record_id":rec_id,"context":{"record":{"name":"Acme"}}})
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+
+    mda_server::outbox::spawn_drain(ctx.pool.clone());
+    wait_drained(&ctx.pool, ctx.tenant).await;
+
+    assert_eq!(count_notif(&ctx, ctx.user_id).await, 1, "owner notified");
+    assert_eq!(
+        count_notif(&ctx, reader).await,
+        1,
+        "share recipient notified"
+    );
+    assert_eq!(
+        count_notif(&ctx, outsider).await,
+        0,
+        "outsider (no read access) NOT notified"
+    );
+}
+
+/// Count a user's in-app notifications for the `cust.changed` type.
+async fn count_notif(ctx: &Ctx, uid: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM sys_notification WHERE tenant_id=$1 AND user_id=$2 AND type='cust.changed'",
+    )
+    .bind(ctx.tenant)
+    .bind(uid)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap()
+}
+
+/// Newest delivered message body for a user (for FLS-under-recipient checks).
+async fn message_body(ctx: &Ctx, uid: Uuid) -> String {
+    let (b,): (String,) = sqlx::query_as(
+        "SELECT body FROM sys_message WHERE tenant_id=$1 AND user_id=$2 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(ctx.tenant)
+    .bind(uid)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    b
+}
+
+#[tokio::test]
+async fn email_rendering_respects_recipient_fls() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // a template that emits both the readable + the FLS-restricted field.
+    call(
+        &ctx.app,
+        "POST",
+        "/api/templates",
+        &ctx.token,
+        Some(
+            json!({"name":"fls_test","body":"{{ record.name }} | {{ record.secret }}"}).to_string(),
+        ),
+    )
+    .await;
+    call(
+        &ctx.app,
+        "POST",
+        "/api/notification-types",
+        &ctx.token,
+        Some(json!({"key":"cust.detail","label":"Detail","default_channels":["email"],"template_name":"fls_test"}).to_string()),
+    )
+    .await;
+
+    // a reader with read on Customer but `secret` = none.
+    let reader_role =
+        common::seed_role(&ctx.pool, ctx.tenant, "reader2", &[("Customer", "read")]).await;
+    let reader = seed_user_with_role(&ctx.pool, ctx.tenant, reader_role).await;
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    sqlx::query("INSERT INTO sec.sec_field_permission (role_id, entity, field, access) VALUES ($1,'Customer','secret','none')")
+        .bind(reader_role)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // a Customer owned by the admin, shared with the reader.
+    let (_, c) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","secret":"topsecret"}).to_string()),
+    )
+    .await;
+    let rec_id = c["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)
+         VALUES ($1, 'Customer', $2, $3, 'read')",
+    )
+    .bind(ctx.tenant)
+    .bind(rec_id)
+    .bind(reader)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    // dispatch to everyone who can read the record, carrying both fields.
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        "/api/notifications/dispatch",
+        &ctx.token,
+        Some(
+            json!({"type_key":"cust.detail","recipient_strategy":"record_readers",
+                   "entity":"Customer","record_id":rec_id,
+                   "context":{"record":{"name":"Acme","secret":"topsecret"}}})
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    mda_server::outbox::spawn_drain(ctx.pool.clone());
+    wait_drained(&ctx.pool, ctx.tenant).await;
+
+    // owner (full access) sees BOTH fields; reader (secret=none) sees only name.
+    let owner_body = message_body(&ctx, ctx.user_id).await;
+    let reader_body = message_body(&ctx, reader).await;
+    assert!(
+        owner_body.contains("Acme") && owner_body.contains("topsecret"),
+        "owner sees both: {owner_body}"
+    );
+    assert!(
+        reader_body.contains("Acme") && !reader_body.contains("topsecret"),
+        "reader sees name only, secret FLS-projected: {reader_body}"
+    );
+}
