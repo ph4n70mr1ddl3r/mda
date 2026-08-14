@@ -56,7 +56,7 @@ jobs:
           cargo test --test data --test studio --test integration --test events
           --test throttle --test sessions --test observability
           --test secrets --test templates --test notifications --test webhooks
-          --test integration_flows --test graphql --test scheduler
+          --test integration_flows --test graphql --test scheduler --test tenants
 
   # Build the Leptos WASM runtime UI with Trunk (catches UI regressions; the
   # backend job can't — the UI is a separate standalone workspace). Runs in

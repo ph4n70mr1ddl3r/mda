@@ -1079,6 +1079,7 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 - **Error code taxonomy + localized error messages** — the platform emits 409s, validation errors, and publish failures with no coherent, i18n-able error model.
   - **✅ closed (ADR-0018):** every `Error` carries a stable `code()` (`mda.<kind>`); the API envelope exposes `code`/`status`/`message`. `code` is the SDK branch key and the i18n message key. Per-field `details` are now surfaced too: a record write failing several field rules returns one `mda.validation` envelope listing every problem (`field` + per-field `code` like `mda.required`/`mda.invalid_type`/`mda.unknown_field`) instead of failing one-at-a-time.
 - **Tenant-scoped backup / restore + data residency** — currently DB-level, single-region; granular tenant export/restore and regional placement tie to the deferred tenant lifecycle (§5.4) and HA (U9).
+  - **Partially ✅ closed (configuration export):** `GET /api/tenants/export` produces a portable JSON snapshot of a tenant's configuration — the active model (Studio shape, so model restore round-trips through `PUT /api/studio/drafts/:id/model`) plus reports, rules, workflows, templates, notification types, schedules, the security graph (roles/permissions/field-permissions/OWD/teams), and integration definitions. Superuser-only. Full tenant *data* export/restore + regional placement remain tied to tenant lifecycle (§5.4) and HA (U9).
 
 ---
 

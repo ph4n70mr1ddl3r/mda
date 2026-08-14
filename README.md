@@ -133,6 +133,10 @@ curl -X POST localhost:8080/api/schedules -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
      -d '{"name":"nightly","kind":"report","target_id":"'$REP_ID'","cron":"0 0 * * * *"}'
 curl localhost:8080/api/schedules/$SCHED_ID/runs -H "Authorization: Bearer $JWT"
+
+# Tenant config export (§14 backup) — a portable JSON snapshot of the tenant's
+# model + reports + schedules + security graph + integrations.
+curl localhost:8080/api/tenants/export -H "Authorization: Bearer $JWT" > tenant-backup.json
 ```
 
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a

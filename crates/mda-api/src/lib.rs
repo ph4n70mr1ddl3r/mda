@@ -29,6 +29,7 @@ pub mod schedules;
 pub mod secrets;
 pub mod studio;
 pub mod templates;
+pub mod tenants;
 pub mod webhooks;
 
 use mda_meta::MetadataCache;
@@ -82,7 +83,8 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(history::routes())
         .merge(integrations::routes())
         .merge(observability::routes())
-        .merge(schedules::routes());
+        .merge(schedules::routes())
+        .merge(tenants::routes());
 
     // Layer order (last = outermost): body-limit → security headers → access
     // log/metrics → CORS. CORS is outermost so preflight is answered before
