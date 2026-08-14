@@ -1001,6 +1001,18 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Documentation, SDK generation, sample apps
 - **Deliverable:** Production-ready v1.0.
 
+> **Progress (first hardening pass — see `docs/HARDENING.md`):** a
+> release-mode E2E audit running the server as the production `mda_app` role
+> closed the *works-as-owner* bug class (schema misplacement, missing `int`
+> grants, runtime DDL in the webhook relay, the `"$user"` search_path capture —
+> migrations 20260132–35), stopped 500 responses leaking internal error text,
+> converted handler panics into proper error envelopes, made the staging
+> compose path bootable, and added the `app_role` regression suite (CI + `make
+> test`) so any future grant/schema gap fails the build. A recurring red-CI
+> race on the cluster-global `mda_app` role creation is fixed race-tolerantly
+> in `migrate::run`. Still open from the list above: load testing, report
+> materialized views, pen-test, SDK generation.
+
 > Timelines are rough planning anchors for a small team; **Phases 6 and 8 were re-estimated honestly** (REVIEW.md Timeline Reality Check): Phase 6 ≈ 9 weeks for a from-scratch metadata-driven UI renderer + real-time; Phase 8 ≈ 14 weeks for the full drag-and-drop Studio (parallelizable only with a real team). The full sequence is now ~55 weeks; a solo developer should ~double it — which is why the **MVP milestone above exists** (ship value around week 26, not week 55).
 
 > **Deferred (explicitly, not omitted — closes REVIEW.md U5 / U9).** Deliberately out of v1 scope:
