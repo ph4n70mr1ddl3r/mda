@@ -53,7 +53,7 @@ test-db:
 	   --test observability --test secrets --test templates --test tenants \
 	   --test translations --test mass_actions --test versioning --test admin \
 	   --test sharing_rules --test ui_defs --test reports_api --test rules_workflows \
-	   --test app_role
+	   --test app_role --test security
 
 test: test-unit test-db
 

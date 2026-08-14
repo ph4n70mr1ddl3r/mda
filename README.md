@@ -311,6 +311,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
 - [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE10.md`](./docs/PHASE10.md) — phase status & handoffs.
 - [`docs/CAPABILITIES.md`](./docs/CAPABILITIES.md) — the §5.18–5.22 platform-capability cluster (secrets, templating, notifications, webhook contract, hub-model integration) + GraphQL (ADR-0010) status & handoff.
 - [`docs/HARDENING.md`](./docs/HARDENING.md) — Phase-11 production hardening pass: release-mode E2E as the `mda_app` role, the works-as-owner bug class it exposed (schema misplacement, missing grants, runtime DDL), and the regression suites that now guard it.
+- [`docs/LOADTEST.md`](./docs/LOADTEST.md) — Phase-11 load-test results (release binary, production role): throughput/latency per surface, reproduction steps, and what the numbers mean for scale-out.
 
 ## Roadmap (summary)
 

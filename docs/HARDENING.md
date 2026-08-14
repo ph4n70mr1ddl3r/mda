@@ -54,12 +54,37 @@ Fixes, in migration order:
 - `tests/app_role.rs` (new suite, in `make test` + CI): after the full
   migration chain, `mda_app` must hold `USAGE` on every app schema and
   `SELECT` on every table in `public`/`meta`/`sec`/`int` — any future
-  migration that forgets a grant fails the build, not staging.
+  migration that forgets a grant fails the build, not staging. Also migrates
+  six databases concurrently (the CI `pg_authid` role race).
+- `tests/security.rs` (new suite, in `make test` + CI — the automated pen-test
+  pass): SQL-injection payloads against entity paths, list filters and record
+  bodies (never a 5xx, never widened results), malicious identifiers rejected
+  at validate/publish, tampered/forged JWTs, malformed input, error
+  content-type, and the global body limit.
 - `scheduler_tables_are_visible_to_the_app_role` (in `tests/scheduler.rs`):
   the specific misplacement regression.
 - `quoted_rfc_etag_is_accepted` (in `tests/studio.rs`).
 - Unit tests for the error envelope (no internal leak, client errors keep
   their message) and the panic layer.
+
+## Second pass (same day): load test + error-envelope completion
+
+- **Load test** ([`docs/LOADTEST.md`](./LOADTEST.md)): release binary as
+  `mda_app`, ~505k requests across health / authenticated list / GraphQL /
+  login scenarios — zero 5xx, zero panics, server healthy at ~412 MB RSS.
+  Read path ~1.4k rps/node at p99 ≈ 140 ms under c=64; login ~170 rps/node is
+  the deliberate Argon2id cost.
+- **Framework errors now carry the envelope too**: extractor rejections
+  (malformed JSON → axum's plain-text 400) and router 404/405 fallbacks were
+  the last responses bypassing the ADR-0018 JSON envelope; an innermost
+  `error_envelope` middleware rewrites them (stable `code` per status, 5xx
+  details still server-side only). Found by the security suite.
+- `migrate::run` pre-creates the `mda_app` role race-tolerantly — recurring
+  red CI: parallel test databases losing the check-then-create race on the
+  cluster-global `pg_authid`.
+- The runtime UI's API origin is runtime-configurable
+  (`window.__MDA_API_BASE__` > build-time `MDA_API_BASE` > dev default), so
+  the static nginx bundle deploys anywhere without a rebuild.
 
 ## Audited and found sound (no change needed)
 

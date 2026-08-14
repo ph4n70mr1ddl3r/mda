@@ -1010,8 +1010,15 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 > compose path bootable, and added the `app_role` regression suite (CI + `make
 > test`) so any future grant/schema gap fails the build. A recurring red-CI
 > race on the cluster-global `mda_app` role creation is fixed race-tolerantly
-> in `migrate::run`. Still open from the list above: load testing, report
-> materialized views, pen-test, SDK generation.
+> in `migrate::run`.
+> **Second pass:** an initial **load test** (release binary as `mda_app`,
+> ~505k requests, zero 5xx — `docs/LOADTEST.md`) and an **automated security
+> suite** (`tests/security.rs`: injection payloads across every dynamic
+> surface, malicious identifiers at publish, JWT tampering, body limits,
+> error-envelope content-type) landed; framework-rejection responses now carry
+> the ADR-0018 JSON envelope too. Still open from the list above: sustained
+> soak + write-path/report-export saturation, report materialized views,
+> external pen-test, SDK generation.
 
 > Timelines are rough planning anchors for a small team; **Phases 6 and 8 were re-estimated honestly** (REVIEW.md Timeline Reality Check): Phase 6 ≈ 9 weeks for a from-scratch metadata-driven UI renderer + real-time; Phase 8 ≈ 14 weeks for the full drag-and-drop Studio (parallelizable only with a real team). The full sequence is now ~55 weeks; a solo developer should ~double it — which is why the **MVP milestone above exists** (ship value around week 26, not week 55).
 

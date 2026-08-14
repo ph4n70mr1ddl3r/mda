@@ -4,6 +4,8 @@
 //! - Phase 2: runtime data API (`/api/data/:entity`)
 //! - Phase 3: JWT auth + object/field/record security + audit
 
+use axum::extract::Request;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -105,6 +107,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
     // API versioning is applied innermost so its `MDA-API-Version` discovery
     // header + deprecation signalling (and the 400 for an unsupported major)
     // reach every route, including future versioned surfaces (§7).
+    let app = app.layer(axum::middleware::from_fn(error_envelope));
     let app = app.layer(axum::middleware::from_fn_with_state(
         cfg.versioning.clone(),
         crate::versioning::middleware,
@@ -135,6 +138,70 @@ fn panic_response(panic: Box<dyn std::any::Any + Send>) -> Response {
         "handler panic: {detail}"
     )))
     .into_response()
+}
+
+/// Rewrite framework-generated error responses that bypass the [`crate::error::ApiError`]
+/// envelope — extractor rejections (malformed JSON → axum's plain-text 400),
+/// the router's empty 404/405 fallbacks — into the platform JSON shape, so
+/// ADR-0018's "every error response carries code/status/message" holds for
+/// them too. Successful responses and already-JSON errors pass through
+/// untouched; 5xx details stay server-side.
+async fn error_envelope(req: Request, next: Next) -> Response {
+    let resp = next.run(req).await;
+    let status = resp.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return resp;
+    }
+    let is_json = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.starts_with("application/json"))
+        .unwrap_or(false);
+    if is_json {
+        return resp;
+    }
+    // Framework bodies are tiny; cap the buffer defensively.
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let detail = String::from_utf8_lossy(&bytes).trim().to_string();
+    if status.is_server_error() && !detail.is_empty() {
+        tracing::warn!(detail = %detail, "framework error response");
+    }
+    let (code, kind) = match status.as_u16() {
+        400 => ("mda.malformed", "malformed"),
+        401 => ("mda.unauthorized", "unauthorized"),
+        403 => ("mda.forbidden", "forbidden"),
+        404 => ("mda.not_found", "not_found"),
+        405 => ("mda.method_not_allowed", "method_not_allowed"),
+        409 => ("mda.conflict", "conflict"),
+        413 => ("mda.too_large", "too_large"),
+        415 => ("mda.unsupported_media_type", "unsupported_media_type"),
+        422 => ("mda.invalid", "invalid"),
+        429 => ("mda.rate_limited", "rate_limited"),
+        _ if status.is_server_error() => ("mda.internal_error", "internal_error"),
+        _ => ("mda.error", "error"),
+    };
+    // Client-facing message: the framework detail for 4xx (it's about the
+    // request, e.g. "expected value at line 1"), never internals for 5xx.
+    let message = if !status.is_server_error() && !detail.is_empty() {
+        detail
+    } else {
+        status.canonical_reason().unwrap_or("error").to_string()
+    };
+    let _ = parts; // framework-generated responses carry nothing worth keeping
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "code": code,
+            "error": kind,
+            "status": status.as_u16(),
+            "message": message,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Serialize)]
