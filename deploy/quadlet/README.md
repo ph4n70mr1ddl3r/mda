@@ -21,4 +21,6 @@
 #    the non-superuser mda_app role (migrations/...rls.sql);
 #  - serves requests through MDA_APP_DATABASE_URL (mda_app) so biz.* RLS engages.
 # Secrets (MDA_APP_DATABASE_URL password, MDA_JWT_SECRET) live in
-# /etc/mda/mda-app.env (chmod 600, NOT committed).
+# /etc/mda/mda-app.env (chmod 600, NOT committed). SecretStore values (§5.20:
+# webhook signing keys, connector credentials) live in a separate JSON file
+# mounted read-only into the container and named by MDA_SECRET_FILE there.
