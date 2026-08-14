@@ -219,18 +219,8 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
         .unwrap();
     assert_eq!(rec1, rec2, "same external key → same record");
 
-    // one Customer row, tier Silver.
-    let (count, tier): (i64, String) =
-        sqlx::query_as("SELECT count(*), (SELECT tier FROM biz.customer_* LIMIT 1)")
-            .fetch_one(&ctx.pool)
-            .await
-            .map_err(|e| {
-                // dynamic table name; fall back to a count via the entity table.
-                eprintln!("join failed (dynamic table): {e}");
-            })
-            .unwrap_or((0, String::new()));
-    let _ = (count, tier);
-    // the table name is dynamic, so query it by listing via the API instead.
+    // one Customer row, tier Silver. The biz.<table> name is dynamic, so query
+    // it by listing via the data API instead (single source of truth).
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
     let rows = list["items"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "no duplicate records");
@@ -248,11 +238,7 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(
-        v["record_ids"][0]
-            .as_str()
-            .unwrap()
-            .parse::<Uuid>()
-            .unwrap(),
+        v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap(),
         rec1
     );
 

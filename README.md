@@ -8,13 +8,15 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > plus the full §5.18–5.22 platform-capability cluster and a first-class GraphQL
 > runtime API (ADR-0010).
 > Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
-> notifications, sharing. Platform: secrets, templating, multi-channel
+> notifications, sharing (incl. **team-OWD** record visibility — ADR-0013
+> `owd_visible`). Platform: secrets, templating, multi-channel
 > notifications + digest (with record-reader recipient resolution +
 > FLS-under-recipient rendering + SMTP send), signed webhook contract + inbound
 > verification, hub-model integration (connectors / flows / external-ID registry,
 > with `field_level_sor` conflict policy, debatching, per-flow running user, and
-> cron-scheduled pulls), GraphQL (reads **and** mutations), and cron-driven
-> **scheduled-job management** (§14, including scheduled integration pulls).
+> cron-scheduled pulls), GraphQL (reads **and** mutations), cron-driven
+> **scheduled-job management** (§14, including scheduled integration pulls),
+> and tenant configuration **export + import** (§14 backup/restore).
 > Frontend: login + entity list (WASM).
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
@@ -151,9 +153,13 @@ curl -X POST localhost:8080/api/schedules -H "Authorization: Bearer $JWT" \
      -d '{"name":"nightly","kind":"report","target_id":"'$REP_ID'","cron":"0 0 * * * *"}'
 curl localhost:8080/api/schedules/$SCHED_ID/runs -H "Authorization: Bearer $JWT"
 
-# Tenant config export (§14 backup) — a portable JSON snapshot of the tenant's
-# model + reports + schedules + security graph + integrations.
+# Tenant config export/import (§14 backup/restore) — a portable JSON snapshot of
+# the tenant's model + reports + schedules + security graph + integrations.
+# Import merges by natural key (idempotent; FKs remapped) into the caller's
+# tenant and stages the model as a Studio draft.
 curl localhost:8080/api/tenants/export -H "Authorization: Bearer $JWT" > tenant-backup.json
+curl -X POST localhost:8080/api/tenants/import -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' --data @tenant-backup.json
 ```
 
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
@@ -172,9 +178,9 @@ DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
   cargo test --test data --test studio --test integration
 # or:  make test   (unit + DB-backed)
 #
-# Platform-capability + GraphQL + scheduler suites (§5.18–5.22, ADR-0010, §14):
+# Platform-capability + GraphQL + scheduler + tenant suites (§5.18–5.22, ADR-0010, §14):
 #   cargo test --test secrets --test templates --test notifications \
-#              --test webhooks --test integration_flows --test graphql --test scheduler
+#              --test webhooks --test integration_flows --test graphql --test scheduler --test tenants
 ```
 
 The `data`/`studio` suites connect the app as the non-superuser `mda_app` role

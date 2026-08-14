@@ -378,6 +378,8 @@ pub(crate) async fn scope_for(
         public_read: owd.allows_read_for_all(),
         public_write: owd.allows_write_for_all(),
         bypass: user.is_superuser,
+        team_owd: owd == Owd::Team,
+        team_id: user.team_id,
     })
 }
 

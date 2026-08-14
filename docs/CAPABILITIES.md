@@ -90,8 +90,8 @@ so object / field / record security applies by construction on every surface.
   mail (3).
 - DB-backed (each its own fresh database, fully parallel):
   secrets (2) · templates (2) · notifications (6) · webhooks (4) ·
-  integration_flows (6) · graphql (5) · scheduler (4). Plus the full prior suite
-  green.
+  integration_flows (6) · graphql (5) · scheduler (4) · tenants (3). Plus the
+  full prior suite green, incl. a team-OWD record-visibility test in `data`.
 
 ## Decisions / deferrals
 
@@ -101,7 +101,8 @@ The earlier follow-ups are now **implemented** (each with a DB-backed test):
   now resolvable. `recipient_strategy: "record_readers"` on
   `POST /api/notifications/dispatch` resolves the owner + direct shares +, when
   the entity's OWD grants org-wide read, every active user whose role grants
-  object-level `read` (ADR-0013 record-share materialization).
+  object-level `read`, and, under team-OWD, the owner's teammates
+  (ADR-0013 record-share materialization).
   `resolve_record_readers` is the reusable helper (call from a rule/workflow).
 - **FLS-under-recipient for email rendering** — the email channel now FLS-
   projects the render context per recipient (`record` fields the recipient may
@@ -127,9 +128,16 @@ Remaining, still-deferred (lower priority / tied to other work):
 
 - **GraphQL** schema is cached per version (not hot-reloaded on invalidation);
   a publish advances the version, which rebuilds it.
-- **Team-OWD** sub-team materialization for recipient resolution treats `team`
-  like `private` (owner + shares); full team-hierarchy traversal is a deeper
-  ADR-0013 refinement.
-- **Tenant-scoped data export/restore + data residency** remain tied to the
-tenant lifecycle (§5.4) and HA (U9); tenant *configuration* export already
-ships (`GET /api/tenants/export`).
+- **Team hierarchy** (parent-team / sub-team visibility in record security +
+  recipient resolution). Flat **team-OWD is now honored** (ADR-0013
+  `owd_visible`): an entity whose OWD is `team` admits the owner's teammates
+  for read (write stays owner-only, mirroring `PublicRead`), in both the
+  record-visibility predicate and `record_readers` recipient resolution. The
+  remaining refinement is the *hierarchy* (a manager's team sees descendant
+  teams' records), which needs the role/team-hierarchy epoch machinery.
+- **Tenant-scoped *data* export/restore + data residency** remain tied to the
+  tenant lifecycle (§5.4) and HA (U9). Tenant *configuration* export **and**
+  import now ship: `GET /api/tenants/export` + `POST /api/tenants/import`
+  (merge-by-natural-key with FK id-remapping, idempotent; the model stages as a
+  Studio draft). Full record-data export/restore + regional placement stay tied
+  to tenant lifecycle.

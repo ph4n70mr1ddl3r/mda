@@ -39,6 +39,12 @@ pub struct RecordScope {
     pub public_read: bool,
     pub public_write: bool,
     pub bypass: bool,
+    /// Team-OWD: when true (and `team_id` is set) the user may read records
+    /// owned by members of their team (ADR-0013 `owd_visible` — live, flat;
+    /// sub-team hierarchy is the deeper refinement). Write stays owner-only,
+    /// mirroring `PublicRead`.
+    pub team_owd: bool,
+    pub team_id: Option<Uuid>,
 }
 
 impl RecordScope {
@@ -49,6 +55,8 @@ impl RecordScope {
             public_read: true,
             public_write: true,
             bypass: true,
+            team_owd: false,
+            team_id: None,
         }
     }
 }
@@ -93,23 +101,32 @@ enum ListBind {
     Text(String),
 }
 
-/// Read-visibility predicate (with a `{u}` placeholder for the user bind).
-/// owner OR public already handled by caller; here: owner OR shared-with-me.
-/// Returns None when the scope grants broad read (bypass / public_read).
+/// Read-visibility predicate fragment. Uses placeholders `${u}` for the user
+/// bind and, when team-OWD applies, `${t}` for the team bind. Owner OR public is
+/// already handled by the caller; here: owner OR shared-with-me OR (team-OWD:
+/// owner is a member of my team). Returns None when the scope grants broad read
+/// (bypass / public_read) — no row filter needed.
 fn read_predicate(s: &RecordScope) -> Option<String> {
     if s.bypass || s.public_read {
-        None
-    } else {
-        Some(
-            "(t.owner_id = ${u} OR EXISTS (SELECT 1 FROM sec.sec_record_share rs \
-              WHERE rs.tenant_id = t.tenant_id AND rs.record_id = t.id \
-                AND rs.principal_id = ${u} AND rs.access IN ('read','write')))"
-                .to_string(),
-        )
+        return None;
     }
+    let team_clause = if s.team_owd && s.team_id.is_some() {
+        " OR EXISTS (SELECT 1 FROM sec.sec_user u2 \
+           WHERE u2.id = t.owner_id AND u2.tenant_id = t.tenant_id \
+             AND u2.team_id = ${t})"
+    } else {
+        ""
+    };
+    Some(format!(
+        "(t.owner_id = ${{u}} \
+          OR EXISTS (SELECT 1 FROM sec.sec_record_share rs \
+           WHERE rs.tenant_id = t.tenant_id AND rs.record_id = t.id \
+             AND rs.principal_id = ${{u}} AND rs.access IN ('read','write')){team_clause})"
+    ))
 }
 
-/// Write predicate: owner OR shared-with-write-access.
+/// Write predicate: owner OR shared-with-write-access. Team-OWD grants read
+/// only (mirrors `PublicRead`), so write never adds a team clause.
 fn write_predicate(s: &RecordScope) -> Option<String> {
     if s.bypass || s.public_write {
         None
@@ -121,6 +138,23 @@ fn write_predicate(s: &RecordScope) -> Option<String> {
                 .to_string(),
         )
     }
+}
+
+/// Substitute a predicate fragment's `{u}` (and optional `{t}`) placeholders
+/// with absolute `$n` indices starting at `start`, returning the rendered SQL
+/// and the ordered Uuid bind values. The team bind is added only when the
+/// fragment carries a `{t}` placeholder (i.e. team-OWD applies *and* the scope
+/// has a team).
+fn pred_render(pred: &str, scope: &RecordScope, start: usize) -> (String, Vec<Uuid>) {
+    let mut binds = vec![scope.user_id];
+    let mut out = pred.replace("{u}", &start.to_string());
+    if out.contains("{t}") {
+        if let Some(team) = scope.team_id {
+            out = out.replace("{t}", &(start + 1).to_string());
+            binds.push(team);
+        }
+    }
+    (out, binds)
 }
 
 // ===== create =====
@@ -235,16 +269,19 @@ pub async fn read(
         "SELECT to_jsonb(t.*) AS doc FROM biz.{} t WHERE id = $1 AND tenant_id = $2",
         def.entity.table_name
     );
+    let mut rp_binds: Vec<Uuid> = Vec::new();
     if let Some(ref p) = &rp {
-        sql.push_str(&format!(" AND {}", p.replace("{u}", "3")));
+        let (frag, binds) = pred_render(p, scope, 3);
+        sql.push_str(&format!(" AND {}", frag));
+        rp_binds = binds;
     }
     let mut tx = pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, tenant).await?;
     let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str())
         .bind(id)
         .bind(tenant);
-    if rp.is_some() {
-        q = q.bind(scope.user_id);
+    for b in rp_binds {
+        q = q.bind(b);
     }
     let row = q.fetch_optional(&mut *tx).await.map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
@@ -351,7 +388,7 @@ async fn distinguish_not_found_or_conflict(
 ) -> Result<Value> {
     // exists at all (ignoring scope)?
     let exists: Option<(i32,)> = sqlx::query_as(&format!(
-        "SELECT 1 FROM biz.{} WHERE id = $1 AND tenant_id = $2",
+        "SELECT 1 FROM biz.{} t WHERE t.id = $1 AND t.tenant_id = $2",
         def.entity.table_name
     ))
     .bind(id)
@@ -364,7 +401,7 @@ async fn distinguish_not_found_or_conflict(
         Some(_) => {
             let rp = write_predicate(scope);
             let mut sql = format!(
-                "SELECT 1 FROM biz.{} WHERE id = $1 AND tenant_id = $2",
+                "SELECT 1 FROM biz.{} t WHERE t.id = $1 AND t.tenant_id = $2",
                 def.entity.table_name
             );
             if let Some(ref p) = &rp {
@@ -444,8 +481,11 @@ pub async fn list(
     let mut where_sql = where_sql;
     if let Some(p) = rp {
         let n = binds.len() + 1;
-        where_sql.push_str(&format!(" AND {}", p.replace("{u}", &n.to_string())));
-        binds.push(ListBind::Uuid(scope.user_id));
+        let (frag, pb) = pred_render(&p, scope, n);
+        where_sql.push_str(&format!(" AND {}", frag));
+        for b in pb {
+            binds.push(ListBind::Uuid(b));
+        }
     }
     let order_sql = build_order(def, &params.sort);
     let table = &def.entity.table_name;

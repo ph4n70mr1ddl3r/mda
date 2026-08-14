@@ -2291,3 +2291,181 @@ async fn validation_returns_per_field_details() {
     assert_eq!(by_field.get("balance"), Some(&"mda.invalid_type"));
     assert_eq!(by_field.get("bogus"), Some(&"mda.unknown_field"));
 }
+
+// ===== team-OWD (ADR-0013 `owd_visible`) =====
+//
+// A helper to create a team + assign a user to it, and to set the OWD for an
+// entity, all under the tenant GUC (the sec_* tables are RLS-gated).
+
+/// Seed a team in the tenant, returning its id.
+async fn seed_team(pool: &PgPool, tenant: Uuid, name: &str) -> Uuid {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sec.sec_team (tenant_id, name) VALUES ($1, $2)
+         ON CONFLICT (tenant_id, name) DO UPDATE SET name = $2 RETURNING id",
+    )
+    .bind(tenant)
+    .bind(name)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    id
+}
+
+/// Put a user in a team (under the tenant GUC).
+async fn assign_team(pool: &PgPool, tenant: Uuid, user_id: Uuid, team_id: Uuid) {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    sqlx::query("UPDATE sec.sec_user SET team_id = $1 WHERE id = $2")
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Set the OWD for an entity (under the tenant GUC).
+async fn seed_owd(pool: &PgPool, tenant: Uuid, entity: &str, access: &str) {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO sec.sec_owd (tenant_id, entity, default_access)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (tenant_id, entity) DO UPDATE SET default_access = $3",
+    )
+    .bind(tenant)
+    .bind(entity)
+    .bind(access)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn team_owd_lets_teammates_read_owners_record() {
+    // OWD = team: members of the owner's team may read each other's records
+    // (write stays owner-only, mirroring PublicRead). A user in a *different*
+    // team (or no team) cannot.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    seed_owd(&ctx.pool, ctx.tenant, "Customer", "team").await;
+
+    let team_a = seed_team(&ctx.pool, ctx.tenant, "team-a").await;
+    let team_b = seed_team(&ctx.pool, ctx.tenant, "team-b").await;
+
+    // owner: in team-a, can create + read its own records.
+    let (owner_token, owner_id) =
+        limited_user(&ctx, &[("Customer", "create"), ("Customer", "read")]).await;
+    assign_team(&ctx.pool, ctx.tenant, owner_id, team_a).await;
+    // teammate: in team-a, read only.
+    let (mate_token, _mate_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+    assign_team(&ctx.pool, ctx.tenant, _mate_id, team_a).await;
+    // outsider: in team-b, read only — different team.
+    let (other_token, other_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+    assign_team(&ctx.pool, ctx.tenant, other_id, team_b).await;
+    // team-less reader: read perm but no team at all.
+    let (noteam_token, _noteam_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+
+    // owner creates a private-to-team record.
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &owner_token,
+        Some(json!({"name":"Shared-by-team"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // teammate (same team) can read it + sees it in the list.
+    let (st, got) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &mate_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "teammate can read: {got}");
+    assert_eq!(got["name"], "Shared-by-team");
+    let (_, list) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer",
+        &mate_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        list["total"], 1,
+        "teammate list sees the team record: {list}"
+    );
+
+    // outsider (different team) cannot read it (404) nor list it.
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &other_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "different-team reader is blocked"
+    );
+    let (_, list) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer",
+        &other_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list["total"], 0, "different-team list is empty: {list}");
+
+    // a team-less reader (read perm, but no team) is also blocked.
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &noteam_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "team-less reader is blocked");
+
+    // team-OWD grants read, NOT write: the teammate cannot update (404) even
+    // with the right object perm, because write is owner-only under team-OWD.
+    let (mate_write_token, mate_write_id) =
+        limited_user(&ctx, &[("Customer", "read"), ("Customer", "update")]).await;
+    assign_team(&ctx.pool, ctx.tenant, mate_write_id, team_a).await;
+    let (st, body) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &mate_write_token,
+        Some(json!({"name":"mutated"}).to_string()),
+        rec["version"].as_i64(),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "team-OWD is read-only: write blocked: {body}"
+    );
+}

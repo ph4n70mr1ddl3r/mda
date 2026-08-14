@@ -653,10 +653,11 @@ pub async fn fanout(pool: &PgPool, channels: &[Box<dyn Channel>], payload: &Valu
 /// - **object-level**: an active user whose role grants `read` on the entity
 ///   (the wildcard `*/*` counts) — always required (the gate to read any record);
 /// - **record-level**: the owner + anyone with a direct share, OR — when the
-///   entity's OWD grants org-wide read — every object-level reader.
+///   entity's OWD grants org-wide read — every object-level reader, OR — when
+///   the OWD is `team` — the owner's teammates.
 ///
-/// Team-OWD (sub-team materialization) is treated like `private` here (owner +
-/// shares); full team-hierarchy traversal is a deeper ADR-0013 refinement.
+/// Sub-team hierarchy (parent-team visibility) is the deeper ADR-0013
+/// refinement; team-OWD here is flat same-team.
 pub async fn resolve_record_readers(
     pool: &PgPool,
     tenant: Uuid,
@@ -691,6 +692,8 @@ pub async fn resolve_record_readers(
     }
     // private/team: owner + direct share principals, intersected with the
     // object-level read gate (no object-level read → can't read any record).
+    // Team-OWD additionally admits members of the owner's team (ADR-0013
+    // `owd_visible`, flat — sub-team hierarchy is the deeper refinement).
     let allowed: HashSet<Uuid> = object_readers.iter().copied().collect();
     let mut readers: HashSet<Uuid> = HashSet::new();
     if allowed.contains(&owner_id) {
@@ -710,6 +713,26 @@ pub async fn resolve_record_readers(
     for p in shares {
         if allowed.contains(&p) {
             readers.insert(p);
+        }
+    }
+    // Team-OWD: anyone in the owner's team (who also clears the object-level
+    // read gate) can read. A team-less owner admits no one extra here.
+    if owd == mda_security::Owd::Team {
+        let teammates: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT u.id FROM sec.sec_user u
+              JOIN sec.sec_user o ON o.id = $1 AND o.team_id IS NOT NULL
+             WHERE u.tenant_id = $2 AND u.active
+               AND u.team_id = o.team_id",
+        )
+        .bind(owner_id)
+        .bind(tenant)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        for p in teammates {
+            if allowed.contains(&p) {
+                readers.insert(p);
+            }
         }
     }
     tx.commit().await.map_err(Error::internal)?;

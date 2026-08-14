@@ -90,6 +90,8 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         public_read: owd == Owd::PublicRead || owd == Owd::PublicReadWrite,
         public_write: false,
         bypass: identity.is_superuser,
+        team_owd: owd == Owd::Team,
+        team_id: identity.team_id,
     };
 
     let scalar: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
