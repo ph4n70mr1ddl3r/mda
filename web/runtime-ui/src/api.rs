@@ -2,7 +2,25 @@
 
 use serde::Deserialize;
 
-const API_BASE: &str = "http://localhost:8080";
+/// Resolve the API origin (first match wins):
+/// 1. `window.__MDA_API_BASE__` — settable at *serve* time (a templated
+///    index.html or an inline `<script>` before the bundle loads), so the same
+///    static bundle works in any environment; an empty string means same-origin.
+/// 2. build-time `MDA_API_BASE` env (`MDA_API_BASE=https://api.example.com trunk build`)
+/// 3. the dev default (Trunk on :8081, API on :8080).
+pub fn api_base() -> String {
+    if let Some(w) = web_sys::window() {
+        let key = wasm_bindgen::JsValue::from_str("__MDA_API_BASE__");
+        if let Ok(v) = js_sys::Reflect::get(&w.into(), &key) {
+            if let Some(s) = v.as_string() {
+                return s;
+            }
+        }
+    }
+    option_env!("MDA_API_BASE")
+        .map(str::to_string)
+        .unwrap_or_else(|| "http://localhost:8080".to_string())
+}
 
 #[derive(Deserialize, Clone)]
 pub struct ModelInfo {
@@ -46,7 +64,7 @@ pub struct TokenResp {
 }
 
 pub async fn login(tenant: &str, email: &str, password: &str) -> Result<String, String> {
-    let resp = gloo_net::http::Request::post(&format!("{API_BASE}/api/auth/login"))
+    let resp = gloo_net::http::Request::post(&format!("{}/api/auth/login", api_base()))
         .header("content-type", "application/json")
         .body(
             serde_json::json!({"tenant": tenant, "email": email, "password": password}).to_string(),
@@ -63,7 +81,7 @@ pub async fn login(tenant: &str, email: &str, password: &str) -> Result<String, 
 }
 
 pub async fn get_model(token: &str) -> Result<ModelInfo, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/studio/model"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/studio/model", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -72,7 +90,7 @@ pub async fn get_model(token: &str) -> Result<ModelInfo, String> {
 }
 
 pub async fn list_records(token: &str, entity: &str) -> Result<ListResult, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/data/{entity}"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/data/{entity}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -81,7 +99,7 @@ pub async fn list_records(token: &str, entity: &str) -> Result<ListResult, Strin
 }
 
 pub async fn get_record(token: &str, entity: &str, id: &str) -> Result<serde_json::Value, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/data/{entity}/{id}"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/data/{entity}/{id}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -92,7 +110,7 @@ pub async fn get_record(token: &str, entity: &str, id: &str) -> Result<serde_jso
 }
 
 pub async fn create_record(token: &str, entity: &str, body: String) -> Result<(), String> {
-    let resp = gloo_net::http::Request::post(&format!("{API_BASE}/api/data/{entity}"))
+    let resp = gloo_net::http::Request::post(&format!("{}/api/data/{entity}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(body)
@@ -113,7 +131,7 @@ pub async fn update_record(
     version: i64,
     body: String,
 ) -> Result<(), String> {
-    let resp = gloo_net::http::Request::patch(&format!("{API_BASE}/api/data/{entity}/{id}"))
+    let resp = gloo_net::http::Request::patch(&format!("{}/api/data/{entity}/{id}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .header("if-match", &version.to_string())
         .header("content-type", "application/json")
@@ -129,7 +147,7 @@ pub async fn update_record(
 }
 
 pub async fn delete_record(token: &str, entity: &str, id: &str) -> Result<(), String> {
-    let resp = gloo_net::http::Request::delete(&format!("{API_BASE}/api/data/{entity}/{id}"))
+    let resp = gloo_net::http::Request::delete(&format!("{}/api/data/{entity}/{id}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -146,7 +164,8 @@ pub async fn delete_record(token: &str, entity: &str, id: &str) -> Result<(), St
 /// percent-encoded so a channel like `record:Customer:<uuid>` survives intact.
 pub fn events_url(ticket: &str, channel: &str) -> String {
     format!(
-        "{API_BASE}/api/events?ticket={}&channel={}",
+        "{}/api/events?ticket={}&channel={}",
+        api_base(),
         pct_enc(ticket),
         pct_enc(channel),
     )
@@ -156,7 +175,7 @@ pub fn events_url(ticket: &str, channel: &str) -> String {
 /// the returned ticket is what `EventSource` carries in the URL (so the JWT
 /// never appears there).
 pub async fn event_ticket(token: &str) -> Result<String, String> {
-    let resp = gloo_net::http::Request::post(&format!("{API_BASE}/api/auth/event-ticket"))
+    let resp = gloo_net::http::Request::post(&format!("{}/api/auth/event-ticket", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -226,7 +245,7 @@ pub struct NavItem {
 }
 
 pub async fn get_navigation(token: &str) -> Result<Vec<NavItem>, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/navigation"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/navigation", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -251,7 +270,7 @@ pub struct ViewInfo {
 /// The default list-view definition (None when the API has no view — the
 /// caller falls back to the raw model fields).
 pub async fn get_view(token: &str, entity: &str) -> Result<Option<ViewInfo>, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/views/{entity}"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/views/{entity}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -294,7 +313,7 @@ pub struct FormInfo {
 }
 
 pub async fn get_form(token: &str, entity: &str) -> Result<Option<FormInfo>, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/forms/{entity}"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/forms/{entity}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -316,7 +335,7 @@ pub struct DashSummary {
 }
 
 pub async fn list_dashboards(token: &str) -> Result<Vec<DashSummary>, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/dashboards"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/dashboards", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -352,7 +371,7 @@ pub struct DashboardInfo {
 }
 
 pub async fn get_dashboard(token: &str, id: &str) -> Result<DashboardInfo, String> {
-    let resp = gloo_net::http::Request::get(&format!("{API_BASE}/api/dashboards/{id}"))
+    let resp = gloo_net::http::Request::get(&format!("{}/api/dashboards/{id}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
@@ -385,7 +404,7 @@ async fn send_json(
         "PATCH" => Method::PATCH,
         _ => Method::DELETE,
     };
-    let url = format!("{API_BASE}{path}");
+    let url = format!("{}/{path}", api_base());
     let b = gloo_net::http::RequestBuilder::new(&url)
         .method(method)
         .header("Authorization", &format!("Bearer {token}"));

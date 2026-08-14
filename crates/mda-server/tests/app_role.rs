@@ -101,3 +101,64 @@ async fn app_role_has_usage_on_app_schemas() {
         "mda_app lacks USAGE on schemas: {missing:?}"
     );
 }
+
+/// Concurrent first-time migrations must not race on the cluster-global
+/// `mda_app` role. Roles live in `pg_authid` (shared by every database on the
+/// cluster), so parallel test databases executing migration 20260111000001's
+/// check-then-create simultaneously lose with `duplicate key value violates
+/// unique constraint "pg_authid_rolname_index"` — this was a recurring red CI
+/// on fully-parallel suite runs. `migrate::run` pre-creates the role
+/// race-tolerantly; this test would fail without it.
+#[tokio::test]
+async fn concurrent_migrations_do_not_race_on_the_app_role() {
+    let admin_url = std::env::var("DATABASE_URL").unwrap();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&admin_url)
+        .await
+        .unwrap();
+
+    // N fresh databases, dropped first so the test is rerunnable.
+    let n = 6;
+    let pid = std::process::id();
+    let names: Vec<String> = (0..n).map(|i| format!("mda_race_{pid}_{i}")).collect();
+    for name in &names {
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE DATABASE {name}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+
+    // Migrate all of them at once — the loser of any role race fails its whole
+    // migration chain, so all six must succeed.
+    let mut set = tokio::task::JoinSet::new();
+    for name in &names {
+        let url = common::url_with_db(&admin_url, name);
+        set.spawn(async move {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&url)
+                .await
+                .unwrap();
+            mda_server::migrate::run(&pool).await
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        let r = joined.expect("migration task panicked");
+        assert!(
+            r.is_ok(),
+            "concurrent migration failed: {:?}",
+            r.err().map(|e| e.to_string())
+        );
+    }
+    for name in &names {
+        sqlx::query(&format!("DROP DATABASE {name} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+}

@@ -805,6 +805,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "gloo-net",
+ "js-sys",
  "leptos",
  "serde",
  "serde_json",

@@ -70,7 +70,7 @@ async fn cleanup_other_runs(admin: &PgPool, this_pid: u32) {
 
 /// Replace the database name (trailing path segment) in a Postgres URL.
 /// `postgres:///mda` → `postgres:///mda_test_x`; `postgres://u:p@h:5432/mda` → `…/mda_test_x`.
-fn url_with_db(url: &str, db: &str) -> String {
+pub fn url_with_db(url: &str, db: &str) -> String {
     match url.rfind('/') {
         Some(pos) => format!("{}{db}", &url[..pos + 1]),
         None => format!("/{db}"),

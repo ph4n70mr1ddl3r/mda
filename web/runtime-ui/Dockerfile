@@ -4,9 +4,14 @@
 #   podman build -t mda-ui web/runtime-ui
 #   podman run --rm -p 8081:80 mda-ui   # http://localhost:8081
 #
-# The app calls the API at http://localhost:8080 by default (api.rs API_BASE).
-# For non-local deployments, make API_BASE configurable (e.g. a window global /
-# build-time env) — tracked as a follow-up.
+# The app resolves its API origin at runtime (api.rs `api_base()`), in order:
+#   1. `window.__MDA_API_BASE__` — inject it at serve time (e.g. a templated
+#      index.html or an inline <script> before the bundle); "" = same-origin.
+#      Best for a static bundle reused across environments (e.g. API behind the
+#      same nginx via a /api reverse-proxy).
+#   2. build-time `MDA_API_BASE` env (add `--build-arg`-style: bake it into the
+#      build stage below with `ENV MDA_API_BASE=https://api.example.com`).
+#   3. dev default `http://localhost:8080` (Trunk on :8081).
 #
 # Rust + Trunk are pinned (not floating) for reproducible builds that match the
 # `ui` CI job; bump them deliberately (ideally via Dependabot/Renovate).
