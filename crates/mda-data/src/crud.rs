@@ -133,7 +133,7 @@ pub async fn create(
     owner: Uuid,
 ) -> Result<Value> {
     ensure_active(def)?;
-    validate_known_keys(def, &body)?;
+    validate_record(def, &body)?;
 
     let mut attributes = Map::new();
     for f in &def.fields {
@@ -266,7 +266,7 @@ pub async fn update(
     new_state: Option<String>,
 ) -> Result<Value> {
     ensure_active(def)?;
-    validate_known_keys(def, &body)?;
+    validate_record(def, &body)?;
 
     let mut attributes_merge = Map::new();
     for f in &def.fields {
@@ -603,7 +603,14 @@ fn ensure_active(def: &EntityDefinition) -> Result<()> {
     Ok(())
 }
 
-fn validate_known_keys(def: &EntityDefinition, body: &Map<String, Value>) -> Result<()> {
+/// Accumulate *all* field-level validation problems for a record body and return
+/// them as a single [`Error::Validation`] (ADR-0018 per-field `details`). Covers
+/// unknown fields, missing required fields, and per-field type/reference shape —
+/// so a client renders every error in one round trip instead of fail-then-retry
+/// per field. `auto_number` fields are never required (generated at write time).
+pub fn validate_record(def: &EntityDefinition, body: &Map<String, Value>) -> Result<()> {
+    use mda_core::FieldError;
+
     let known: HashSet<&str> = def
         .fields
         .iter()
@@ -614,12 +621,72 @@ fn validate_known_keys(def: &EntityDefinition, body: &Map<String, Value>) -> Res
                 .map(|r| r.source_field_name.as_str()),
         )
         .collect();
+
+    let mut errs: Vec<FieldError> = Vec::new();
+
     for k in body.keys() {
         if !known.contains(k.as_str()) {
-            return Err(Error::Invalid(format!("unknown field {k}")));
+            errs.push(FieldError::new(
+                k.as_str(),
+                "mda.unknown_field",
+                format!("unknown field {k}"),
+            ));
         }
     }
-    Ok(())
+
+    for f in &def.fields {
+        let raw = body.get(&f.name).cloned();
+        let raw = match (raw, &f.default_expr) {
+            (Some(v), _) => Some(v),
+            (None, Some(d)) if !is_expr_marker(d) => Some(d.clone()),
+            _ => None,
+        };
+        match raw {
+            None => {
+                if f.required && f.field_type != "auto_number" {
+                    errs.push(FieldError::new(
+                        &f.name,
+                        "mda.required",
+                        format!("field {} is required", f.name),
+                    ));
+                }
+            }
+            Some(v) if !v.is_null() => {
+                if let Err(e) = coerce::coerce(&f.field_type, Some(v)) {
+                    errs.push(FieldError::new(&f.name, "mda.invalid_type", e.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for r in &def.relationships {
+        let v = body.get(&r.source_field_name);
+        if matches!(v, None | Some(Value::Null)) {
+            if r.required {
+                errs.push(FieldError::new(
+                    &r.source_field_name,
+                    "mda.required",
+                    format!("field {} is required", r.source_field_name),
+                ));
+            }
+        } else if let Err(e) = uuid_or_null(v, &r.source_field_name) {
+            errs.push(FieldError::new(
+                &r.source_field_name,
+                "mda.invalid_reference",
+                e.to_string(),
+            ));
+        }
+    }
+
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Validation {
+            message: format!("{} validation problem(s)", errs.len()),
+            fields: errs,
+        })
+    }
 }
 
 fn uuid_or_null(v: Option<&Value>, field: &str) -> Result<Option<Uuid>> {

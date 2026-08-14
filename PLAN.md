@@ -1077,7 +1077,7 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 - **Record / field history as a surfaced capability** — `sys_audit_log` stores before/after for compliance, but "timeline of this record" and "as-of" queries are not yet framed as a platform API.
   - **✅ closed (ADR-0018):** `GET /api/data/:entity/:id/history` (per-field diffs, FLS-projected) and `GET /api/data/:entity/:id/as-of?version=|at=` reconstruct from audit snapshots, gated like a live read.
 - **Error code taxonomy + localized error messages** — the platform emits 409s, validation errors, and publish failures with no coherent, i18n-able error model.
-  - **✅ closed (ADR-0018):** every `Error` carries a stable `code()` (`mda.<kind>`); the API envelope exposes `code`/`status`/`message`. `code` is the SDK branch key and the i18n message key. (Per-field `details` for validation payloads is a future refinement.)
+  - **✅ closed (ADR-0018):** every `Error` carries a stable `code()` (`mda.<kind>`); the API envelope exposes `code`/`status`/`message`. `code` is the SDK branch key and the i18n message key. Per-field `details` are now surfaced too: a record write failing several field rules returns one `mda.validation` envelope listing every problem (`field` + per-field `code` like `mda.required`/`mda.invalid_type`/`mda.unknown_field`) instead of failing one-at-a-time.
 - **Tenant-scoped backup / restore + data residency** — currently DB-level, single-region; granular tenant export/restore and regional placement tie to the deferred tenant lifecycle (§5.4) and HA (U9).
 
 ---

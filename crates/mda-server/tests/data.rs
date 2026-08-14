@@ -2257,3 +2257,37 @@ async fn error_responses_carry_stable_code() {
     assert_eq!(st, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "mda.not_found");
 }
+
+#[tokio::test]
+async fn validation_returns_per_field_details() {
+    // ADR-0018 refinement: a record write failing several field rules returns a
+    // single `mda.validation` envelope whose `details` lists every problem
+    // (field + stable code) in one round trip — not one fail-then-retry per field.
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+
+    // missing required `name`, a bad type on `balance`, and an unknown field.
+    let (st, body) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"balance":"not-a-number","bogus":1}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "mda.validation");
+    assert_eq!(body["error"], "validation");
+    let details = body["details"].as_array().expect("details array");
+    let by_field: std::collections::HashMap<&str, &str> = details
+        .iter()
+        .map(|d| (d["field"].as_str().unwrap(), d["code"].as_str().unwrap()))
+        .collect();
+    assert_eq!(by_field.get("name"), Some(&"mda.required"));
+    assert_eq!(by_field.get("balance"), Some(&"mda.invalid_type"));
+    assert_eq!(by_field.get("bogus"), Some(&"mda.unknown_field"));
+}

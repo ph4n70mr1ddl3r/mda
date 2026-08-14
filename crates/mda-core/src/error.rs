@@ -7,8 +7,30 @@
 //! §14 "error code taxonomy + localized error messages" platform gap — clients
 //! switch on `code`, humans read `message`, translators key on `code`.
 
+use serde::Serialize;
+
 /// The canonical `Result` alias used across crates.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A single field-level validation problem, surfaced in the `details` array of a
+/// [`Error::Validation`] response. `code` is a stable machine key (the SDK/i18n
+/// contract at field grain); `field` is the offending field path.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldError {
+    pub field: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl FieldError {
+    pub fn new(field: impl Into<String>, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            code,
+            message: message.into(),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -17,6 +39,15 @@ pub enum Error {
 
     #[error("invalid input: {0}")]
     Invalid(String),
+
+    /// One or more field-level validation problems. The envelope surfaces each
+    /// problem in `details` so a client can render per-field errors in one round
+    /// trip instead of fail-then-retry-per-field. `message` is the summary.
+    #[error("validation failed: {message}")]
+    Validation {
+        message: String,
+        fields: Vec<FieldError>,
+    },
 
     #[error("not found: {0}")]
     NotFound(String),
@@ -52,6 +83,7 @@ impl Error {
         match self {
             Error::Config(_) => "mda.config_error",
             Error::Invalid(_) => "mda.invalid",
+            Error::Validation { .. } => "mda.validation",
             Error::NotFound(_) => "mda.not_found",
             Error::Conflict(_) => "mda.conflict",
             Error::Forbidden(_) => "mda.forbidden",
@@ -71,6 +103,13 @@ mod tests {
         let cases = [
             (Error::Config("x".into()), "mda.config_error"),
             (Error::Invalid("x".into()), "mda.invalid"),
+            (
+                Error::Validation {
+                    message: "x".into(),
+                    fields: vec![],
+                },
+                "mda.validation",
+            ),
             (Error::NotFound("x".into()), "mda.not_found"),
             (Error::Conflict("x".into()), "mda.conflict"),
             (Error::Forbidden("x".into()), "mda.forbidden"),
