@@ -51,6 +51,10 @@ services:
       # The app serves as the non-superuser mda_app role so biz.* RLS engages.
       # The role + grants are created at startup by migrations/...rls.sql.
       MDA_APP_DATABASE_URL: postgres://mda_app:mda@postgres:5432/mda
+      # The image is a release build, which refuses to boot without a real
+      # secret (≥ 32 bytes). Compose fails fast with this message if unset:
+      # generate one with `openssl rand -hex 32` (e.g. in a gitignored .env).
+      MDA_JWT_SECRET: ${MDA_JWT_SECRET:?MDA_JWT_SECRET is required for the app image — set it in .env (openssl rand -hex 32)}
       REDIS_URL: redis://redis:6379
       MDA_HOST: 0.0.0.0
       MDA_PORT: 8080

@@ -256,14 +256,8 @@ pub async fn deliver(
 /// high-water mark stored out-of-band (`sys_event_log.seq`). Returns the number
 /// of deliveries enqueued.
 pub async fn relay_once(pool: &PgPool) -> Result<u64> {
-    // Load the relay cursor (a single-row settings table is overkill; store the
-    // last-relayed seq in a dedicated table created lazily here).
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS sys_webhook_relay_cursor (id int PRIMARY KEY, seq bigint NOT NULL)",
-    )
-    .execute(pool)
-    .await
-    .map_err(Error::internal)?;
+    // The relay cursor table is migration-owned (20260133000001): runtime DDL
+    // here would need CREATE rights the app role must not have.
     let last: i64 = sqlx::query_scalar("SELECT seq FROM sys_webhook_relay_cursor WHERE id = 0")
         .fetch_optional(pool)
         .await

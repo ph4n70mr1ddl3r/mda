@@ -339,6 +339,39 @@ async fn etag_conflict_returns_409() {
 }
 
 #[tokio::test]
+async fn quoted_rfc_etag_is_accepted() {
+    let (app, token) = match setup().await {
+        Some(x) => x,
+        None => return,
+    };
+
+    let (_, draft) = call(
+        &app,
+        "POST",
+        "/api/studio/drafts",
+        &token,
+        Some(json!({"name":"q"}).to_string()),
+        None,
+    )
+    .await;
+    let id = draft["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let etag = draft["version_etag"].as_str().unwrap().to_string();
+
+    // RFC-9110 sends entity-tags quoted (`If-Match: "uuid"`); generic HTTP
+    // clients must work alongside the bare-UUID form the Studio UI uses.
+    let (st, body) = call(
+        &app,
+        "PUT",
+        &format!("/api/studio/drafts/{id}/model"),
+        &token,
+        Some(customer_model().to_string()),
+        Some(format!("\"{etag}\"")),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "quoted etag must be accepted: {body}");
+}
+
+#[tokio::test]
 async fn drafts_list_and_discard() {
     let (app, token) = match setup().await {
         Some(x) => x,

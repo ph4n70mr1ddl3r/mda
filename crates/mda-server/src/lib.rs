@@ -30,8 +30,10 @@ pub async fn run() -> anyhow::Result<()> {
     // The app serves requests as the non-superuser `mda_app` role so the biz.*
     // RLS policies engage (superusers/owners BYPASS RLS). Migrations + bootstrap
     // above ran as the owner; from here the runtime uses the low-privilege pool
-    // when MDA_APP_DATABASE_URL is set. If unset we warn loudly — in release the
-    // app would run as the owner and RLS would be silently inert.
+    // when MDA_APP_DATABASE_URL is set. Release refuses to boot without it:
+    // owner-mode silently disarms tenant isolation at the DB layer (the same
+    // works-as-owner blind spot that hid the schema/grant bugs — see
+    // docs/HARDENING.md). Dev builds warn and continue.
     let app_pool = match &cfg.app_database_url {
         Some(url) => {
             tracing::info!("app role pool: mda_app (RLS active)");
@@ -48,9 +50,11 @@ pub async fn run() -> anyhow::Result<()> {
                      Set it to the mda_app role for tenant isolation at the DB layer."
                 );
             } else {
-                tracing::error!(
-                    "MDA_APP_DATABASE_URL unset in release — the app runs as the owner and \
-                     biz.* RLS policies do NOT engage. Set it to the non-superuser mda_app role."
+                panic!(
+                    "MDA_APP_DATABASE_URL is required in release mode — without it the app \
+                     serves as the database owner and biz.* RLS (tenant isolation) does not \
+                     engage. Point it at the non-superuser mda_app role \
+                     (postgres://mda_app:…@host/mda)."
                 );
             }
             pool.clone()

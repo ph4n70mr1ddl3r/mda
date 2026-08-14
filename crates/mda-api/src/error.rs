@@ -57,11 +57,57 @@ impl IntoResponse for ApiError {
             "code": self.0.code(),
             "error": kind,
             "status": code.as_u16(),
-            "message": self.0.to_string(),
+            // 5xx details (SQL/driver/internal paths) stay in the server log
+            // above — the client gets the stable code, never the internals.
+            "message": if code.is_server_error() {
+                "internal server error".to_string()
+            } else {
+                self.0.to_string()
+            },
         });
         if let Some(d) = details {
             body["details"] = d;
         }
         (code, Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body_of(resp: Response) -> Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn internal_errors_do_not_leak_details() {
+        let resp = ApiError(Error::Internal(anyhow::anyhow!(
+            "db error: connection to postgres://secret@host refused"
+        )))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_of(resp).await;
+        assert_eq!(body["code"], "mda.internal_error");
+        assert_eq!(body["message"], "internal server error");
+        assert!(
+            !body["message"].as_str().unwrap().contains("postgres"),
+            "internal detail must not reach the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_their_message() {
+        let resp = ApiError(Error::Invalid(
+            "mode must be one of create|update|upsert".into(),
+        ))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_of(resp).await;
+        assert_eq!(body["code"], "mda.invalid");
+        assert!(body["message"].as_str().unwrap().contains("mode"));
     }
 }

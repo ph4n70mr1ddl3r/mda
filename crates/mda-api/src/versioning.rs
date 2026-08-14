@@ -72,14 +72,16 @@ impl VersioningConfig {
                     .collect()
             })
             .unwrap_or_default();
-        let sunset = std::env::var("MDA_SUNSET_DATE")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "Sun, 31 Dec 2099 00:00:00 GMT".to_string());
-        let deprecation_link = std::env::var("MDA_DEPRECATION_LINK")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "https://mda.example.com/docs/api-versioning".to_string());
+        let sunset = header_safe(
+            "MDA_SUNSET_DATE",
+            std::env::var("MDA_SUNSET_DATE").ok(),
+            "Sun, 31 Dec 2099 00:00:00 GMT",
+        );
+        let deprecation_link = header_safe(
+            "MDA_DEPRECATION_LINK",
+            std::env::var("MDA_DEPRECATION_LINK").ok(),
+            "https://mda.example.com/docs/api-versioning",
+        );
         Self {
             current,
             min_supported,
@@ -124,6 +126,22 @@ fn parse_vendor_version(accept: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// Resolve a header-valued env override, falling back to `default` when unset,
+/// empty, or not representable as an HTTP header value (an operator typo then
+/// degrades to the default instead of panicking on every deprecated response).
+fn header_safe(var: &str, val: Option<String>, default: &str) -> String {
+    match val {
+        Some(v) if !v.is_empty() => match axum::http::HeaderValue::from_str(&v) {
+            Ok(_) => v,
+            Err(_) => {
+                tracing::warn!("{var} is not a valid HTTP header value — using default");
+                default.to_string()
+            }
+        },
+        _ => default.to_string(),
+    }
 }
 
 /// The outcome of version negotiation for one request.

@@ -409,6 +409,10 @@ fn etag_from_headers(headers: &HeaderMap) -> Result<Uuid> {
     headers
         .get("if-match")
         .and_then(|h| h.to_str().ok())
+        // Tolerate the RFC-9110 quoted form (`"uuid"`) as well as the bare
+        // UUID the Studio UI and tests send — the value is a version etag
+        // either way.
+        .map(|s| s.trim().trim_matches('"'))
         .and_then(|s| Uuid::parse_str(s).ok())
         .ok_or_else(|| Error::Invalid("If-Match version_etag header required".into()))
 }

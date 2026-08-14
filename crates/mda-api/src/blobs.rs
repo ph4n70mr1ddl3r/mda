@@ -187,8 +187,12 @@ async fn download_attachment(
         .mime
         .unwrap_or_else(|| "application/octet-stream".to_string());
     let mut resp = (StatusCode::OK, bytes).into_response();
-    resp.headers_mut()
-        .insert(header::CONTENT_TYPE, ct.parse().unwrap());
+    // Stored mime is upload-sourced, so it is header-shaped in practice — but
+    // degrade to octet-stream rather than panic if it ever isn't.
+    let ct: header::HeaderValue = ct
+        .parse()
+        .unwrap_or(header::HeaderValue::from_static("application/octet-stream"));
+    resp.headers_mut().insert(header::CONTENT_TYPE, ct);
     if let Some(name) = meta.filename.as_deref().and_then(sanitize_filename) {
         if let Ok(hv) = format!("attachment; filename=\"{name}\"").parse() {
             resp.headers_mut().insert(header::CONTENT_DISPOSITION, hv);

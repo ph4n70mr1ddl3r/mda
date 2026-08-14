@@ -52,7 +52,8 @@ test-db:
 	   --test notifications --test webhooks --test graphql --test scheduler \
 	   --test observability --test secrets --test templates --test tenants \
 	   --test translations --test mass_actions --test versioning --test admin \
-	   --test sharing_rules --test ui_defs --test reports_api --test rules_workflows
+	   --test sharing_rules --test ui_defs --test reports_api --test rules_workflows \
+	   --test app_role
 
 test: test-unit test-db
 

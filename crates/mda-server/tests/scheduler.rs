@@ -516,3 +516,36 @@ async fn integration_schedule_pulls_flow_from_connector() {
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
     assert_eq!(list["items"].as_array().unwrap().len(), 2);
 }
+
+/// Regression for migrations/20260132000001: the scheduler tables must live in
+/// `public` — the production app role `mda_app` (no `mda` in its search_path)
+/// reads them unqualified. They originally landed in the `mda` schema through
+/// the owner role's `"$user"` search_path, so every scheduler query failed
+/// with "relation does not exist" when the app served as `mda_app`.
+#[tokio::test]
+async fn scheduler_tables_are_visible_to_the_app_role() {
+    let url = std::env::var("DATABASE_URL").unwrap();
+    let (pool, _db) = common::spawn_db(&url).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let has_role: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'mda_app')")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+    if !has_role {
+        return; // restricted environments without role-creation rights
+    }
+    sqlx::query("SET ROLE mda_app")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let schedules: i64 = sqlx::query_scalar("SELECT count(*) FROM sys_schedule")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("sys_schedule must resolve for mda_app (public schema)");
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM sys_schedule_run")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("sys_schedule_run must resolve for mda_app (public schema)");
+    assert_eq!((schedules, runs), (0, 0));
+}

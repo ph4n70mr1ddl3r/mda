@@ -109,11 +109,32 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         cfg.versioning.clone(),
         crate::versioning::middleware,
     ));
+    // A panicking handler becomes a 500 in the platform's error envelope (the
+    // panic is logged; the client never sees a dropped connection). Applied
+    // just outside versioning so the response still carries discovery headers.
+    let app = app.layer(tower_http::catch_panic::CatchPanicLayer::custom(
+        panic_response,
+    ));
     let app = app.layer(axum::extract::DefaultBodyLimit::max(cfg.max_body_bytes));
     let app = edge::apply_security_headers(app);
     app.layer(axum::middleware::from_fn(edge::access_log))
         .layer(edge::cors_layer(&cfg))
         .with_state(state)
+}
+
+/// Convert a caught handler panic into the platform error envelope (500
+/// `mda.internal_error`); the detail goes to the server log only.
+fn panic_response(panic: Box<dyn std::any::Any + Send>) -> Response {
+    let detail = panic
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string());
+    tracing::error!(detail = %detail, "handler panicked");
+    crate::error::ApiError(mda_core::Error::Internal(anyhow::anyhow!(
+        "handler panic: {detail}"
+    )))
+    .into_response()
 }
 
 #[derive(Debug, Serialize)]
@@ -145,4 +166,41 @@ async fn health(axum::extract::State(state): axum::extract::State<AppState>) -> 
     };
 
     (code, axum::Json(report)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use tower::util::ServiceExt; // oneshot
+
+    /// A panicking handler must surface as a 500 error envelope, never a
+    /// dropped connection — this is what `CatchPanicLayer::custom(panic_response)`
+    /// guarantees in the real router.
+    #[tokio::test]
+    async fn handler_panic_becomes_500_envelope() {
+        async fn boom() -> &'static str {
+            panic!("kaboom: secret detail")
+        }
+        let app = Router::new().route("/boom", get(boom)).layer(
+            tower_http::catch_panic::CatchPanicLayer::custom(panic_response),
+        );
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/boom")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response despite panic");
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["code"], "mda.internal_error");
+        assert_eq!(body["message"], "internal server error");
+        assert!(!body["message"].as_str().unwrap().contains("secret detail"));
+    }
 }
