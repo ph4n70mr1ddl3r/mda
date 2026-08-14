@@ -43,10 +43,13 @@ pub fn spawn_drain_with(
     tokio::spawn(async move {
         tracing::info!("outbox drain worker started");
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // drain first, then sleep: a freshly-enqueued row is processed on
+            // the next runtime tick instead of waiting a full poll interval.
+            // (Particularly matters at startup and in tests.)
             if let Err(e) = drain_once(&pool, &channels, secrets.as_ref(), &http).await {
                 tracing::warn!(?e, "outbox drain pass failed");
             }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     });
 }

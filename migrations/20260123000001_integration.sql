@@ -66,8 +66,28 @@ CREATE TABLE IF NOT EXISTS int.value_map (
     UNIQUE (tenant_id, name)
 );
 
+-- int.flow_step is a child of int.flow and lacks tenant_id; like the meta
+-- workflow child tables, denormalise tenant_id from the parent (int.flow) via a
+-- BEFORE INSERT/UPDATE trigger, then every int.* table is uniformly gateable.
+ALTER TABLE int.flow_step ADD COLUMN IF NOT EXISTS tenant_id UUID;
+
+UPDATE int.flow_step fs SET tenant_id = f.tenant_id
+   FROM int.flow f WHERE f.id = fs.flow_id AND fs.tenant_id IS NULL;
+
+CREATE OR REPLACE FUNCTION mda.int_tenant_from_flow() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    SELECT f.tenant_id INTO NEW.tenant_id FROM int.flow f WHERE f.id = NEW.flow_id;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS int_flow_step_tenant ON int.flow_step;
+CREATE TRIGGER int_flow_step_tenant BEFORE INSERT OR UPDATE ON int.flow_step
+    FOR EACH ROW EXECUTE FUNCTION mda.int_tenant_from_flow();
+
 -- RLS on the int.* definition tables (the generic meta-RLS pass ran before
--- these; gate explicitly).
+-- these; gate explicitly). Every int.* table now carries tenant_id.
 DO $$
 DECLARE t record;
 BEGIN

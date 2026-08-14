@@ -183,7 +183,7 @@ async fn template_renders_context_and_record_modes() {
     assert_eq!(v["content_type"], "text/html");
 
     // (2) record mode: loads + AuthZ-projects the record.
-    let (st, _v) = call(
+    let (st, v) = call(
         &ctx.app,
         "POST",
         &format!("/api/templates/welcome/render?entity=Customer&id={id}"),

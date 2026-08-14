@@ -449,7 +449,8 @@ async fn inbound_verifies_signature_and_dedupes() {
     .unwrap();
     assert_eq!(n, 1, "deduped on event_id");
 
-    // a bad signature → forbidden
+    // a bad signature (valid timestamp, wrong MAC) → forbidden
+    let bad_sig = format!("t={ts},v1=deadbeef");
     let (st, _) = call(
         &app,
         "POST",
@@ -457,7 +458,7 @@ async fn inbound_verifies_signature_and_dedupes() {
         None,
         Some(body),
         vec![
-            ("x-mda-signature", "t=1,v1=deadbeef"),
+            ("x-mda-signature", bad_sig.as_str()),
             ("x-mda-event-id", "evt-2"),
         ],
     )

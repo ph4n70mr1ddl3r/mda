@@ -27,7 +27,6 @@ struct Ctx {
 /// Customer (1) → (N) Invoice model, so traversal can be exercised.
 fn model(table_c: &str, table_i: &str) -> Value {
     let cust = Uuid::new_v4();
-    let inv_rel = Uuid::new_v4();
     json!({
         "modules": [],
         "entities": [
@@ -44,11 +43,10 @@ fn model(table_c: &str, table_i: &str) -> Value {
                 "id": Uuid::new_v4(), "module_id": null, "name": "Invoice",
                 "table_name": table_i, "label": "Invoice", "description": null,
                 "fields": [
-                    {"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}},
-                    {"id": inv_rel, "name":"customer_id","label":"Customer","field_type":"reference","required":true,"is_unique":false,"is_indexed":true,"default_expr":null,"config":{"target_entity_id": cust}}
+                    {"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}}
                 ],
                 "relationships": [
-                    {"id": Uuid::new_v4(), "source_entity_id": Uuid::new_v4(), "source_field_name":"customer_id","target_entity_id": cust,"cardinality":"many_to_one","strength":"hard","on_delete":null,"required":true,"reference_qualifier":null,"rollup_summary":null}
+                    {"id": Uuid::new_v4(), "source_entity_id": Uuid::new_v4(), "source_field_name":"customer_id","target_entity_id": cust,"cardinality":"many_to_one","strength":"master_detail","on_delete":null,"required":true,"reference_qualifier":null,"rollup_summary":null}
                 ]
             }
         ]
@@ -234,6 +232,17 @@ async fn graphql_field_level_security_projects() {
         ),
     )
     .await;
+
+    // Customer is org-wide public-read so any user with the `read` verb sees
+    // every record — isolating this test to field-level (not record-level) security.
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    sqlx::query("INSERT INTO sec.sec_owd (tenant_id, entity, default_access) VALUES ($1,'Customer','public_read') ON CONFLICT (tenant_id, entity) DO UPDATE SET default_access='public_read'")
+        .bind(ctx.tenant)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
 
     // a Customer record with a `secret` field.
     let (_, c) = call(

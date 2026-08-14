@@ -231,17 +231,21 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
             else {
                 continue;
             };
-            let field_name = rel.source_field_name.clone();
+            // The traversal is exposed under the (camel-cased) target entity name
+            // (e.g. `customer`), while the FK value is read from the source column
+            // (`customer_id`) on the parent record.
+            let gql_name = entity_to_camel(&target);
+            let fk_column = rel.source_field_name.clone();
             let pool = pool.clone();
             let defs_map = defs_map.clone();
             let target = target.clone();
             obj = obj.field(Field::new(
-                field_name.clone(),
+                gql_name.clone(),
                 TypeRef::named(target.clone()),
                 move |ctx| {
                     let pool = pool.clone();
                     let defs_map = defs_map.clone();
-                    let field_name = field_name.clone();
+                    let fk_column = fk_column.clone();
                     let target = target.clone();
                     FieldFuture::new(async move {
                         let user = ctx.data::<Identity>()?.clone();
@@ -252,7 +256,7 @@ async fn build_schema(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Schema, Error
                         let fk = ctx
                             .parent_value
                             .as_value()
-                            .and_then(|v| field_of(v, &field_name))
+                            .and_then(|v| field_of(v, &fk_column))
                             .and_then(|v| match v {
                                 GqlValue::String(s) => Some(s.clone()),
                                 _ => None,

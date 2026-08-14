@@ -364,45 +364,58 @@ async fn audit(
     before: Option<Value>,
     after: Option<Value>,
 ) {
-    // Compliance audit (heavy before/after JSONB, §4.7).
-    if let Err(e) = sqlx::query(
-        "INSERT INTO sys_audit_log (tenant_id, actor_id, entity, record_id, op, before, after)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(tenant)
-    .bind(actor)
-    .bind(entity)
-    .bind(record_id.unwrap_or_else(Uuid::nil))
-    .bind(op)
-    .bind(&before)
-    .bind(&after)
-    .execute(&st.pool)
-    .await
-    {
-        let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::error!(?e, failures = n, "audit log insert failed");
-    }
-
-    // Canonical domain event (lightweight facts for real-time/replay, §5.10).
-    // Written in the same transaction-bound request so it is consistent with the
-    // write; best-effort like the audit row.
+    // Both sys_audit_log and sys_event_log are tenant-RLS-gated, so the inserts
+    // must run under the tenant GUC — otherwise a non-superuser app role (the
+    // normal case) fails the WITH CHECK and the row is dropped. They share one
+    // short transaction so the two side-effects land together (best-effort).
     let (etype, payload) = event_for(op, &before, &after);
-    if let (Some(etype), Some(rid)) = (etype, record_id) {
-        if let Err(e) = sqlx::query(
-            "INSERT INTO sys_event_log (tenant_id, type, entity, record_id, actor_id, payload)
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(tenant)
-        .bind(etype)
-        .bind(entity)
-        .bind(rid)
-        .bind(actor)
-        .bind(payload)
-        .execute(&st.pool)
-        .await
-        {
-            tracing::warn!(?e, "event log insert failed");
+    match st.pool.begin().await {
+        Ok(mut tx) => {
+            if let Err(e) = mda_security::set_tenant(&mut tx, tenant).await {
+                tracing::warn!(?e, "audit: set_tenant failed");
+                return;
+            }
+            let audit_ok = sqlx::query(
+                "INSERT INTO sys_audit_log (tenant_id, actor_id, entity, record_id, op, before, after)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(tenant)
+            .bind(actor)
+            .bind(entity)
+            .bind(record_id.unwrap_or_else(Uuid::nil))
+            .bind(op)
+            .bind(&before)
+            .bind(&after)
+            .execute(&mut *tx)
+            .await
+            .is_ok();
+            let event_ok = if let (Some(etype), Some(rid)) = (etype, record_id) {
+                sqlx::query(
+                    "INSERT INTO sys_event_log (tenant_id, type, entity, record_id, actor_id, payload)
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(tenant)
+                .bind(etype)
+                .bind(entity)
+                .bind(rid)
+                .bind(actor)
+                .bind(&payload)
+                .execute(&mut *tx)
+                .await
+                .is_ok()
+            } else {
+                true
+            };
+            if audit_ok && event_ok {
+                if let Err(e) = tx.commit().await {
+                    tracing::warn!(?e, "audit tx commit failed");
+                }
+            } else if !audit_ok {
+                let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::error!(failures = n, "audit log insert failed");
+            }
         }
+        Err(e) => tracing::warn!(?e, "audit: begin tx failed"),
     }
 }
 

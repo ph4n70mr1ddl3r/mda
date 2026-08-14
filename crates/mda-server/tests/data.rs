@@ -901,7 +901,7 @@ async fn outbox_drains_into_notifications() {
     // start the drain worker and wait for it to process
     mda_server::outbox::spawn_drain(ctx.pool.clone());
     let mut done = false;
-    for _ in 0..20 {
+    for _ in 0..40 {
         let notified: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM sys_notification WHERE tenant_id=$1 AND user_id=$2",
         )

@@ -224,7 +224,7 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     let _ = (count, tier);
     // the table name is dynamic, so query it by listing via the API instead.
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
-    let rows = list.as_array().unwrap();
+    let rows = list["items"].as_array().unwrap();
     assert_eq!(rows.len(), 1, "no duplicate records");
     assert_eq!(rows[0]["tier"], "Silver");
     assert_eq!(rows[0]["name"], "Acme");
@@ -256,7 +256,7 @@ async fn inbound_upserts_by_external_key_no_duplicates() {
     let rec3 = v["record_id"].as_str().unwrap().parse::<Uuid>().unwrap();
     assert_ne!(rec3, rec1);
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
-    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert_eq!(list["items"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -379,7 +379,7 @@ async fn inbound_value_map_step_translates_codes() {
     assert!(v["record_id"].as_str().is_some());
 
     let (_, list) = call(&ctx.app, "GET", "/api/data/Customer", &ctx.token, None).await;
-    let row = &list.as_array().unwrap()[0];
+    let row = &list["items"].as_array().unwrap()[0];
     assert_eq!(row["tier"], "Gold", "value_map translated GOLD→Gold");
 }
 
