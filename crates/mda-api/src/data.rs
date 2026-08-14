@@ -3,13 +3,14 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use mda_core::Error;
-use mda_data::{self, ListParams, RecordScope};
+use mda_data::{self, Filter, ListParams, RecordScope};
 use mda_meta::{loader, EntityDefinition};
 use mda_security::{Access, Identity, Owd};
 use serde::Deserialize;
@@ -781,63 +782,390 @@ where
 }
 
 // ===== bulk import / export (PLAN §5.13) =====
+//
+// The synchronous impex contract: an import is *batched, mapped writes* that
+// reuse the runtime write pipeline, so an imported row is indistinguishable
+// from one typed by hand (no second set of rules to drift). Supports CSV
+// (symmetric with the CSV export) and JSON; `mode` (create|update|upsert) with a
+// `key` field for update/upsert matching; `dry_run` (validate only, nothing
+// written); and `on_error` (abort = all-or-nothing validate-then-commit,
+// continue = best-effort per row). Large/streaming imports as an async job
+// (sys_impex_job) are the documented follow-up; this is the v1 synchronous
+// surface the plan scopes for the runtime API.
 
-/// `POST /api/impex/:entity/import` — best-effort import of a JSON array of
-/// records. Each row runs through the same pipeline as a hand-typed create
-/// (RBAC + FLS + rules + calculated fields + audit), so an imported row is
-/// indistinguishable from one typed by hand. Returns `{ imported, errors[] }`.
+#[derive(Deserialize, Default)]
+struct ImportQuery {
+    /// `csv` | `json` — overrides Content-Type sniffing.
+    #[serde(default)]
+    format: Option<String>,
+    /// `create` | `update` | `upsert` (default create).
+    #[serde(default)]
+    mode: Option<String>,
+    /// Key field for update/upsert matching (a known field, or `id`).
+    #[serde(default)]
+    key: Option<String>,
+    /// Validate only — nothing is written; returns the would-create/would-update
+    /// counts + per-row errors.
+    #[serde(default)]
+    dry_run: Option<bool>,
+    /// `abort` (validate-then-commit: any error writes nothing) | `continue`
+    /// (best-effort per row; default).
+    #[serde(default)]
+    on_error: Option<String>,
+}
+
+/// `POST /api/impex/:entity/import` — mapped, validated, safe record import
+/// (CSV or JSON), reusing the runtime write pipeline per row.
 async fn import_records(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
     Path(entity): Path<String>,
-    Json(rows): Json<Vec<Value>>,
+    headers: HeaderMap,
+    Query(q): Query<ImportQuery>,
+    body: Bytes,
 ) -> ApiResult<Json<Value>> {
-    authorize(&user, &entity, "create")?;
+    let mode = q.mode.as_deref().unwrap_or("create").to_string();
+    if !matches!(mode.as_str(), "create" | "update" | "upsert") {
+        return Err(Error::Invalid("mode must be one of create|update|upsert".into()).into());
+    }
+    let on_error = q.on_error.as_deref().unwrap_or("continue").to_string();
+    if !matches!(on_error.as_str(), "abort" | "continue") {
+        return Err(Error::Invalid("on_error must be abort|continue".into()).into());
+    }
+    let dry_run = q.dry_run.unwrap_or(false);
+
     let def = entity_def(&st, user.tenant_id, &entity).await?;
-    let reg = mda_rules::Registry::new();
-    let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
-    let mut imported = 0u64;
-    let mut errors: Vec<Value> = Vec::new();
-    for (i, row) in rows.into_iter().enumerate() {
-        let map = match into_object(row) {
-            Ok(m) => m,
-            Err(e) => {
-                errors.push(json!({"row": i, "error": e.to_string()}));
-                continue;
-            }
-        };
-        if let Err(e) = assert_writable(&user, &entity, &def, &map) {
-            errors.push(json!({"row": i, "error": e.to_string()}));
-            continue;
+
+    // Authorize by mode (upsert needs both verbs — it can do either per row).
+    match mode.as_str() {
+        "create" => authorize(&user, &entity, "create")?,
+        "update" => authorize(&user, &entity, "update")?,
+        "upsert" => {
+            authorize(&user, &entity, "create")?;
+            authorize(&user, &entity, "update")?;
         }
-        let mut ctx = map;
-        if let Err(e) = mda_rules::fire(&rules, "after_create", &mut ctx, &reg) {
-            errors.push(json!({"row": i, "error": e.to_string()}));
-            continue;
-        }
-        if let Err(e) = mda_rules::compute_calculated(&def, &mut ctx, &reg) {
-            errors.push(json!({"row": i, "error": e.to_string()}));
-            continue;
-        }
-        match mda_data::create(&st.pool, user.tenant_id, &def, ctx, user.user_id).await {
-            Ok(rec) => {
-                audit(
-                    &st,
-                    user.tenant_id,
-                    user.user_id,
-                    &entity,
-                    rec["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()),
-                    "create",
-                    None,
-                    Some(rec),
-                )
-                .await;
-                imported += 1;
-            }
-            Err(e) => errors.push(json!({"row": i, "error": e.to_string()})),
+        _ => unreachable!(),
+    }
+
+    // Key field is required for update/upsert and must name a known column.
+    let key = q.key.clone();
+    if mode != "create" {
+        let k = key
+            .as_deref()
+            .ok_or_else(|| Error::Invalid("mode update/upsert requires a `key` field".into()))?;
+        if !key_is_known(&def, k) {
+            return Err(Error::Invalid(format!(
+                "key field '{k}' is not a known field of {entity}"
+            ))
+            .into());
         }
     }
-    Ok(Json(json!({"imported": imported, "errors": errors})))
+
+    // ---- parse rows (CSV or JSON) ----
+    let format = q.format.as_deref().unwrap_or_else(|| {
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if ct.contains("text/csv") || ct.contains("application/csv") {
+            "csv"
+        } else {
+            "json"
+        }
+    });
+    // Parse into (source columns, rows). For CSV the columns are the header
+    // (so an all-blank unmapped column is still caught); for JSON they are the
+    // union of every row's keys.
+    let (src_cols, mut rows): (Vec<String>, Vec<Map<String, Value>>) = match format {
+        "csv" => {
+            let text = std::str::from_utf8(&body)
+                .map_err(|_| Error::Invalid("CSV body is not valid UTF-8".into()))?;
+            let res = mda_reports::from_csv(text)?;
+            (res.columns, res.rows)
+        }
+        "json" => {
+            let v: Vec<Value> = serde_json::from_slice(&body).map_err(|e| {
+                Error::Invalid(format!("JSON body must be an array of objects: {e}"))
+            })?;
+            let rows: Vec<Map<String, Value>> = v
+                .into_iter()
+                .map(into_object)
+                .collect::<ApiResult<Vec<_>>>()?;
+            let mut cols = std::collections::HashSet::new();
+            for r in &rows {
+                for k in r.keys() {
+                    cols.insert(k.clone());
+                }
+            }
+            (cols.into_iter().collect(), rows)
+        }
+        other => return Err(Error::Invalid(format!("unknown format '{other}'")).into()),
+    };
+
+    // ---- column mapping: every source column must map to a known field or a
+    // recognized system column (id/owner_id/state/...). Unknowns abort up front
+    // (§5.13 “Map source columns → entity fields”). System columns are stripped
+    // before the write so validate_record never sees them. ----
+    let unmapped: Vec<String> = src_cols
+        .iter()
+        .filter(|c| !is_mappable_column(&def, c))
+        .cloned()
+        .collect();
+    if !unmapped.is_empty() {
+        return Err(Error::Invalid(format!(
+            "unmapped source columns (no matching field): {}",
+            unmapped.join(", ")
+        ))
+        .into());
+    }
+
+    let write_scope = scope_for(&st, &user, &entity).await?;
+
+    // For CSV, a blank cell means "not provided" (absent), matching JSON
+    // semantics — so a required field left blank fails required instead of being
+    // silently accepted as an empty string. (JSON rows already express absence
+    // by omitting the key.)
+    if format == "csv" {
+        for m in rows.iter_mut() {
+            m.retain(|_, v| !matches!(v, Value::String(s) if s.is_empty()));
+        }
+    }
+
+    // ---- validation pass: per-row field-write AuthZ + record validation +
+    // (update/upsert) key resolution. Nothing is written here. ----
+    struct Planned {
+        index: usize,
+        body: Map<String, Value>,    // system columns stripped
+        target: Option<(Uuid, i64)>, // Some for an existing record (update)
+        errors: Vec<Value>,
+    }
+    let mut planned: Vec<Planned> = Vec::with_capacity(rows.len());
+    for (i, raw) in rows.into_iter().enumerate() {
+        let mut errors: Vec<Value> = Vec::new();
+
+        // Field-level write AuthZ (a row may not write a field the caller can't).
+        if let Err(e) = assert_writable(&user, &entity, &def, &raw) {
+            errors.push(json!({"row": i, "error": e.to_string()}));
+        }
+
+        let body = strip_system_columns(&raw);
+
+        // Declarative validation (type / required / unknown) — same check the
+        // write path runs, so dry-run reflects what commit would reject.
+        if let Err(e) = mda_data::crud::validate_record(&def, &body) {
+            errors.push(json!({"row": i, "error": e.to_string()}));
+        }
+
+        // Resolve the target record for update/upsert (write-scoped: a user can
+        // only import-update a record they may write).
+        let target = if mode == "create" {
+            None
+        } else {
+            match resolve_import_target(
+                &st.pool,
+                &user,
+                &def,
+                key.as_deref().unwrap(),
+                &raw,
+                &write_scope,
+            )
+            .await
+            {
+                Ok(Some(tv)) => Some(tv),
+                Ok(None) => {
+                    if mode == "update" {
+                        errors.push(json!({
+                            "row": i,
+                            "error": format!(
+                                "no existing record matches key '{}'",
+                                key.as_deref().unwrap()
+                            )
+                        }));
+                    }
+                    None // upsert → falls through to create
+                }
+                Err(e) => {
+                    errors.push(json!({"row": i, "error": e.to_string()}));
+                    None
+                }
+            }
+        };
+
+        planned.push(Planned {
+            index: i,
+            body,
+            target,
+            errors,
+        });
+    }
+
+    let validation_errors: usize = planned.iter().map(|p| p.errors.len()).sum::<usize>();
+    let would_create = planned
+        .iter()
+        .filter(|p| p.target.is_none() && p.errors.is_empty())
+        .count();
+    let would_update = planned
+        .iter()
+        .filter(|p| p.target.is_some() && p.errors.is_empty())
+        .count();
+
+    let mut errors: Vec<Value> = planned.iter().flat_map(|p| p.errors.clone()).collect();
+    let mut created = 0u64;
+    let mut updated = 0u64;
+
+    // Commit: never on dry_run; under `abort`, only if the validation pass was
+    // fully clean (validate-then-commit ⇒ all-or-nothing).
+    let do_write = !dry_run && (on_error == "continue" || validation_errors == 0);
+    if do_write {
+        for p in &planned {
+            if !p.errors.is_empty() {
+                continue;
+            }
+            let res = match p.target {
+                Some((id, ver)) => update_record_service(
+                    &st,
+                    &user,
+                    &entity,
+                    id,
+                    ver,
+                    Value::Object(p.body.clone()),
+                )
+                .await
+                .map(|_| ()),
+                None => create_record_service(&st, &user, &entity, Value::Object(p.body.clone()))
+                    .await
+                    .map(|_| ()),
+            };
+            match res {
+                Ok(()) => {
+                    if p.target.is_some() {
+                        updated += 1;
+                    } else {
+                        created += 1;
+                    }
+                }
+                Err(e) => errors.push(json!({"row": p.index, "error": e.to_string()})),
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "mode": mode,
+        "format": format,
+        "dry_run": dry_run,
+        "on_error": on_error,
+        "created": created,
+        "updated": updated,
+        "imported": created + updated,
+        "would_create": would_create,
+        "would_update": would_update,
+        "errors": errors,
+    })))
+}
+
+/// Is `k` a known field, relationship, or the record id? (Eligible as an
+/// import key.)
+fn key_is_known(def: &EntityDefinition, k: &str) -> bool {
+    k == "id"
+        || def.fields.iter().any(|f| f.name == k)
+        || def.relationships.iter().any(|r| r.source_field_name == k)
+}
+
+/// Is `k` a mappable source column? (A known field/relationship, or a
+/// recognized system column that is silently ignored on write.)
+fn is_mappable_column(def: &EntityDefinition, k: &str) -> bool {
+    key_is_known(def, k)
+        || matches!(
+            k,
+            "owner_id" | "state" | "version" | "created_at" | "updated_at"
+        )
+}
+
+/// Remove system columns from a row so the write pipeline (which validates
+/// against the field set) never sees them. The key field, if it is a real
+/// field, is retained.
+fn strip_system_columns(m: &Map<String, Value>) -> Map<String, Value> {
+    m.iter()
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "id" | "owner_id" | "state" | "version" | "created_at" | "updated_at"
+            )
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// Resolve an existing record by the import key under the caller's **write**
+/// scope. Returns `Ok(Some((id, version)))` when a unique match exists,
+/// `Ok(None)` when none does (update ⇒ row error, upsert ⇒ create), and an
+/// error on an ambiguous match or a malformed key value.
+async fn resolve_import_target(
+    pool: &sqlx::PgPool,
+    user: &Identity,
+    def: &EntityDefinition,
+    key: &str,
+    raw: &Map<String, Value>,
+    write_scope: &RecordScope,
+) -> ApiResult<Option<(Uuid, i64)>> {
+    let keyval = raw.get(key).and_then(|v| v.as_str()).ok_or_else(|| {
+        Error::Invalid(format!(
+            "key field '{key}' is missing or not a string in this row"
+        ))
+    })?;
+
+    if key == "id" {
+        let id = Uuid::parse_str(keyval)
+            .map_err(|_| Error::Invalid("key 'id' is not a valid UUID".into()))?;
+        return match mda_data::read(pool, user.tenant_id, def, id, &write_scope.clone()).await {
+            Ok(rec) => {
+                let ver = version_of(&rec).unwrap_or(1);
+                Ok(Some((id, ver)))
+            }
+            Err(_) => Ok(None),
+        };
+    }
+
+    // Write-scoped lookup (same predicate a single-record PATCH enforces).
+    let ids = mda_data::mass_target_ids(
+        pool,
+        user.tenant_id,
+        def,
+        &ListParams {
+            filters: vec![Filter {
+                field: key.to_string(),
+                op: "eq".to_string(),
+                value: keyval.to_string(),
+            }],
+            sort: Vec::new(),
+            page: 1,
+            page_size: 0,
+        },
+        write_scope,
+        2, // 2 is enough to detect ambiguity
+    )
+    .await?;
+
+    match ids.len() {
+        0 => Ok(None),
+        1 => {
+            let id = ids[0];
+            let rec = mda_data::read(
+                pool,
+                user.tenant_id,
+                def,
+                id,
+                &RecordScope::superuser(user.user_id),
+            )
+            .await?;
+            let ver = version_of(&rec).unwrap_or(1);
+            Ok(Some((id, ver)))
+        }
+        _ => Err(Error::Invalid(format!(
+            "multiple records match key '{key}' — the key must be unique"
+        ))
+        .into()),
+    }
 }
 
 /// `GET /api/impex/:entity/export` — list (filtered) as CSV, respecting field

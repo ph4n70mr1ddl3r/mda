@@ -167,6 +167,53 @@ async fn call(
     (status, val)
 }
 
+/// POST/GET with an explicit Content-Type + raw (non-JSON) body — used for the
+/// CSV import path. Returns the parsed-JSON response envelope.
+async fn call_with_type(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    content_type: &str,
+    body: String,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let val: Value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, val)
+}
+
+/// GET a text body (e.g. the CSV export) as a raw String.
+async fn call_text(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
 async fn publish(ctx: &Ctx, model: Value) -> Value {
     let (_, d) = call(
         &ctx.app,
@@ -872,6 +919,319 @@ async fn bulk_import_and_export() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "export status");
+}
+
+// ===== §5.13 impex: CSV import, dry-run, create/update/upsert, on_error =====
+
+/// A small model with a unique key (email) for upsert/update tests.
+fn keyed_model(table: &str) -> Value {
+    json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(), "module_id": null,
+            "name": "Contact", "table_name": table,
+            "label": "Contact", "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(), "name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"email","label":"Email","field_type":"string","required":false,"is_unique":true,"is_indexed":true,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"city","label":"City","field_type":"string","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+            ],
+            "relationships": []
+        }]
+    })
+}
+
+#[tokio::test]
+async fn import_csv_creates_records() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // CSV with a quoted value containing a comma (round-trips through the parser).
+    let csv =
+        "name,email,city\nAda,ada@x.com,\"Cambridge, MA\"\nBob,bob@x.com,Oxford\n".to_string();
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "import: {res}");
+    assert_eq!(res["imported"], 2, "imported: {res}");
+    assert_eq!(res["created"], 2);
+    assert_eq!(res["updated"], 0);
+    assert_eq!(res["mode"], "create");
+    assert_eq!(res["format"], "csv");
+    assert!(
+        res["errors"].as_array().unwrap().is_empty(),
+        "errors: {res}"
+    );
+
+    // the quoted comma survived as data
+    let (_st, res) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Contact?filter=email:eq:ada@x.com",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "read: {res}");
+    assert_eq!(res["total"], 1);
+    assert_eq!(res["items"][0]["city"], "Cambridge, MA");
+}
+
+#[tokio::test]
+async fn import_dry_run_writes_nothing() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    let csv = "name,email,city\nAda,ada@x.com,Cambridge\n,email@x.com,Bad\n".to_string();
+    // dry_run: 1 valid (would_create), 1 invalid (missing required name); nothing written.
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?dry_run=true",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "dry_run: {res}");
+    assert_eq!(res["dry_run"], true);
+    assert_eq!(res["would_create"], 1);
+    assert_eq!(res["created"], 0, "dry_run must not write");
+    assert_eq!(res["updated"], 0);
+    assert_eq!(res["errors"].as_array().unwrap().len(), 1);
+
+    // nothing was actually written
+    let (_st, res) = call(&ctx.app, "GET", "/api/data/Contact", &ctx.token, None, None).await;
+    assert_eq!(res["total"], 0);
+}
+
+#[tokio::test]
+async fn import_upsert_by_key_creates_and_updates() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // seed an existing record (owner = admin) to be matched by key=email
+    let (st, _res) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Contact",
+        &ctx.token,
+        Some(json!({"name":"Ada","email":"ada@x.com","city":"Old"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+
+    // upsert by key=email: Ada matches → update (city Old→New); Cyd is new → create
+    let csv = "name,email,city\nAda,ada@x.com,New\nCyd,cyd@x.com,Paris\n".to_string();
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?mode=upsert&key=email",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "upsert: {res}");
+    assert_eq!(res["created"], 1, "{res}");
+    assert_eq!(res["updated"], 1, "{res}");
+    assert_eq!(res["imported"], 2);
+    assert!(
+        res["errors"].as_array().unwrap().is_empty(),
+        "errors: {res}"
+    );
+
+    // Ada's city was updated to New; total is now 2
+    let (_st, res) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Contact?filter=email:eq:ada@x.com",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(res["items"][0]["city"], "New");
+    let (_st, res) = call(&ctx.app, "GET", "/api/data/Contact", &ctx.token, None, None).await;
+    assert_eq!(res["total"], 2);
+}
+
+#[tokio::test]
+async fn import_update_mode_missing_key_is_a_row_error() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // update by key=email, but no record has this email → row error, nothing written
+    let csv = "name,email,city\nGhost,ghost@x.com,Nowhere\n".to_string();
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?mode=update&key=email",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "update: {res}");
+    assert_eq!(res["updated"], 0);
+    assert_eq!(res["errors"].as_array().unwrap().len(), 1);
+    let (_st, res) = call(&ctx.app, "GET", "/api/data/Contact", &ctx.token, None, None).await;
+    assert_eq!(res["total"], 0);
+}
+
+#[tokio::test]
+async fn import_on_error_abort_writes_nothing() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // one good row, one bad (missing required name). on_error=abort ⇒ validate-then-
+    // commit: the validation error means nothing is written.
+    let csv = "name,email,city\nAda,ada@x.com,Cambridge\n,bad@x.com,Nope\n".to_string();
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?on_error=abort",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "abort: {res}");
+    assert_eq!(res["on_error"], "abort");
+    assert_eq!(res["imported"], 0, "abort must not partially commit: {res}");
+    assert_eq!(res["would_create"], 1);
+    assert_eq!(res["errors"].as_array().unwrap().len(), 1);
+
+    let (_st, res) = call(&ctx.app, "GET", "/api/data/Contact", &ctx.token, None, None).await;
+    assert_eq!(res["total"], 0);
+}
+
+#[tokio::test]
+async fn import_rejects_unmapped_columns() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // 'bogus' is not a field → mapping error (422 invalid), not a per-row error.
+    let csv = "name,email,bogus\nAda,ada@x.com,whatever\n".to_string();
+    let (st, _res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn import_export_round_trips() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // create two records
+    for (n, e) in [("Ada", "ada@x.com"), ("Bob", "bob@x.com")] {
+        call(
+            &ctx.app,
+            "POST",
+            "/api/data/Contact",
+            &ctx.token,
+            Some(json!({"name":n,"email":e}).to_string()),
+            None,
+        )
+        .await;
+    }
+
+    // export → CSV (id + readable fields)
+    let (st, csv) = call_text(&ctx.app, "GET", "/api/impex/Contact/export", &ctx.token).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        csv.contains("name") && csv.contains("email"),
+        "export header: {csv}"
+    );
+
+    // re-import the exported CSV as upsert by id → every row matches (idempotent)
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?mode=upsert&key=id",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "round-trip: {res}");
+    assert_eq!(
+        res["updated"], 2,
+        "all exported rows should match by id: {res}"
+    );
+    assert_eq!(res["created"], 0);
+    assert!(
+        res["errors"].as_array().unwrap().is_empty(),
+        "errors: {res}"
+    );
+
+    // still exactly two records (no duplicates from the re-import)
+    let (_st, res) = call(&ctx.app, "GET", "/api/data/Contact", &ctx.token, None, None).await;
+    assert_eq!(res["total"], 2);
 }
 
 #[tokio::test]

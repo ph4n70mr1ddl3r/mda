@@ -7,7 +7,7 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > **Status:** Phases 0–7, 9, 10 implemented + Phase 6 Runtime UI (Leptos),
 > plus the full §5.18–5.22 platform-capability cluster and a first-class GraphQL
 > runtime API (ADR-0010).
-> Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
+> Server: auth, CRUD, security, rules, workflows, reporting, bulk (CSV+JSON import with dry-run / create·update·upsert by key / on_error abort+continue), attachments,
 > notifications, sharing (incl. **team-OWD record visibility + team hierarchy**
 > — ADR-0013 `owd_visible` / ADR-0025 `sec_team.parent_id`). Platform: secrets, templating, multi-channel
 > notifications + digest (with record-reader recipient resolution +
@@ -86,6 +86,9 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 # Mass actions (ADR-0021) — bulk update/delete by filter, reusing the write pipeline:
 #   POST /api/data/:entity/mass-update   {"filter":["tier:eq:Bronze"],"set":{"tier":"Silver"},"dry_run":false}
 #   POST /api/data/:entity/mass-delete   {"filter":["tier:eq:Bronze"]}
+# Bulk import/export (§5.13) — mapped, validated, safe record import (CSV or JSON):
+#   POST /api/impex/:entity/import?mode=upsert&key=email&dry_run=true&on_error=abort  (text/csv body)
+#   GET  /api/impex/:entity/export  (-> text/csv; respects field-level read security)
 ```
 
 Platform surfaces (ADR-0018) — record history & as-of, and the tenant

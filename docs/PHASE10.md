@@ -5,12 +5,29 @@
 
 ## Bulk import/export (§5.13)
 
-- `POST /api/impex/:entity/import` — a JSON array of records; each row runs the
-  **full runtime create pipeline** (RBAC + FLS + rules + calculated + audit), so
-  an imported row is indistinguishable from one typed by hand. Best-effort;
-  returns `{ imported, errors[{row,error}] }`.
+The synchronous impex contract — an import is *batched, mapped writes* reusing
+the runtime write pipeline, so an imported row is indistinguishable from one
+typed by hand (no second set of rules to drift).
+
+- `POST /api/impex/:entity/import` — accepts **CSV** (`text/csv`) **or JSON**
+  (array of objects). Each row runs the full create/update write service
+  (RBAC + FLS + rules + calculated + audit + events).
+  - `mode` = `create` (default) | `update` | `upsert`; `update`/`upsert` take a
+    `key` field (a known field or `id`) and match under the caller's **write**
+    scope (a user can only import-update a record they may write).
+  - `dry_run=true` validates + resolves targets but writes nothing; returns
+    `would_create` / `would_update` / per-row `errors`.
+  - `on_error` = `continue` (default, best-effort per row) | `abort`
+    (validate-then-commit ⇒ any error writes nothing — all-or-nothing).
+  - Source columns auto-map by name to entity fields; unknown columns are a
+    422 mapping error (up front, not per row). System columns (`id`, `owner_id`,
+    …) are stripped before the write. A blank CSV cell = "not provided", so a
+    required field left blank fails required (matching JSON semantics).
+  - Returns `{ mode, format, dry_run, on_error, created, updated, imported,
+    would_create, would_update, errors[{row,error}] }`.
 - `GET /api/impex/:entity/export` — the filtered list as CSV (field-read security
-  respected; reuses the report CSV renderer).
+  respected; reuses the report CSV renderer, which now RFC-4180 quotes). A
+  round-trip works: export → edit → `import?mode=upsert&key=id`.
 
 ## Attachments (§5.14)
 
@@ -25,14 +42,20 @@
 
 ## Verification
 
-`--test data`: bulk import (2/3 imported, 1 missing required) + export 200;
-attachments upload→download + storing a blob id in an `attachment` field.
+`--test data`: bulk import (JSON create, best-effort), plus the new §5.13
+contract — CSV import (quoting round-trips), `dry_run` (writes nothing),
+`upsert`/`update` by key (create + update + missing-key row error),
+`on_error=abort` (all-or-nothing), unmapped-column 422, and a full export →
+import round-trip. `mda-reports --lib`: RFC-4180 `from_csv`/`to_csv` round-trip.
 
 ## Phase-10 decisions / deferrals
 
-- Bulk import is **sync + best-effort** (JSON array). Deferred: CSV parsing,
-  field-mapping UI, **dry-run** validation report, all-or-nothing mode, and the
-  `sys_impex_job` async job for very large files (§5.13).
+- The §5.13 **synchronous** surface is complete: CSV+JSON, create/update/upsert,
+  dry-run, on_error abort/continue, key-field matching, column mapping. Still
+  deferred (lower priority / large-file scale): the async `sys_impex_job` worker
+  for very large files (streaming, resumable per-row results, downloadable error
+  report), XLSX, and the Studio mapping UI. Reference-field **lookup** (resolve a
+  Customer by `name` rather than id) is a natural follow-up on the same boundary.
 - Attachments: owner-based access for now; S3 store, presigned upload/download
   URLs, virus-scan hook, checksum dedup, thumbnails, and orphan cleanup are
   follow-ups.

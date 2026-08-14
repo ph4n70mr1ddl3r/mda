@@ -256,8 +256,11 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
 
 /// Render a result as CSV (header = columns).
 pub fn to_csv(res: &ReportResult) -> String {
+    // Header names are quoted like any string field so the file round-trips
+    // through [`from_csv`] even if a name happens to contain a comma/quote.
+    let header: Vec<String> = res.columns.iter().map(|c| quote(c)).collect();
     let mut s = String::new();
-    s.push_str(&res.columns.join(","));
+    s.push_str(&header.join(","));
     s.push('\n');
     for row in &res.rows {
         let vals: Vec<String> = res
@@ -273,16 +276,103 @@ pub fn to_csv(res: &ReportResult) -> String {
 
 fn cell(v: &Value) -> String {
     match v {
-        Value::String(s) => {
-            if s.contains(',') || s.contains('"') || s.contains('\n') {
-                format!("\"{}\"", s.replace('"', "\"\""))
-            } else {
-                s.clone()
-            }
-        }
+        Value::String(s) => quote(s),
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// RFC-4180 quoting: wrap in quotes iff the value contains a comma, quote,
+/// CR, or LF; double any embedded quotes.
+fn quote(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Parse RFC-4180 CSV (a header row naming the columns, then one record per
+/// line) into a [`ReportResult`] whose rows hold the **raw string** values as
+/// `Value::String` (typing/coercion is the caller's job — e.g. the impex import
+/// path lets the runtime write pipeline coerce per field type). Quoted fields
+/// may contain commas, newlines (CR/LF/CRLF), and `""` for a literal quote.
+/// Mirrors [`to_csv`] so an export round-trips back through `from_csv`. Returns
+/// `mda.invalid` for an empty input (no header).
+pub fn from_csv(input: &str) -> Result<ReportResult> {
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut field = String::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut in_quotes = false;
+    let mut field_pending = false; // we are inside a (possibly empty) field
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            match c {
+                '"' => {
+                    if matches!(chars.peek(), Some('"')) {
+                        field.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                _ => field.push(c),
+            }
+        } else {
+            match c {
+                '"' if !field_pending => {
+                    in_quotes = true;
+                    field_pending = true;
+                }
+                '"' => field.push('"'),
+                ',' => {
+                    record.push(std::mem::take(&mut field));
+                    field_pending = false;
+                }
+                '\r' => {
+                    if matches!(chars.peek(), Some('\n')) {
+                        chars.next();
+                    }
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                    field_pending = false;
+                }
+                '\n' => {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                    field_pending = false;
+                }
+                _ => {
+                    field.push(c);
+                    field_pending = true;
+                }
+            }
+        }
+    }
+    // Flush a trailing record that had no terminating newline. After a newline
+    // both `field` and `record` are empty (taken), so we don't emit a phantom
+    // empty row.
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+
+    let mut iter = records.into_iter();
+    let header = iter
+        .next()
+        .ok_or_else(|| Error::Invalid("empty CSV: no header row".to_string()))?;
+    let columns = header.clone();
+    let mut rows = Vec::with_capacity(iter.len());
+    for rec in iter {
+        let mut m = Map::with_capacity(columns.len());
+        for (i, col) in columns.iter().enumerate() {
+            let v = rec.get(i).cloned().unwrap_or_default();
+            m.insert(col.clone(), Value::String(v));
+        }
+        rows.push(m);
+    }
+    Ok(ReportResult { columns, rows })
 }
 
 fn field_expr(def: &EntityDefinition, name: &str) -> String {
@@ -326,5 +416,78 @@ fn read_user(s: &RecordScope) -> Option<Uuid> {
         None
     } else {
         Some(s.user_id)
+    }
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::*;
+
+    fn row(pairs: &[(&str, &str)]) -> Map<String, Value> {
+        let mut m = Map::new();
+        for (k, v) in pairs {
+            m.insert((*k).to_string(), Value::String((*v).to_string()));
+        }
+        m
+    }
+
+    #[test]
+    fn csv_round_trips_quoting_and_newlines() {
+        let res = ReportResult {
+            columns: vec!["id".into(), "name".into(), "note".into()],
+            rows: vec![
+                row(&[
+                    ("id", "1"),
+                    ("name", "Acme, Inc."),
+                    ("note", "has \"quotes\""),
+                ]),
+                row(&[("id", "2"), ("name", "Line\nBreak"), ("note", "plain")]),
+                row(&[("id", "3"), ("name", ""), ("note", "")]),
+            ],
+        };
+        let csv = to_csv(&res);
+        let back = from_csv(&csv).expect("round-trip");
+        assert_eq!(back.columns, res.columns);
+        assert_eq!(back.rows.len(), 3);
+        assert_eq!(back.rows[0]["name"].as_str(), Some("Acme, Inc."));
+        assert_eq!(back.rows[0]["note"].as_str(), Some("has \"quotes\""));
+        assert_eq!(back.rows[1]["name"].as_str(), Some("Line\nBreak"));
+        assert_eq!(back.rows[2]["name"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn csv_handles_crlf_and_trailing_field() {
+        let csv = "a,b,c\r\n1,2,\r\n4,5,6\r\n";
+        let back = from_csv(csv).expect("parse");
+        assert_eq!(back.columns, vec!["a", "b", "c"]);
+        assert_eq!(back.rows.len(), 2);
+        assert_eq!(back.rows[0]["c"].as_str(), Some(""));
+        assert_eq!(back.rows[1]["c"].as_str(), Some("6"));
+    }
+
+    #[test]
+    fn csv_no_trailing_newline_is_flushed() {
+        let csv = "x,y\n1,2";
+        let back = from_csv(csv).expect("parse");
+        assert_eq!(back.rows.len(), 1);
+        assert_eq!(back.rows[0]["y"].as_str(), Some("2"));
+    }
+
+    #[test]
+    fn csv_empty_input_is_an_error() {
+        assert!(from_csv("").is_err());
+    }
+
+    #[test]
+    fn csv_header_only_yields_zero_rows() {
+        let back = from_csv("x,y\n").expect("parse");
+        assert_eq!(back.columns, vec!["x", "y"]);
+        assert!(back.rows.is_empty());
+    }
+
+    #[test]
+    fn csv_short_row_pads_missing_columns() {
+        let back = from_csv("a,b,c\n1,2\n").expect("parse");
+        assert_eq!(back.rows[0]["c"].as_str(), Some(""));
     }
 }
