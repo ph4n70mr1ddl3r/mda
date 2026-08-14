@@ -529,6 +529,51 @@ pub async fn list(
     })
 }
 
+/// Resolve the IDs of records a writer may touch for a **mass action**
+/// (PLAN §9 deferral — bulk update/delete by filter, distinct from the
+/// §5.13 file import). Unlike [`list`] (read-scope), this injects the **write**
+/// predicate so a mass update/delete can never reach a record the caller may
+/// not write — exactly the same scope a single-record PATCH/DELETE enforces.
+/// The result is capped at `limit` (the API layer bounds it) and ordered by id
+/// for deterministic, resumable processing of large result sets.
+pub async fn mass_target_ids(
+    pool: &PgPool,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    params: &ListParams,
+    scope: &RecordScope,
+    limit: u64,
+) -> Result<Vec<Uuid>> {
+    ensure_active(def)?;
+    let (mut where_sql, mut binds) = build_list_where(def, tenant, &params.filters)?;
+    let rp = write_predicate(scope);
+    if let Some(p) = rp {
+        let n = binds.len() + 1;
+        let (frag, pb) = pred_render(&p, scope, n);
+        where_sql.push_str(&format!(" AND {}", frag));
+        for b in pb {
+            binds.push(ListBind::Uuid(b));
+        }
+    }
+    let table = &def.entity.table_name;
+    let lim = binds.len() + 1;
+    let sql =
+        format!("SELECT t.id FROM biz.{table} t WHERE {where_sql} ORDER BY t.id LIMIT ${lim}");
+    let mut q = sqlx::query_scalar::<_, Uuid>(sql.as_str());
+    for b in &binds {
+        q = match b {
+            ListBind::Uuid(v) => q.bind(*v),
+            ListBind::Text(v) => q.bind(v.clone()),
+        };
+    }
+    q = q.bind(limit as i64);
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let ids = q.fetch_all(&mut *tx).await.map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(ids)
+}
+
 fn build_list_where(
     def: &EntityDefinition,
     tenant: Uuid,

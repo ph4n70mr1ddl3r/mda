@@ -7,7 +7,6 @@ pub mod outbox;
 
 use anyhow::Context;
 use axum::Router;
-use mda_api::AppState;
 use sqlx::postgres::PgPoolOptions;
 
 /// Run the server to completion: connect, migrate, bootstrap, bind, serve.
@@ -89,16 +88,37 @@ pub async fn run() -> anyhow::Result<()> {
         });
     }
 
-    let app: Router = mda_api::router(AppState {
-        pool: app_pool,
-        cache,
-        jwt: mda_security::JwtConfig::from_env(),
-        blobs,
-        secrets,
-        events,
-        login_throttle: mda_security::LoginThrottle::from_env(),
-        gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-    });
+    let app: Router = {
+        // The GraphQL schema cache is shared with the invalidator worker, so bind
+        // it by name and pass it to both the AppState and the LISTEN worker
+        // (ADR-0020 follow-up: a publish rebuilds the schema, and stale version
+        // entries are evicted so they do not accumulate across publishes).
+        let gql: std::sync::Arc<tokio::sync::RwLock<mda_api::graphql::SchemaCache>> =
+            std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        mda_api::graphql::spawn_invalidator(
+            app_pool.clone(),
+            mda_api::AppState {
+                pool: app_pool.clone(),
+                cache: cache.clone(),
+                jwt: mda_security::JwtConfig::from_env(),
+                blobs: blobs.clone(),
+                secrets: secrets.clone(),
+                events: events.clone(),
+                login_throttle: mda_security::LoginThrottle::from_env(),
+                gql: gql.clone(),
+            },
+        );
+        mda_api::router(mda_api::AppState {
+            pool: app_pool,
+            cache,
+            jwt: mda_security::JwtConfig::from_env(),
+            blobs,
+            secrets,
+            events,
+            login_throttle: mda_security::LoginThrottle::from_env(),
+            gql,
+        })
+    };
 
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let listener = tokio::net::TcpListener::bind(&addr)

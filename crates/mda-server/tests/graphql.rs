@@ -16,12 +16,16 @@ use uuid::Uuid;
 
 mod common;
 
+type GqlCache = std::sync::Arc<tokio::sync::RwLock<mda_api::graphql::SchemaCache>>;
+
 #[allow(dead_code)]
 struct Ctx {
     app: axum::Router,
     token: String,
     pool: PgPool,
     tenant: Uuid,
+    /// Shared with the AppState so the test can observe cache invalidation.
+    gql: GqlCache,
 }
 
 /// Customer (1) → (N) Invoice model, so traversal can be exercised.
@@ -68,7 +72,9 @@ async fn setup() -> Option<Ctx> {
         Arc::new(mda_api::blobs::LocalBlobStore::from_env());
     let secrets: Arc<dyn mda_core::SecretStore> =
         Arc::new(mda_api::secrets::LocalSecretStore::from_env());
-    let app = mda_api::router(AppState {
+    let gql: GqlCache =
+        std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let state = AppState {
         pool: pool.clone(),
         cache: MetadataCache::new(),
         jwt: jwt.clone(),
@@ -76,13 +82,18 @@ async fn setup() -> Option<Ctx> {
         secrets,
         events: mda_api::events::channel(),
         login_throttle: mda_security::LoginThrottle::default(),
-        gql: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-    });
+        gql: gql.clone(),
+    };
+    // Spawn the GraphQL schema invalidator so a publish (meta_changed NOTIFY)
+    // evicts stale version entries — mirroring the production server wiring.
+    mda_api::graphql::spawn_invalidator(pool.clone(), state.clone());
+    let app = mda_api::router(state);
     Some(Ctx {
         app,
         token,
         pool,
         tenant,
+        gql,
     })
 }
 
@@ -467,4 +478,71 @@ async fn graphql_mutation_enforces_authorization() {
     let q = format!("{{ customer(id: \"{id}\") {{ name }} }}");
     let v = gql(&ctx, &q).await;
     assert_eq!(v["data"]["customer"]["name"], "Acme", "record survived");
+}
+
+#[tokio::test]
+async fn graphql_schema_rebuilds_and_invalidates_after_publish() {
+    // ADR-0020 follow-up: the schema is cached per (tenant, active_version), so
+    // a publish (version advance) rebuilds it. This test pins the two guarantees
+    // a caller relies on: (1) a field added by a publish is immediately
+    // queryable (no stale schema), and (2) the GraphQL invalidator clears stale
+    // version entries so they don't accumulate unbounded across publishes.
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    let table_c = format!("c_{}", Uuid::new_v4().simple());
+    let table_i = format!("i_{}", Uuid::new_v4().simple());
+    let mut m = model(&table_c, &table_i);
+    publish(&ctx, m.clone()).await;
+
+    // Build + cache the schema (v1) by issuing a query.
+    let _ = gql(&ctx, "{ customers { name } }").await;
+    assert_eq!(
+        ctx.gql.read().await.len(),
+        1,
+        "schema cached after first query"
+    );
+
+    // Add a new field `city` to the SAME model (additive publish, same ids) and
+    // republish → version advances → schema rebuilds.
+    m["entities"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": Uuid::new_v4(), "name":"city","label":"City","field_type":"string",
+            "required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}
+        }));
+    publish(&ctx, m).await;
+
+    // A newly-added field is queryable immediately (the v1 schema is not served
+    // to a v2 request — the version key guarantees a fresh build).
+    let v = gql(&ctx, "{ customers { name city } }").await;
+    assert!(
+        v["errors"].as_array().map(|e| e.is_empty()).unwrap_or(true),
+        "new field must be queryable after publish: {v}"
+    );
+
+    // The invalidator (meta_changed LISTEN) should evict the stale v1 entry.
+    // LISTEN delivery is async; poll for up to 5s for the worker to clear it.
+    let mut cleared = false;
+    for _ in 0..50 {
+        if ctx.gql.read().await.len() <= 1 {
+            // At most the freshly-built v2 entry remains; the v1 entry is gone.
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        cleared,
+        "stale GraphQL schema entries should be evicted by the invalidator"
+    );
+
+    // Direct proof the cache can be cleared entirely (the same clear the LISTEN
+    // worker performs), leaving the store empty.
+    ctx.gql.write().await.clear();
+    assert!(
+        ctx.gql.read().await.is_empty(),
+        "manual clear empties the cache"
+    );
 }

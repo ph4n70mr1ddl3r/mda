@@ -46,6 +46,14 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(restore_record),
         )
         .route(
+            "/api/data/:entity/mass-update",
+            axum::routing::post(mass_update_record),
+        )
+        .route(
+            "/api/data/:entity/mass-delete",
+            axum::routing::post(mass_delete_record),
+        )
+        .route(
             "/api/impex/:entity/import",
             axum::routing::post(import_records),
         )
@@ -327,6 +335,175 @@ async fn transition_record(
     Ok(Json(project(&user, &entity, &def, after)))
 }
 
+// ===== mass actions (PLAN §9 deferral) =====
+//
+// Bulk update / delete *by filter* — distinct from the §5.13 file import
+// (which is row-by-row from a file). Mass actions reuse the single-record
+// write pipeline *per affected record* (RBAC + FLS write-check + rules +
+// calculated fields + OCC + audit + event log), so a mass update is
+// indistinguishable from N hand-typed PATCHes and respects record-level
+// security on every row. A hard cap bounds the blast radius; `dry_run`
+// returns the candidate id set without mutating. (Interacts with cascade
+// ADR-0006 and sharing recompute ADR-0013 by construction, since each row
+// goes through the normal delete/update path.)
+
+/// Maximum number of records one mass action may touch. Bounds the blast
+/// radius of a broad filter and the per-record write-loop cost.
+const MAX_MASS_BATCH: u64 = 5000;
+
+#[derive(serde::Deserialize)]
+struct MassUpdateBody {
+    #[serde(default, deserialize_with = "string_or_seq")]
+    filter: Vec<String>,
+    /// The field patch to apply (same shape as a single-record PATCH body).
+    #[serde(rename = "set")]
+    patch: Value,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct MassDeleteBody {
+    #[serde(default, deserialize_with = "string_or_seq")]
+    filter: Vec<String>,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// Resolve the candidate record ids for a mass action (write-scoped, capped).
+/// Shares the filter grammar + write predicate with single-record writes.
+async fn mass_targets(
+    st: &AppState,
+    user: &Identity,
+    entity: &str,
+    filters: &[String],
+    limit: Option<u64>,
+) -> ApiResult<Vec<Uuid>> {
+    let def = entity_def(st, user.tenant_id, entity).await?;
+    let scope = scope_for(st, user, entity).await?;
+    let params = ListParams {
+        filters: filters_from_strings(filters)?,
+        sort: Vec::new(),
+        page: 1,
+        page_size: 0,
+    };
+    let cap = limit.unwrap_or(MAX_MASS_BATCH).clamp(1, MAX_MASS_BATCH);
+    Ok(mda_data::mass_target_ids(&st.pool, user.tenant_id, &def, &params, &scope, cap).await?)
+}
+
+/// `POST /api/data/:entity/mass-update` — apply a patch to every record matching
+/// the filter that the caller may write. Returns `{ affected, ids, errors[], dry_run }`.
+async fn mass_update_record(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(entity): Path<String>,
+    Json(body): Json<MassUpdateBody>,
+) -> ApiResult<Json<Value>> {
+    authorize(&user, &entity, "update")?;
+    // FLS write-check on the patch UPFRONT: a mass update touching a field the
+    // caller may not write is rejected before any record is resolved/touched —
+    // identical to a single-record PATCH (which checks the same thing first).
+    let patch = into_object(body.patch)?;
+    let def = entity_def(&st, user.tenant_id, &entity).await?;
+    assert_writable(&user, &entity, &def, &patch)?;
+    let ids = mass_targets(&st, &user, &entity, &body.filter, body.limit).await?;
+    if body.dry_run {
+        return Ok(Json(json!({
+            "dry_run": true,
+            "affected": ids.len(),
+            "ids": ids,
+            "errors": Vec::<Value>::new(),
+        })));
+    }
+    let mut affected: u64 = 0;
+    let mut errors: Vec<Value> = Vec::new();
+    let mut done: Vec<Uuid> = Vec::with_capacity(ids.len());
+    for id in ids {
+        // Read the current version (superuser) so OCC still holds per record:
+        // a row changed between target-resolution and the write is skipped with
+        // a conflict rather than clobbered.
+        let def = entity_def(&st, user.tenant_id, &entity).await?;
+        let before = mda_data::read(
+            &st.pool,
+            user.tenant_id,
+            &def,
+            id,
+            &RecordScope::superuser(user.user_id),
+        )
+        .await
+        .ok();
+        let version = before.as_ref().and_then(version_of).unwrap_or(0);
+        match update_record_service(
+            &st,
+            &user,
+            &entity,
+            id,
+            version,
+            Value::Object(patch.clone()),
+        )
+        .await
+        {
+            Ok(_) => {
+                affected += 1;
+                done.push(id);
+            }
+            Err(e) => {
+                errors.push(json!({ "id": id, "error": e.0.to_string(), "code": e.0.code() }))
+            }
+        }
+    }
+    Ok(Json(json!({
+        "dry_run": false,
+        "affected": affected,
+        "ids": done,
+        "errors": errors,
+    })))
+}
+
+/// `POST /api/data/:entity/mass-delete` — delete every record matching the filter
+/// that the caller may delete. Returns `{ affected, ids[], dry_run }`.
+async fn mass_delete_record(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(entity): Path<String>,
+    Json(body): Json<MassDeleteBody>,
+) -> ApiResult<Json<Value>> {
+    authorize(&user, &entity, "delete")?;
+    let ids = mass_targets(&st, &user, &entity, &body.filter, body.limit).await?;
+    if body.dry_run {
+        return Ok(Json(json!({
+            "dry_run": true,
+            "affected": ids.len(),
+            "ids": ids,
+            "errors": Vec::<Value>::new(),
+        })));
+    }
+    let mut affected: u64 = 0;
+    let mut errors: Vec<Value> = Vec::new();
+    let mut done: Vec<Uuid> = Vec::with_capacity(ids.len());
+    for id in ids {
+        match delete_record_service(&st, &user, &entity, id).await {
+            Ok(_) => {
+                affected += 1;
+                done.push(id);
+            }
+            Err(e) => {
+                errors.push(json!({ "id": id, "error": e.0.to_string(), "code": e.0.code() }))
+            }
+        }
+    }
+    Ok(Json(json!({
+        "dry_run": false,
+        "affected": affected,
+        "ids": done,
+        "errors": errors,
+    })))
+}
+
 // ===== security helpers =====
 
 pub(crate) fn authorize(id: &Identity, entity: &str, verb: &str) -> ApiResult<()> {
@@ -532,17 +709,7 @@ fn version_from_headers(headers: &HeaderMap) -> ApiResult<i64> {
 }
 
 fn parse_list_params(q: ListQuery) -> ApiResult<ListParams> {
-    let mut filters = Vec::new();
-    for f in q.filter {
-        let mut parts = f.splitn(3, ':');
-        let field = parts.next().unwrap_or("").trim().to_string();
-        let op = parts.next().unwrap_or("").trim().to_string();
-        let value = parts.next().unwrap_or("").to_string();
-        if field.is_empty() || op.is_empty() {
-            return Err(Error::Invalid(format!("bad filter: {f}")).into());
-        }
-        filters.push(mda_data::Filter { field, op, value });
-    }
+    let filters = filters_from_strings(&q.filter)?;
     let mut sort = Vec::new();
     for s in q.sort {
         let s = s.trim();
@@ -564,6 +731,24 @@ fn parse_list_params(q: ListQuery) -> ApiResult<ListParams> {
         page: q.page.unwrap_or(1),
         page_size: q.page_size.unwrap_or(0),
     })
+}
+
+/// Parse the shared `field:op:value` filter strings into [`mda_data::Filter`]s.
+/// Used by both the list query param and the mass-action request body so the
+/// filter grammar is identical everywhere (PLAN §7).
+fn filters_from_strings(fs: &[String]) -> ApiResult<Vec<mda_data::Filter>> {
+    let mut filters = Vec::new();
+    for f in fs {
+        let mut parts = f.splitn(3, ':');
+        let field = parts.next().unwrap_or("").trim().to_string();
+        let op = parts.next().unwrap_or("").trim().to_string();
+        let value = parts.next().unwrap_or("").to_string();
+        if field.is_empty() || op.is_empty() {
+            return Err(Error::Invalid(format!("bad filter: {f}")).into());
+        }
+        filters.push(mda_data::Filter { field, op, value });
+    }
+    Ok(filters)
 }
 
 /// Accept a single value or a repeated sequence (serde_urlencoded quirk).

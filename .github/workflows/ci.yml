@@ -47,7 +47,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: unit + doc tests (no DB needed)
-        run: cargo test --lib --bins --doc
+        run: cargo test --workspace --lib --bins && cargo test --workspace --doc
 
       # The DB-backed suites each get their own fresh database (tests/common/mod.rs),
       # so they are fully parallel-safe — no --test-threads=1 needed.
@@ -57,6 +57,7 @@ jobs:
           --test throttle --test sessions --test observability
           --test secrets --test templates --test notifications --test webhooks
           --test integration_flows --test graphql --test scheduler --test tenants
+          --test mass_actions --test versioning --test translations
 
   # Build the Leptos WASM runtime UI with Trunk (catches UI regressions; the
   # backend job can't — the UI is a separate standalone workspace). Runs in

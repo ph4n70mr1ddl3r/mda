@@ -38,6 +38,8 @@ pub struct EdgeConfig {
     pub cors_origins: Vec<String>,
     /// Max request body in bytes (applies to every route; covers JSON + uploads).
     pub max_body_bytes: usize,
+    /// API versioning & deprecation policy (§9 deferral).
+    pub versioning: crate::versioning::VersioningConfig,
 }
 
 impl Default for EdgeConfig {
@@ -64,6 +66,7 @@ impl EdgeConfig {
         Self {
             cors_origins,
             max_body_bytes,
+            versioning: crate::versioning::VersioningConfig::from_env(),
         }
     }
 }

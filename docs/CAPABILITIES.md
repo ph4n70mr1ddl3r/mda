@@ -126,8 +126,11 @@ The earlier follow-ups are now **implemented** (each with a DB-backed test):
 
 Remaining, still-deferred (lower priority / tied to other work):
 
-- **GraphQL** schema is cached per version (not hot-reloaded on invalidation);
-  a publish advances the version, which rebuilds it.
+- **GraphQL schema hot-invalidation** is now **closed** (ADR-0024): the schema
+  cache is hooked to the `meta_changed` NOTIFY (same channel as the metadata
+  cache) so stale version entries are evicted on publish, not retained. The
+  `(tenant, version)` key remains the correctness guarantee (a publish rebuilds
+  by advancing the version).
 - **Team hierarchy** (parent-team / sub-team visibility in record security +
   recipient resolution). Flat **team-OWD is now honored** (ADR-0013
   `owd_visible`): an entity whose OWD is `team` admits the owner's teammates

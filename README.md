@@ -14,9 +14,13 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > FLS-under-recipient rendering + SMTP send), signed webhook contract + inbound
 > verification, hub-model integration (connectors / flows / external-ID registry,
 > with `field_level_sor` conflict policy, debatching, per-flow running user, and
-> cron-scheduled pulls), GraphQL (reads **and** mutations), cron-driven
-> **scheduled-job management** (§14, including scheduled integration pulls),
-> and tenant configuration **export + import** (§14 backup/restore).
+> cron-scheduled pulls), GraphQL (reads **and** mutations, hot-invalidated on
+> publish — ADR-0024), cron-driven **scheduled-job management** (§14, including
+> scheduled integration pulls), tenant configuration **export + import** (§14
+> backup/restore), **mass actions** (bulk update/delete by filter — ADR-0021),
+> **API versioning & deprecation** with `Sunset`/`Deprecation` headers
+> (ADR-0022), and **metadata/UI i18n** (`md_translation`, best-match locale —
+> ADR-0023).
 > Frontend: login + entity list (WASM).
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
@@ -77,6 +81,9 @@ curl -X POST localhost:8080/api/data/Customer -H "x-tenant-id: $TENANT" \
      -H "content-type: application/json" -d '{"name":"Acme"}'
 curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TENANT"
 # PATCH /api/data/:entity/:id  (If-Match: <version>)  — OCC update (409 on conflict)
+# Mass actions (ADR-0021) — bulk update/delete by filter, reusing the write pipeline:
+#   POST /api/data/:entity/mass-update   {"filter":["tier:eq:Bronze"],"set":{"tier":"Silver"},"dry_run":false}
+#   POST /api/data/:entity/mass-delete   {"filter":["tier:eq:Bronze"]}
 ```
 
 Platform surfaces (ADR-0018) — record history & as-of, and the tenant
@@ -117,7 +124,8 @@ curl -X POST localhost:8080/api/secrets -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' -d '{"name":"smtp_password","ref":"MDA_SMTP"}'
 
 # Templating (§5.19) — sandboxed DSL; render under the caller's FLS.
-curl -X POST localhost:8080/api/templates/welcome/render?entity=Customer&id=$ID \
+# Localizes via the i18n bundle: {{ i18n.email.subject }} (ADR-0023).
+curl -X POST localhost:8080/api/templates/welcome/render?entity=Customer&id=$ID&locale=fr \
      -H "Authorization: Bearer $JWT" -H 'content-type: application/json' -d '{}'
 
 # Notifications (§5.18) — types, per-user preferences, multi-channel fan-out +
@@ -152,6 +160,16 @@ curl -X POST localhost:8080/api/schedules -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
      -d '{"name":"nightly","kind":"report","target_id":"'$REP_ID'","cron":"0 0 * * * *"}'
 curl localhost:8080/api/schedules/$SCHED_ID/runs -H "Authorization: Bearer $JWT"
+
+# i18n (ADR-0023) — metadata/UI string translations, best-match locale
+# (exact → language prefix → default ''). Ships in the tenant config export.
+curl -X POST localhost:8080/api/translations -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' \
+     -d '{"locale":"fr","namespace":"ui","key":"greeting","value":"Bonjour"}'
+curl localhost:8080/api/i18n/fr -H "Authorization: Bearer $JWT"   # resolved bundle
+
+# API versioning (ADR-0022) — pin a major; deprecated majors advertise Sunset.
+curl localhost:8080/health -H "X-API-Version: 1"   # → MDA-API-Version: 1
 
 # Tenant config export/import (§14 backup/restore) — a portable JSON snapshot of
 # the tenant's model + reports + schedules + security graph + integrations.
@@ -220,7 +238,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
   - §14 — tracked, not yet designed (platform gaps)
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
-- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (18 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities).
+- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (24 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities, scheduled jobs, platform follow-ups, **mass actions, API versioning, i18n, GraphQL hot-invalidation**).
 - [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE10.md`](./docs/PHASE10.md) — phase status & handoffs.
 - [`docs/CAPABILITIES.md`](./docs/CAPABILITIES.md) — the §5.18–5.22 platform-capability cluster (secrets, templating, notifications, webhook contract, hub-model integration) + GraphQL (ADR-0010) status & handoff.
 

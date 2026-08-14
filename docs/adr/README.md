@@ -31,6 +31,10 @@ decision and links back.
 | [0018](0018-surfaced-capabilities-history-observability-error-taxonomy.md) | Surfaced platform capabilities: record history/as-of, observability console, error taxonomy | Accepted |
 | [0019](0019-scheduled-job-management.md) | Scheduled-job management: cron-driven scheduler | Accepted |
 | [0020](0020-platform-followups-graphql-mutations-recipient-resolution-integration-completeness.md) | Platform follow-ups: GraphQL mutations, recipient resolution, integration completeness | Accepted |
+| [0021](0021-mass-actions-bulk-update-delete-by-filter.md) | Mass actions: bulk update/delete by filter | Accepted |
+| [0022](0022-api-versioning-and-deprecation.md) | API versioning & deprecation | Accepted |
+| [0023](0023-metadata-ui-i18n-md_translation.md) | Metadata/UI internationalization (`md_translation`) | Accepted |
+| [0024](0024-graphql-schema-hot-invalidation.md) | GraphQL schema hot-invalidation | Accepted |
 
 ## Status legend
 `Proposed` → `Accepted` → `Deprecated` / `Superseded by ADR-NNNN`.

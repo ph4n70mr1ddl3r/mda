@@ -207,6 +207,30 @@ async fn render_template(
     };
 
     let params = body.and_then(|Json(b)| b.context).unwrap_or(json!({}));
+    // Resolve the localized string bundle (§9/Phase 11) for the render locale
+    // and inject it under `i18n` so a template localizes with `{{ i18n.k }}`.
+    // Pure strings only — AuthZ-by-construction is preserved (a translation can
+    // never carry a record field value).
+    let bundle = crate::i18n::resolve_bundle(
+        &st.pool,
+        user.tenant_id,
+        q.locale.as_deref().unwrap_or(""),
+        None,
+    )
+    .await?;
+    // Build a NESTED `i18n[namespace][key]` object so a template localizes with
+    // `{{ i18n.email.subject }}` (dotted path resolution). Pure strings only —
+    // AuthZ-by-construction is preserved (a translation can never carry a
+    // record field value).
+    let mut i18n: serde_json::Map<String, Value> = serde_json::Map::new();
+    for ((ns, key), value) in bundle {
+        let ns_obj = i18n
+            .entry(ns)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(o) = ns_obj.as_object_mut() {
+            o.insert(key, Value::String(value));
+        }
+    }
     let ctx = match (q.entity.as_deref(), q.id) {
         (Some(entity), Some(id)) => {
             // Build the context from the live record, AuthZ-projected.
@@ -214,9 +238,20 @@ async fn render_template(
             let scope = scope_for(&st, &user, entity).await?;
             let rec = mda_data::read(&st.pool, user.tenant_id, &def, id, &scope).await?;
             let projected = project(&user, entity, &def, rec);
-            json!({ "record": projected, "actor": { "id": user.user_id }, "params": params })
+            json!({ "record": projected, "actor": { "id": user.user_id }, "params": params, "i18n": i18n })
         }
-        _ => params,
+        _ => {
+            let mut ctx = match params {
+                Value::Object(m) => m,
+                other => {
+                    let mut m = serde_json::Map::new();
+                    m.insert("context".into(), other);
+                    m
+                }
+            };
+            ctx.insert("i18n".into(), Value::Object(i18n));
+            Value::Object(ctx)
+        }
     };
 
     let reg = mda_expression::Registry::new();

@@ -250,6 +250,8 @@ async fn tenant_import_round_trips_into_a_fresh_tenant() {
         .bind(a.tenant).execute(&mut *tx).await.unwrap();
     sqlx::query("INSERT INTO meta.md_notification_type (tenant_id, key, label, default_channels) VALUES ($1,'x.y','X Y','{in_app}')")
         .bind(a.tenant).execute(&mut *tx).await.unwrap();
+    sqlx::query("INSERT INTO meta.md_translation (tenant_id, locale, namespace, msg_key, value) VALUES ($1,'fr','ui','greeting','Bonjour')")
+        .bind(a.tenant).execute(&mut *tx).await.unwrap();
     tx.commit().await.unwrap();
     // a report schedule (target_id → report) to exercise FK remapping.
     call(
@@ -345,6 +347,13 @@ async fn tenant_import_round_trips_into_a_fresh_tenant() {
     .await
     .unwrap();
     assert_eq!(owd_n, 1, "OWD restored");
+    let tr_n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM meta.md_translation WHERE locale='fr' AND namespace='ui' AND msg_key='greeting' AND value='Bonjour'",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(tr_n, 1, "translation restored by natural key");
     let sched_n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM sys_schedule WHERE name='nightly' AND kind='report'",
     )

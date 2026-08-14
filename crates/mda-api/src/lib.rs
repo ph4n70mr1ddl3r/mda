@@ -21,6 +21,7 @@ pub mod events;
 pub mod extract;
 pub mod graphql;
 pub mod history;
+pub mod i18n;
 pub mod integrations;
 pub mod mail;
 pub mod notifications;
@@ -31,6 +32,7 @@ pub mod secrets;
 pub mod studio;
 pub mod templates;
 pub mod tenants;
+pub mod versioning;
 pub mod webhooks;
 
 use mda_meta::MetadataCache;
@@ -81,6 +83,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(secrets::routes())
         .merge(events::routes())
         .merge(graphql::routes())
+        .merge(i18n::routes())
         .merge(history::routes())
         .merge(integrations::routes())
         .merge(observability::routes())
@@ -90,6 +93,14 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
     // Layer order (last = outermost): body-limit → security headers → access
     // log/metrics → CORS. CORS is outermost so preflight is answered before
     // anything else; the access log sees the final status.
+    //
+    // API versioning is applied innermost so its `MDA-API-Version` discovery
+    // header + deprecation signalling (and the 400 for an unsupported major)
+    // reach every route, including future versioned surfaces (§7).
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        cfg.versioning.clone(),
+        crate::versioning::middleware,
+    ));
     let app = app.layer(axum::extract::DefaultBodyLimit::max(cfg.max_body_bytes));
     let app = edge::apply_security_headers(app);
     app.layer(axum::middleware::from_fn(edge::access_log))

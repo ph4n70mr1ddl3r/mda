@@ -42,6 +42,10 @@ use crate::AppState;
 const MAX_DEPTH: usize = 8;
 const MAX_COMPLEXITY: usize = 1000;
 
+/// The shared, per-`(tenant, active_version)` schema cache. Stored in
+/// [`AppState::gql`] and cleared on `meta_changed` (see [`spawn_invalidator`]).
+pub type SchemaCache = HashMap<(uuid::Uuid, i64), async_graphql::dynamic::Schema>;
+
 pub fn routes() -> Router<AppState> {
     Router::new().route("/api/graphql", post(execute))
 }
@@ -90,6 +94,67 @@ async fn schema_for(st: &AppState, tenant: Uuid) -> Result<Schema, Error> {
         .await
         .insert((tenant, version), schema.clone());
     Ok(schema)
+}
+
+/// Drop every cached GraphQL schema (every tenant / every version). Called by
+/// the `meta_changed` LISTEN worker + the version-stamp poll fallback, which
+/// already invalidate the entity-definition cache (ADR-0020 follow-up: the
+/// schema is keyed by `(tenant, version)` so a publish already rebuilds it —
+/// this clears the *stale* version entries so they do not accumulate across
+/// many publishes, and guarantees a prompt rebuild even if a version stamp is
+/// ever reused).
+///
+/// Safe to call from any task; the guard is a `RwLock`. Exported so the server
+/// wiring can hook the same invalidation that drives the metadata cache.
+pub fn invalidate_all(state: &AppState) {
+    let gql = state.gql.clone();
+    tokio::spawn(async move {
+        gql.write().await.clear();
+        tracing::debug!("meta_changed → graphql schema cache cleared");
+    });
+}
+
+/// Spawn the GraphQL schema invalidator: `LISTEN meta_changed` → clear the
+/// schema cache. Shares the same Postgres notification channel as the
+/// entity-definition cache invalidator (§5.3). Self-healing is provided by the
+/// `(tenant, version)` cache key: a publish advances the version, so a stale
+/// entry is simply never read again even if a NOTIFY is missed.
+pub fn spawn_invalidator(pool: sqlx::PgPool, state: AppState) {
+    use std::time::Duration;
+    tokio::spawn(async move {
+        let mut listener = loop {
+            match sqlx::postgres::PgListener::connect_with(&pool).await {
+                Ok(l) => break l,
+                Err(e) => {
+                    tracing::warn!(
+                        ?e,
+                        "gql invalidator: connect failed; key parity covers this"
+                    );
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        };
+        loop {
+            if let Err(e) = listener.listen("meta_changed").await {
+                tracing::warn!(?e, "gql invalidator: listen failed; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+            loop {
+                match listener.recv().await {
+                    Ok(_) => {
+                        let gql = state.gql.clone();
+                        gql.write().await.clear();
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "gql invalidator: recv error; reconnecting");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 fn gql_type(field_type: &str) -> TypeRef {

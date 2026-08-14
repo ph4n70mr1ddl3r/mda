@@ -16,5 +16,6 @@ pub mod crud;
 pub mod ddl;
 
 pub use crud::{
-    create, delete, list, read, restore, update, Filter, ListParams, ListResult, RecordScope, Sort,
+    create, delete, list, mass_target_ids, read, restore, update, Filter, ListParams, ListResult,
+    RecordScope, Sort,
 };

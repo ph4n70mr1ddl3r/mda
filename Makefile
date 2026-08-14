@@ -42,12 +42,16 @@ clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
 
 test-unit:
-	cargo test --lib --bins --doc
+	cargo test --workspace --lib --bins && cargo test --workspace --doc
 
 # DB-backed suites — each test gets its own fresh database (tests/common/mod.rs),
-# so they run fully in parallel.
+# so they run fully in parallel. Every test binary under mda-server/tests runs.
 test-db:
-	DATABASE_URL="$(DB_URL)" cargo test --test data --test studio --test integration --test events --test throttle --test sessions
+	DATABASE_URL="$(DB_URL)" cargo test --test data --test studio --test integration \
+	   --test integration_flows --test events --test throttle --test sessions \
+	   --test notifications --test webhooks --test graphql --test scheduler \
+	   --test observability --test secrets --test templates --test tenants \
+	   --test translations --test mass_actions --test versioning
 
 test: test-unit test-db
 

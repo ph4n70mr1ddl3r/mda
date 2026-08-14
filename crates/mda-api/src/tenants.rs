@@ -73,6 +73,7 @@ async fn export_tenant(
     )
     .await;
     let schedules = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM sys_schedule t").await;
+    let translations = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM meta.md_translation t").await;
 
     // Security graph (definitions only — never users, sessions, or shares).
     let roles = table_json(&mut tx, "SELECT to_jsonb(t.*) FROM sec.sec_role t").await;
@@ -102,6 +103,7 @@ async fn export_tenant(
         "templates": templates,
         "notification_types": notification_types,
         "schedules": schedules,
+        "translations": translations,
         "security": {
             "roles": roles,
             "permissions": permissions,
@@ -260,6 +262,8 @@ async fn import_tenant(
     let n_reports =
         restore_reports(&mut tx, tenant, arr(&bundle, "reports"), &mut report_map).await?;
     let n_rules = restore_rules(&mut tx, tenant, arr(&bundle, "rules")).await?;
+    let n_translations =
+        restore_translations(&mut tx, tenant, arr(&bundle, "translations")).await?;
 
     let n_connectors = restore_connectors(
         &mut tx,
@@ -304,6 +308,7 @@ async fn import_tenant(
             "reports": n_reports,
             "rules": n_rules,
             "schedules": n_schedules,
+            "translations": n_translations,
             "connectors": n_connectors,
             "value_maps": n_value_maps,
             "flows": n_flows,
@@ -729,6 +734,39 @@ async fn restore_rules(
         .bind(action_value)
         .bind(active)
         .bind(priority)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Merge translations by natural key `(locale, namespace, msg_key)` — a
+/// same-key bundle row updates in place rather than colliding on id. Idempotent
+/// and safe into a tenant already carrying its own translations.
+async fn restore_translations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    rows: &[Value],
+) -> Result<usize> {
+    let mut n = 0;
+    for r in rows {
+        let locale = j_opt_str(r, "locale").unwrap_or_default();
+        let namespace = j_opt_str(r, "namespace").unwrap_or_else(|| "ui".to_string());
+        let msg_key = j_str(r, "msg_key")?.to_string();
+        let value = j_str(r, "value")?.to_string();
+        sqlx::query(
+            "INSERT INTO meta.md_translation (tenant_id, locale, namespace, msg_key, value)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (tenant_id, locale, namespace, msg_key)
+             DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        )
+        .bind(tenant)
+        .bind(locale)
+        .bind(namespace)
+        .bind(msg_key)
+        .bind(value)
         .execute(&mut **tx)
         .await
         .map_err(Error::internal)?;
