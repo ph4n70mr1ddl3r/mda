@@ -84,6 +84,15 @@ WebCrypto for new draft artifacts.
 - `cargo clippy --all-targets --all-features -- -D warnings` clean;
   `trunk build --release` clean (CI's `ui` job builds the same bundle).
 - Full DB-backed suite (`make test-db`) green.
+- **Headless-browser walkthrough** (Chrome for Testing over CDP, driving the
+  built WASM bundle against a live server): login → Studio gate → draft →
+  entity + fields + validate + **publish from the browser** → the published
+  entity appearing in the runtime navigation → form designer save → report
+  author + run → workflow author → security console → model export. This run
+  caught one real bug — a Leptos reactivity loop in the form/view designers
+  (the editor wrapper closure tracked the row signal that the row effects
+  write → teardown/recreate cycle until `OwnerDisposed` panics) — fixed in the
+  same pass by narrowing the wrapper to track only the entity signal.
 
 ## Phase-8 decisions / deferrals
 
