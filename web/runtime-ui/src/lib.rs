@@ -9,6 +9,7 @@
 //! never has to (and never can) widen it.
 
 mod api;
+mod studio;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -47,6 +48,8 @@ pub struct AppState {
     /// Bumped after a create/update/delete so list views refetch on return
     /// (doesn't rely on SPA component remount to pick up changes).
     pub refresh: RwSignal<u64>,
+    /// Set from `/api/auth/me` — gates the Studio (admin-only surfaces).
+    pub is_admin: RwSignal<bool>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -59,6 +62,7 @@ pub enum Page {
         entity: String,
         id: Option<String>,
     },
+    Studio,
 }
 
 // ===== root =====
@@ -71,6 +75,7 @@ pub fn App() -> impl IntoView {
     let nav = create_rw_signal(Vec::new());
     let dashboards = create_rw_signal(Vec::new());
     let refresh = create_rw_signal(0u64);
+    let is_admin = create_rw_signal(false);
     let state = AppState {
         token,
         page,
@@ -78,6 +83,7 @@ pub fn App() -> impl IntoView {
         nav,
         dashboards,
         refresh,
+        is_admin,
     };
     provide_context(state);
 
@@ -85,6 +91,7 @@ pub fn App() -> impl IntoView {
     let model_for_effect = model;
     let nav_for_effect = nav;
     let dash_for_effect = dashboards;
+    let admin_for_effect = is_admin;
     create_effect(move |_| {
         if let Some(t) = token_for_effect.get() {
             spawn_local(async move {
@@ -96,6 +103,9 @@ pub fn App() -> impl IntoView {
                 }
                 if let Ok(d) = api::list_dashboards(&t).await {
                     dash_for_effect.set(d);
+                }
+                if let Ok(admin) = api::is_admin(&t).await {
+                    admin_for_effect.set(admin);
                 }
             });
         }
@@ -110,6 +120,15 @@ pub fn App() -> impl IntoView {
                     on:click=move |_: leptos::ev::MouseEvent| state.page.set(Page::Home)>
                     "MDA"
                 </strong>
+                {move || if state.is_admin.get() {
+                    let s = state;
+                    view! {
+                        <button style="cursor:pointer; margin-left:14px; font-size:0.85rem;"
+                            on:click=move |_: leptos::ev::MouseEvent| s.page.set(Page::Studio)>
+                            "Studio"
+                        </button>
+                    }.into_view()
+                } else { ().into_view() }}
                 {move || if state.token.get().is_some() {
                     let s = state;
                     view! {
@@ -121,6 +140,7 @@ pub fn App() -> impl IntoView {
                                 s.nav.set(Vec::new());
                                 s.dashboards.set(Vec::new());
                                 s.model.set(None);
+                                s.is_admin.set(false);
                             }>
                             "Logout"
                         </button>
@@ -140,6 +160,7 @@ pub fn App() -> impl IntoView {
                             Page::Form { entity, id } => {
                                 view! { <RecordForm entity id/> }.into_view()
                             }
+                            Page::Studio => view! { <studio::Studio/> }.into_view(),
                         }
                     }
                 }}
@@ -194,6 +215,9 @@ fn Login() -> impl IntoView {
                                 }
                                 if let Ok(d) = api::list_dashboards(&token).await {
                                     s.dashboards.set(d);
+                                }
+                                if let Ok(admin) = api::is_admin(&token).await {
+                                    s.is_admin.set(admin);
                                 }
                                 s.page.set(Page::Home);
                             }
@@ -327,19 +351,22 @@ fn DashTileView(tile: api::DashTile) -> impl IntoView {
                 <strong>{title}</strong>
                 <p style="color:#a00; margin:4px 0 0;">{err}</p>
             </div>
-        }.into_view(),
+        }
+        .into_view(),
         (None, Some(res)) => view! {
             <div style="border:1px solid #ddd; border-radius:4px; padding:8px; margin:8px 0;">
                 <strong>{title}</strong>
                 <ReportTable res/>
             </div>
-        }.into_view(),
+        }
+        .into_view(),
         (None, None) => view! {
             <div style="border:1px solid #ddd; border-radius:4px; padding:8px; margin:8px 0;">
                 <strong>{title}</strong>
                 <p style="color:#888; margin:4px 0 0;">"no result"</p>
             </div>
-        }.into_view(),
+        }
+        .into_view(),
     }
 }
 
@@ -565,7 +592,8 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     // the resolved form definition (None until fetched; None+loaded => fall back to the model)
     let form = create_rw_signal::<Option<Vec<FormSection>>>(None);
     // reference-field option lists (entity -> (label list, id list))
-    let ref_options: RwSignal<HashMap<String, Vec<(String, String)>>> = create_rw_signal(HashMap::new());
+    let ref_options: RwSignal<HashMap<String, Vec<(String, String)>>> =
+        create_rw_signal(HashMap::new());
 
     // load the form definition + reference options + the record (on edit)
     let entity_load = entity.clone();
@@ -609,8 +637,11 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                                             o.iter().find(|(k, _)| {
                                                 !matches!(
                                                     k.as_str(),
-                                                    "id" | "version" | "owner_id" | "state"
-                                                        | "created_at" | "updated_at"
+                                                    "id" | "version"
+                                                        | "owner_id"
+                                                        | "state"
+                                                        | "created_at"
+                                                        | "updated_at"
                                                 )
                                             })
                                         })
@@ -893,15 +924,20 @@ fn FieldInput(
                         let val = event_target_checked(&ev).to_string();
                         values.update(|m| { m.insert(k.clone(), val); });
                     }/>
-            }.into_view()
+            }
+            .into_view()
         }
         "select" if !opts.is_empty() => {
             let k = fname.clone();
             let cur = init();
-            let opts_view = opts.clone().into_iter().map(move |o| {
-                let selected = o == cur;
-                view! { <option value=o.clone() selected=selected>{o}</option> }
-            }).collect_view();
+            let opts_view = opts
+                .clone()
+                .into_iter()
+                .map(move |o| {
+                    let selected = o == cur;
+                    view! { <option value=o.clone() selected=selected>{o}</option> }
+                })
+                .collect_view();
             view! {
                 <select style="width:100%; padding:4px;"
                     on:input=move |ev| {
@@ -909,20 +945,15 @@ fn FieldInput(
                     }>
                     {opts_view}
                 </select>
-            }.into_view()
+            }
+            .into_view()
         }
         // reference picker: options resolved from the target entity by the server
         "reference" => {
             let k = fname.clone();
             let cur = init();
             let target = field.target_entity.clone().unwrap_or_default();
-            let options = move || {
-                ref_options
-                    .get()
-                    .get(&target)
-                    .cloned()
-                    .unwrap_or_default()
-            };
+            let options = move || ref_options.get().get(&target).cloned().unwrap_or_default();
             view! {
                 <select style="width:100%; padding:4px;"
                     on:input=move |ev| {
@@ -936,7 +967,8 @@ fn FieldInput(
                              view! { <option value=oid.clone() selected=selected>{label}</option> }
                          }/>
                 </select>
-            }.into_view()
+            }
+            .into_view()
         }
         "textarea" => {
             let k = fname.clone();
@@ -946,7 +978,8 @@ fn FieldInput(
                     on:input=move |ev| {
                         values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
                     }></textarea>
-            }.into_view()
+            }
+            .into_view()
         }
         "number" => {
             let k = fname.clone();
@@ -957,19 +990,25 @@ fn FieldInput(
                         values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
                     }
                     style="width:100%; padding:4px;"/>
-            }.into_view()
+            }
+            .into_view()
         }
         "date" | "datetime" => {
             let k = fname.clone();
             let v = init();
-            let t = if field.widget == "date" { "date" } else { "datetime-local" };
+            let t = if field.widget == "date" {
+                "date"
+            } else {
+                "datetime-local"
+            };
             view! {
                 <input type=t prop:value=v
                     on:input=move |ev| {
                         values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
                     }
                     style="width:100%; padding:4px;"/>
-            }.into_view()
+            }
+            .into_view()
         }
         _ => {
             let k = fname.clone();
@@ -980,7 +1019,8 @@ fn FieldInput(
                         values.update(|m| { m.insert(k.clone(), event_target_value(&ev)); });
                     }
                     style="width:100%; padding:4px;"/>
-            }.into_view()
+            }
+            .into_view()
         }
     };
     view! {
@@ -1000,7 +1040,9 @@ fn model_fields(
     entity: &str,
     values: RwSignal<HashMap<String, String>>,
 ) -> impl IntoView {
-    let model = s.model.get().unwrap_or(api::ModelInfo { entities: Vec::new() });
+    let model = s.model.get().unwrap_or(api::ModelInfo {
+        entities: Vec::new(),
+    });
     let entity_fields: Vec<EntityInfo> = model
         .entities
         .into_iter()
@@ -1019,7 +1061,11 @@ fn model_fields(
                 field_type: f.field_type.clone(),
                 required: f.required,
                 widget: infer_widget(&f.field_type).to_string(),
-                options: f.config.get("options").cloned().unwrap_or(serde_json::Value::Null),
+                options: f
+                    .config
+                    .get("options")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 target_entity: None,
             };
             let ref_options = create_rw_signal(HashMap::<String, Vec<(String, String)>>::new());

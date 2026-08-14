@@ -958,7 +958,20 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Dashboards consume report datasets
 - **Deliverable:** Build a "Sales by Month" report in Studio, run it, export to PDF, schedule daily email.
 
-### Phase 8 — Studio UI (Weeks 29–43)
+### Phase 8 — Studio UI (Weeks 29–43) — ✅ complete
+> Shipped as an admin-gated section of the Leptos Runtime UI (ADR-0009 stack)
+> riding the authoring APIs — the Studio holds no security/validation logic of
+> its own. **Model designer** over the draft lifecycle (entities, fields with
+> the full type registry, references with on-delete; active artifacts locked,
+> retire-only; Save/Validate/Publish with the server diff report), **page
+> designers** (forms / views / dashboards / navigation), **report designer**
+> (select fields with aggregates + reference traversals, filters, group-by),
+> **rule editor + workflow designer** (new authoring APIs `/api/rules` +
+> `/api/workflows` with whole-machine validation), **security admin console**
+> (teams/roles/permissions/role-hierarchy, OWD, users, sharing rules), and
+> **import/export/promote** (bundle export, import-as-draft, snapshot
+> history). Drag-drop layout painters are a v2 aesthetic layer over the same
+> contracts. See `docs/PHASE8.md`.
 - Entity/field designer, form designer (drag-drop), view designer, report designer, workflow designer, rule editor, security admin
 - Metadata import/export/promote UI
 - This is large; consider parallelizing across designers

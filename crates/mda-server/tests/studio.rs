@@ -337,3 +337,106 @@ async fn etag_conflict_returns_409() {
     .await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn drafts_list_and_discard() {
+    let (app, token) = match setup().await {
+        Some(x) => x,
+        None => return,
+    };
+
+    // two drafts (one to discard, one to publish)
+    let (_, d1) = call(
+        &app,
+        "POST",
+        "/api/studio/drafts",
+        &token,
+        Some(json!({"name":"scratch"}).to_string()),
+        None,
+    )
+    .await;
+    let (_, d2) = call(
+        &app,
+        "POST",
+        "/api/studio/drafts",
+        &token,
+        Some(json!({"name":"real"}).to_string()),
+        None,
+    )
+    .await;
+    let id1 = d1["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    let id2 = d2["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // list contains both, newest first, and carries no model blob
+    let (st, list) = call(&app, "GET", "/api/studio/drafts", &token, None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&id1.to_string().as_str()));
+    assert!(ids.contains(&id2.to_string().as_str()));
+    assert!(list[0].get("model").is_none());
+
+    // publish d2, then discard d1
+    let etag2 = d2["version_etag"].as_str().unwrap().to_string();
+    let (st, _) = call(
+        &app,
+        "PUT",
+        &format!("/api/studio/drafts/{id2}/model"),
+        &token,
+        Some(customer_model().to_string()),
+        Some(etag2),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &app,
+        "POST",
+        &format!("/api/studio/drafts/{id2}/publish"),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/studio/drafts/{id1}"),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (_, list) = call(&app, "GET", "/api/studio/drafts", &token, None, None).await;
+    assert_eq!(list.as_array().unwrap().len(), 1);
+
+    // a published draft is history — discarding it is a 409
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/studio/drafts/{id2}"),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // discarding an unknown id is a 404
+    let (st, _) = call(
+        &app,
+        "DELETE",
+        &format!("/api/studio/drafts/{}", Uuid::new_v4()),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

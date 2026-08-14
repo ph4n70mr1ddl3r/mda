@@ -4,7 +4,13 @@ A declarative, data-driven, model-driven **no-code enterprise system** built in 
 Everything — entities, forms, screens, reports, workflows, rules, integrations — is
 stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 
-> **Status:** Phases 0–7, 9, 10 implemented + the Phase 6 Runtime UI (Leptos)
+> **Status:** Phases 0–10 implemented — including the **Phase 8 Studio UI**:
+> the Leptos Runtime UI grows an admin-gated Studio (model designer over the
+> draft → validate → publish lifecycle, page designers, report designer,
+> rule editor + workflow designer, security admin console, import/export),
+> backed by new **rules + workflows authoring APIs** (`/api/rules`,
+> `/api/workflows`) and completed draft management (`GET /api/studio/drafts`,
+> discard). Phase 6 Runtime UI (Leptos)
 > **rendering from metadata** (navigation / view / form / dashboard definitions),
 > plus the full §5.18–5.22 platform-capability cluster and a first-class GraphQL
 > runtime API (ADR-0010).
@@ -33,7 +39,10 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > with scheduled delivery (`report.completed` notification).
 > Frontend (WASM): login, navigation shell, view-driven grids,
 > form-definition-driven editors (incl. reference pickers), dashboards, and the
-> real-time conflict banner.
+> real-time conflict banner — plus the **Studio** (Phase 8): model designer
+> (entities/fields/references + draft → validate → publish), page designers
+> (forms/views/dashboards/navigation), report designer, rule editor +
+> workflow designer, security admin console, and model import/export.
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
 > (`/api/data/:entity/:id/{history,as-of}`), a tenant observability console

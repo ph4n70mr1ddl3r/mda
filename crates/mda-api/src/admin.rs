@@ -1080,7 +1080,6 @@ async fn create_share_rule(
     require_admin(&user)?;
     validate_share_rule_body(&st, &user, &body.entity, body.principal_id, &body.access).await?;
     parse_condition(&body.condition)?;
-    parse_condition(&body.condition)?;
     let def = crate::data::entity_def(&st, user.tenant_id, &body.entity).await?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, user.tenant_id).await?;

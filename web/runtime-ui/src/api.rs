@@ -259,7 +259,10 @@ pub async fn get_view(token: &str, entity: &str) -> Result<Option<ViewInfo>, Str
     if !resp.ok() {
         return Ok(None);
     }
-    resp.json::<ViewInfo>().await.map(Some).map_err(|e| e.to_string())
+    resp.json::<ViewInfo>()
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize, Clone, serde::Serialize)]
@@ -299,7 +302,10 @@ pub async fn get_form(token: &str, entity: &str) -> Result<Option<FormInfo>, Str
     if !resp.ok() {
         return Ok(None);
     }
-    resp.json::<FormInfo>().await.map(Some).map_err(|e| e.to_string())
+    resp.json::<FormInfo>()
+        .await
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize, Clone, serde::Serialize)]
@@ -354,4 +360,128 @@ pub async fn get_dashboard(token: &str, id: &str) -> Result<DashboardInfo, Strin
     resp.json::<DashboardInfo>()
         .await
         .map_err(|e| e.to_string())
+}
+
+// ===== Studio (Phase 8): generic JSON calls + typed helpers =====
+//
+// The Studio talks to the admin-gated surfaces (draft lifecycle, UI-definition
+// authoring, report authoring, rule/workflow authoring, the admin security
+// API, import/export). Most payloads are returned as raw JSON — the Studio
+// renders them structurally, and keeping the client thin avoids mirroring a
+// dozen DTOs in WASM.
+
+async fn send_json(
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<String>,
+    if_match: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    use gloo_net::http::Method;
+    let method = match method {
+        "GET" => Method::GET,
+        "POST" => Method::POST,
+        "PUT" => Method::PUT,
+        "PATCH" => Method::PATCH,
+        _ => Method::DELETE,
+    };
+    let url = format!("{API_BASE}{path}");
+    let b = gloo_net::http::RequestBuilder::new(&url)
+        .method(method)
+        .header("Authorization", &format!("Bearer {token}"));
+    let b = if let Some(etag) = if_match {
+        b.header("if-match", etag)
+    } else {
+        b
+    };
+    let resp = match body {
+        Some(body) => {
+            b.header("content-type", "application/json")
+                .body(body)
+                .unwrap()
+                .send()
+                .await
+        }
+        None => b.send().await,
+    }
+    .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !resp_ok(status) {
+        let msg = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| {
+                v["message"]
+                    .as_str()
+                    .or_else(|| v["error"].as_str())
+                    .map(String::from)
+            })
+            .unwrap_or(text);
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+    if text.is_empty() {
+        Ok(serde_json::Value::Null)
+    } else {
+        serde_json::from_str(&text).map_err(|e| e.to_string())
+    }
+}
+
+fn resp_ok(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
+pub async fn sget(token: &str, path: &str) -> Result<serde_json::Value, String> {
+    send_json("GET", path, token, None, None).await
+}
+
+pub async fn spost(
+    token: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    send_json("POST", path, token, Some(body.to_string()), None).await
+}
+
+pub async fn spatch(
+    token: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    send_json("PATCH", path, token, Some(body.to_string()), None).await
+}
+
+pub async fn sput(
+    token: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    send_json("PUT", path, token, Some(body.to_string()), None).await
+}
+
+pub async fn sdelete(token: &str, path: &str) -> Result<serde_json::Value, String> {
+    send_json("DELETE", path, token, None, None).await
+}
+
+/// `PUT /api/studio/drafts/:id/model` with the OCC etag — the one Studio call
+/// that needs a header beyond auth, so it gets its own wrapper.
+pub async fn save_draft_model(
+    token: &str,
+    draft_id: &str,
+    etag: &str,
+    model: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    send_json(
+        "PUT",
+        &format!("/api/studio/drafts/{draft_id}/model"),
+        token,
+        Some(model.to_string()),
+        Some(etag),
+    )
+    .await
+}
+
+/// `GET /api/auth/me` → is the caller a superuser (Studio gate)?
+pub async fn is_admin(token: &str) -> Result<bool, String> {
+    let me = sget(token, "/api/auth/me").await?;
+    Ok(me["is_superuser"].as_bool().unwrap_or(false))
 }

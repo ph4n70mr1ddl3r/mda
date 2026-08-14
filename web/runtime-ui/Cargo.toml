@@ -19,5 +19,6 @@ web-sys = { version = "0.3", features = [
     "Window", "Storage",
     "EventSource", "MessageEvent",
     "HtmlInputElement", "HtmlTextAreaElement", "HtmlSelectElement",
+    "Crypto",
 ] }
 console_error_panic_hook = "0.1"

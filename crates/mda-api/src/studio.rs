@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -32,8 +32,11 @@ use crate::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/studio/drafts", post(create_draft))
-        .route("/api/studio/drafts/:id", get(get_draft))
+        .route("/api/studio/drafts", get(list_drafts).post(create_draft))
+        .route(
+            "/api/studio/drafts/:id",
+            get(get_draft).delete(discard_draft),
+        )
         .route(
             "/api/studio/drafts/:id/model",
             axum::routing::put(put_model),
@@ -96,7 +99,41 @@ struct SnapshotRow {
     created_at: DateTime<Utc>,
 }
 
+/// A draft row without the model blob — what the Studio's draft picker lists.
+#[derive(sqlx::FromRow, Serialize)]
+struct DraftSummary {
+    id: Uuid,
+    name: String,
+    status: String,
+    version_etag: Uuid,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
 // ===== handlers =====
+
+/// `GET /api/studio/drafts` — the tenant's drafts (newest first, model elided)
+/// so the Studio UI can reopen or discard prior work instead of only branching.
+async fn list_drafts(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+) -> ApiResult<Json<Vec<DraftSummary>>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    let rows: Vec<DraftSummary> = sqlx::query_as(
+        "SELECT id, name, status, version_etag, created_at, updated_at
+           FROM meta.md_draft WHERE tenant_id = $1
+          ORDER BY updated_at DESC",
+    )
+    .bind(tenant)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(Json(rows))
+}
 
 async fn create_draft(
     State(st): State<AppState>,
@@ -135,6 +172,37 @@ async fn get_draft(
     let draft = fetch_draft(&st.pool, id, tenant).await?;
     ensure_tenant(&draft, user.tenant_id)?;
     Ok(Json(draft))
+}
+
+/// `DELETE /api/studio/drafts/:id` — discard an unpublished draft. A published
+/// draft is history (its model is archived in `md_snapshot` via the publish),
+/// so refusing the delete keeps that audit link intact; discarding is only for
+/// work that never went live.
+async fn discard_draft(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<StatusCode> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
+    let draft = fetch_draft(&st.pool, id, tenant).await?;
+    ensure_tenant(&draft, tenant)?;
+    if draft.status != "draft" {
+        return Err(Error::Conflict(format!(
+            "draft is {} — only unpublished drafts can be discarded",
+            draft.status
+        ))
+        .into());
+    }
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    sqlx::query("DELETE FROM meta.md_draft WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn put_model(
