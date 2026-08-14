@@ -1370,6 +1370,162 @@ async fn attachments_upload_download_and_field() {
 }
 
 #[tokio::test]
+async fn attachments_checksum_dedup_and_delete() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+
+    let upload = |body: &'static [u8]| {
+        let app = ctx.app.clone();
+        let token = ctx.token.clone();
+        async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/api/attachments")
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("x-filename", "f.bin")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(body.to_vec()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let st = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            (
+                st,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+
+    // two uploads of the SAME bytes → same checksum, distinct ids
+    let (st, a) = upload(b"dedup-me").await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, b) = upload(b"dedup-me").await;
+    assert_eq!(st, StatusCode::CREATED);
+    let id_a: Uuid = a["id"].as_str().unwrap().parse().unwrap();
+    let id_b: Uuid = b["id"].as_str().unwrap().parse().unwrap();
+    assert_ne!(id_a, id_b, "distinct metadata rows");
+    assert_eq!(a["checksum"], b["checksum"], "same bytes ⇒ same checksum");
+    assert!(
+        a["checksum"].as_str().unwrap().len() == 64,
+        "sha256 hex: {a}"
+    );
+    // a different upload has a different checksum
+    let (_st, c) = upload(b"different").await;
+    assert_ne!(a["checksum"], c["checksum"]);
+
+    // both deduped uploads point at one stored blob (same storage_key)
+    let (key_a,): (String,) = sqlx::query_as("SELECT storage_key FROM sys_blob WHERE id = $1")
+        .bind(id_a)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    let (key_b,): (String,) = sqlx::query_as("SELECT storage_key FROM sys_blob WHERE id = $1")
+        .bind(id_b)
+        .fetch_one(&ctx.pool)
+        .await
+        .unwrap();
+    assert_eq!(key_a, key_b, "dedup shares one stored blob");
+
+    // both downloads work
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/attachments/{id_a}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/attachments/{id_b}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // deleting one reference keeps the bytes (the other still references them)
+    let (st, _) = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/attachments/{id_a}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "delete one");
+    // id_a is gone (404), id_b still downloads
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/attachments/{id_a}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "deleted ref gone");
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/attachments/{id_b}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "other ref still works (refcount cleanup)"
+    );
+
+    // deleting the LAST reference reclaims the bytes (id_b now 404)
+    let (st, _) = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/attachments/{id_b}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "delete last");
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/attachments/{id_b}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "last ref gone");
+
+    // a non-owner cannot delete someone else's blob
+    let (_st, mine) = upload(b"mine").await;
+    let mine_id: Uuid = mine["id"].as_str().unwrap().parse().unwrap();
+    let (other_token, _other_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+    let (st, _) = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/attachments/{mine_id}"),
+        &other_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-owner cannot delete");
+}
+
+#[tokio::test]
 async fn record_sharing_makes_private_visible() {
     let ctx = match setup().await {
         Some(c) => c,

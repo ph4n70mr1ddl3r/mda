@@ -93,6 +93,10 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 #   POST   /api/shares/:entity/:id              {"principal_id":"…","access":"read|write"}
 #   GET    /api/shares/:entity/:id              -> [{principal_id, access, name, email, created_at}]
 #   DELETE /api/shares/:entity/:id/:principal_id -> 204
+# Attachments (§5.14) — sha256-checksummed, dedup-by-content, refcount-cleaned:
+#   POST   /api/attachments         (raw bytes) -> {id, filename, mime, size, checksum}
+#   GET    /api/attachments/:id                  -> bytes (owner/superuser)
+#   DELETE /api/attachments/:id                  -> 204 (reclaims bytes only when last ref)
 ```
 
 Platform surfaces (ADR-0018) — record history & as-of, and the tenant
