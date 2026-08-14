@@ -104,16 +104,27 @@ enum ListBind {
 /// Read-visibility predicate fragment. Uses placeholders `${u}` for the user
 /// bind and, when team-OWD applies, `${t}` for the team bind. Owner OR public is
 /// already handled by the caller; here: owner OR shared-with-me OR (team-OWD:
-/// owner is a member of my team). Returns None when the scope grants broad read
-/// (bypass / public_read) — no row filter needed.
+/// owner is a member of my team **or a descendant team**). Returns None when the
+/// scope grants broad read (bypass / public_read) — no row filter needed.
+///
+/// The team clause walks the `sec_team.parent_id` tree DOWNWARD from the
+/// viewer's team (`${t}`), so a member of an ancestor (manager) team reads
+/// records owned by members of any descendant team. Flat (no `parent_id` set)
+/// collapses to same-team-only: the recursive descent yields just `${t}`.
 fn read_predicate(s: &RecordScope) -> Option<String> {
     if s.bypass || s.public_read {
         return None;
     }
     let team_clause = if s.team_owd && s.team_id.is_some() {
-        " OR EXISTS (SELECT 1 FROM sec.sec_user u2 \
+        " OR EXISTS (\
+           WITH RECURSIVE descendant_teams(tid) AS (\
+                SELECT ${t} \
+                UNION ALL \
+                SELECT child.id FROM sec.sec_team child \
+                  JOIN descendant_teams d ON child.parent_id = d.tid) \
+           SELECT 1 FROM sec.sec_user u2 \
            WHERE u2.id = t.owner_id AND u2.tenant_id = t.tenant_id \
-             AND u2.team_id = ${t})"
+             AND u2.team_id IN (SELECT tid FROM descendant_teams))"
     } else {
         ""
     };

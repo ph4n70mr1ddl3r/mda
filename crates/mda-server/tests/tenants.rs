@@ -236,6 +236,22 @@ async fn tenant_import_round_trips_into_a_fresh_tenant() {
     .execute(&mut *tx)
     .await
     .unwrap();
+    // a two-level team hierarchy in A: parent <- child. Exercises the
+    // parent_id edge round-tripping through export/import (ADR-0013 hierarchy).
+    let (team_parent,): (Uuid,) =
+        sqlx::query_as("INSERT INTO sec.sec_team (tenant_id, name) VALUES ($1,'Eng') RETURNING id")
+            .bind(a.tenant)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    let (_team_child,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sec.sec_team (tenant_id, name, parent_id) VALUES ($1,'Eng-Platform',$2) RETURNING id",
+    )
+    .bind(a.tenant)
+    .bind(team_parent)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
     let (report_id,): (Uuid,) = sqlx::query_as("INSERT INTO meta.md_report (tenant_id, name, dataset) VALUES ($1,'by_tier',$2) RETURNING id")
         .bind(a.tenant)
         .bind(json!({"base_entity":"Customer","fields":[{"field":"tier"}],"group_by":["tier"]}))
@@ -347,6 +363,29 @@ async fn tenant_import_round_trips_into_a_fresh_tenant() {
     .await
     .unwrap();
     assert_eq!(owd_n, 1, "OWD restored");
+    // the team hierarchy round-tripped: Eng-Platform's parent resolves to the
+    // Eng team in B (id-remapped, not a dangling FK).
+    let team_parent_n: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sec.sec_team t
+          WHERE t.name='Eng-Platform' AND t.parent_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM sec.sec_team p WHERE p.id = t.parent_id AND p.name='Eng')",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(
+        team_parent_n, 1,
+        "team hierarchy parent_id restored + remapped"
+    );
+    let team_dangling: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sec.sec_team t
+          WHERE t.parent_id IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM sec.sec_team p WHERE p.id = t.parent_id)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(team_dangling, 0, "no dangling team parent_id after import");
     let tr_n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM meta.md_translation WHERE locale='fr' AND namespace='ui' AND msg_key='greeting' AND value='Bonjour'",
     )

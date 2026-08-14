@@ -631,3 +631,166 @@ async fn email_rendering_respects_recipient_fls() {
         "reader sees name only, secret FLS-projected: {reader_body}"
     );
 }
+
+// ===== team hierarchy: ancestor-team recipient resolution (ADR-0013) =====
+//
+// A record owned in a sub-team should notify members of every ancestor
+// (manager) team too (the `record_readers` strategy resolves the OWD-team
+// reader set, which now includes ancestors). Mirrors the visibility predicate.
+
+/// Seed a team (returns its id) under the tenant GUC.
+async fn seed_team(pool: &PgPool, tenant: Uuid, name: &str) -> Uuid {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    let (id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sec.sec_team (tenant_id, name) VALUES ($1, $2)
+         ON CONFLICT (tenant_id, name) DO UPDATE SET name = $2 RETURNING id",
+    )
+    .bind(tenant)
+    .bind(name)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    id
+}
+
+/// Assign a user to a team under the tenant GUC.
+async fn assign_team(pool: &PgPool, tenant: Uuid, user_id: Uuid, team_id: Uuid) {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    sqlx::query("UPDATE sec.sec_user SET team_id = $1 WHERE id = $2")
+        .bind(team_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Set a team's parent (the hierarchy edge).
+async fn set_team_parent(pool: &PgPool, tenant: Uuid, child: Uuid, parent: Uuid) {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    sqlx::query("UPDATE sec.sec_team SET parent_id = $1 WHERE id = $2")
+        .bind(parent)
+        .bind(child)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// Set the OWD for an entity under the tenant GUC.
+async fn seed_owd(pool: &PgPool, tenant: Uuid, entity: &str, access: &str) {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO sec.sec_owd (tenant_id, entity, default_access)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (tenant_id, entity) DO UPDATE SET default_access = $3",
+    )
+    .bind(tenant)
+    .bind(entity)
+    .bind(access)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn record_readers_notifies_ancestor_team_members() {
+    // Tree:  parent
+    //          └─ child
+    // A record owned in `child` should notify members of `child` AND `parent`
+    // (ancestor). It must NOT notify a member of a sibling team.
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        customer_model(&format!("cust_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+    seed_owd(&ctx.pool, ctx.tenant, "Customer", "team").await;
+    call(
+        &ctx.app,
+        "POST",
+        "/api/notification-types",
+        &ctx.token,
+        Some(
+            json!({"key":"cust.changed","label":"Changed","default_channels":["in_app"]})
+                .to_string(),
+        ),
+    )
+    .await;
+
+    let parent = seed_team(&ctx.pool, ctx.tenant, "parent").await;
+    let child = seed_team(&ctx.pool, ctx.tenant, "child").await;
+    let sibling = seed_team(&ctx.pool, ctx.tenant, "sibling").await;
+    set_team_parent(&ctx.pool, ctx.tenant, child, parent).await;
+    set_team_parent(&ctx.pool, ctx.tenant, sibling, parent).await;
+
+    // owner in `child`; manager in `parent`; outsider in `sibling`. All carry
+    // object-level read on Customer so the gate is cleared; the owner also
+    // needs create.
+    let owner_role = common::seed_role(
+        &ctx.pool,
+        ctx.tenant,
+        "owner",
+        &[("Customer", "create"), ("Customer", "read")],
+    )
+    .await;
+    let reader_role =
+        common::seed_role(&ctx.pool, ctx.tenant, "reader", &[("Customer", "read")]).await;
+    let owner = seed_user_with_role(&ctx.pool, ctx.tenant, owner_role).await;
+    let manager = seed_user_with_role(&ctx.pool, ctx.tenant, reader_role).await;
+    let outsider = seed_user_with_role(&ctx.pool, ctx.tenant, reader_role).await;
+    assign_team(&ctx.pool, ctx.tenant, owner, child).await;
+    assign_team(&ctx.pool, ctx.tenant, manager, parent).await;
+    assign_team(&ctx.pool, ctx.tenant, outsider, sibling).await;
+
+    // owner (in child) creates the record.
+    let owner_jwt = JwtConfig::from_env();
+    let owner_token = owner_jwt.issue_access(owner, ctx.tenant, None).unwrap();
+    let (_, c) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &owner_token,
+        Some(json!({"name":"Sub-team owned"}).to_string()),
+    )
+    .await;
+    let rec_id = c["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    // dispatch to everyone who can read the record.
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        "/api/notifications/dispatch",
+        &ctx.token,
+        Some(
+            json!({"type_key":"cust.changed","recipient_strategy":"record_readers",
+                   "entity":"Customer","record_id":rec_id,
+                   "context":{"record":{"name":"Sub-team owned"}}})
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED);
+    mda_server::outbox::spawn_drain(ctx.pool.clone());
+    wait_drained(&ctx.pool, ctx.tenant).await;
+
+    assert_eq!(count_notif(&ctx, owner).await, 1, "owner notified");
+    assert_eq!(
+        count_notif(&ctx, manager).await,
+        1,
+        "ancestor-team member notified (manager visibility)"
+    );
+    assert_eq!(
+        count_notif(&ctx, outsider).await,
+        0,
+        "sibling-team member NOT notified"
+    );
+}

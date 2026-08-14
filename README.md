@@ -8,8 +8,8 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > plus the full §5.18–5.22 platform-capability cluster and a first-class GraphQL
 > runtime API (ADR-0010).
 > Server: auth, CRUD, security, rules, workflows, reporting, bulk, attachments,
-> notifications, sharing (incl. **team-OWD** record visibility — ADR-0013
-> `owd_visible`). Platform: secrets, templating, multi-channel
+> notifications, sharing (incl. **team-OWD record visibility + team hierarchy**
+> — ADR-0013 `owd_visible` / ADR-0025 `sec_team.parent_id`). Platform: secrets, templating, multi-channel
 > notifications + digest (with record-reader recipient resolution +
 > FLS-under-recipient rendering + SMTP send), signed webhook contract + inbound
 > verification, hub-model integration (connectors / flows / external-ID registry,
@@ -20,7 +20,9 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > backup/restore), **mass actions** (bulk update/delete by filter — ADR-0021),
 > **API versioning & deprecation** with `Sunset`/`Deprecation` headers
 > (ADR-0022), and **metadata/UI i18n** (`md_translation`, best-match locale —
-> ADR-0023).
+> ADR-0023). **Team hierarchy** (ancestor-team visibility — ADR-0025) ships
+> with a superuser **admin security API** (`/api/admin/{teams,roles,owd,users}`)
+> that makes the whole security graph operable.
 > Frontend: login + entity list (WASM).
 >
 > **Platform surfaces (ADR-0018):** record/field history + as-of
@@ -178,6 +180,25 @@ curl localhost:8080/health -H "X-API-Version: 1"   # → MDA-API-Version: 1
 curl localhost:8080/api/tenants/export -H "Authorization: Bearer $JWT" > tenant-backup.json
 curl -X POST localhost:8080/api/tenants/import -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' --data @tenant-backup.json
+
+# Admin security API (ADR-0025) — superuser-only management of the security
+# graph: teams (incl. the parent/sub-team hierarchy), roles, object/field
+# permissions, org-wide defaults, and users. Under team-OWD a member of an
+# ancestor (manager) team reads records owned by any descendant team.
+curl -X POST localhost:8080/api/admin/teams -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"name":"Eng"}'
+curl -X POST localhost:8080/api/admin/teams -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"name":"Eng-Platform","parent_id":"'$ENG_ID'"}'
+curl -X PUT  localhost:8080/api/admin/owd/Customer -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"default_access":"team"}'
+curl -X POST localhost:8080/api/admin/users -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"email":"a@x","name":"A","password":"...","team_id":"'$ENG_ID'"}'
+curl -X POST localhost:8080/api/admin/roles -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"name":"Rep"}'
+curl -X POST localhost:8080/api/admin/roles/$ROLE_ID/permissions -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"entity":"Customer","verb":"read"}'
+curl -X POST localhost:8080/api/admin/users/$USER_ID/roles -H "Authorization: Bearer $JWT" \
+     -H 'content-type: application/json' -d '{"role_id":"'$ROLE_ID'"}'
 ```
 
 > Dev Postgres is published on **5433** (not 5432) to avoid colliding with a
@@ -198,7 +219,7 @@ DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
 #
 # Platform-capability + GraphQL + scheduler + tenant suites (§5.18–5.22, ADR-0010, §14):
 #   cargo test --test secrets --test templates --test notifications \
-#              --test webhooks --test integration_flows --test graphql --test scheduler --test tenants
+#              --test webhooks --test integration_flows --test graphql --test scheduler --test tenants --test admin
 ```
 
 The `data`/`studio` suites connect the app as the non-superuser `mda_app` role
@@ -238,7 +259,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
   - §14 — tracked, not yet designed (platform gaps)
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
-- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (24 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities, scheduled jobs, platform follow-ups, **mass actions, API versioning, i18n, GraphQL hot-invalidation**).
+- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (25 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities, scheduled jobs, platform follow-ups, mass actions, API versioning, i18n, GraphQL hot-invalidation, **team hierarchy + admin security API**).
 - [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE10.md`](./docs/PHASE10.md) — phase status & handoffs.
 - [`docs/CAPABILITIES.md`](./docs/CAPABILITIES.md) — the §5.18–5.22 platform-capability cluster (secrets, templating, notifications, webhook contract, hub-model integration) + GraphQL (ADR-0010) status & handoff.
 

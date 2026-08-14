@@ -156,7 +156,8 @@ pub async fn run_transition(
         tx.commit().await.map_err(Error::internal)?;
     }
 
-    // enqueue a side-effect (outbox); the drain worker is a follow-up
+    // enqueue a side-effect (outbox); the drain worker turns the
+    // `workflow.transitioned` row into an in-app notification to the actor.
     sqlx::query(
         "INSERT INTO sys_outbox (tenant_id, kind, payload)
          VALUES ($1, 'workflow.transitioned', $2)",

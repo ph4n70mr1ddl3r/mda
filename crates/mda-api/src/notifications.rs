@@ -654,10 +654,13 @@ pub async fn fanout(pool: &PgPool, channels: &[Box<dyn Channel>], payload: &Valu
 ///   (the wildcard `*/*` counts) — always required (the gate to read any record);
 /// - **record-level**: the owner + anyone with a direct share, OR — when the
 ///   entity's OWD grants org-wide read — every object-level reader, OR — when
-///   the OWD is `team` — the owner's teammates.
+///   the OWD is `team` — the owner's teammates **and members of ancestor
+///   teams** (the manager-visibility side of the ADR-0013 hierarchy).
 ///
-/// Sub-team hierarchy (parent-team visibility) is the deeper ADR-0013
-/// refinement; team-OWD here is flat same-team.
+/// The teammate query walks the `sec_team.parent_id` tree UPWARD from the
+/// owner's team, so a record owned in a sub-team notifies members of every
+/// ancestor (parent/manager) team too. Flat (no `parent_id` set) collapses to
+/// same-team-only: the recursive ascent yields just the owner's team.
 pub async fn resolve_record_readers(
     pool: &PgPool,
     tenant: Uuid,
@@ -715,14 +718,21 @@ pub async fn resolve_record_readers(
             readers.insert(p);
         }
     }
-    // Team-OWD: anyone in the owner's team (who also clears the object-level
-    // read gate) can read. A team-less owner admits no one extra here.
+    // Team-OWD: anyone in the owner's team or an ANCESTOR team (who also
+    // clears the object-level read gate) can read — the manager-visibility
+    // side of the ADR-0013 hierarchy. A team-less owner admits no one extra.
     if owd == mda_security::Owd::Team {
         let teammates: Vec<Uuid> = sqlx::query_scalar(
             "SELECT u.id FROM sec.sec_user u
-              JOIN sec.sec_user o ON o.id = $1 AND o.team_id IS NOT NULL
              WHERE u.tenant_id = $2 AND u.active
-               AND u.team_id = o.team_id",
+               AND u.team_id IN (
+                 WITH RECURSIVE ancestor_teams(tid) AS (
+                      SELECT o.team_id FROM sec.sec_user o WHERE o.id = $1
+                      UNION ALL
+                      SELECT parent.parent_id FROM sec.sec_team parent
+                        JOIN ancestor_teams a ON parent.id = a.tid
+                       WHERE parent.parent_id IS NOT NULL)
+                 SELECT tid FROM ancestor_teams WHERE tid IS NOT NULL)",
         )
         .bind(owner_id)
         .bind(tenant)

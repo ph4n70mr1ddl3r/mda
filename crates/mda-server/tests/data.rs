@@ -1399,7 +1399,8 @@ async fn edge_endpoints_security_headers_and_metrics() {
 async fn cross_tenant_data_is_isolated() {
     // Regression guard for tenant isolation (PLAN §5.4 / §11). The app filters
     // every biz.* query by tenant_id; a cross-tenant leak here means a future
-    // change punched a hole. (RLS, the DB-layer backstop, is a follow-up.)
+    // change punched a hole. (RLS is the DB-layer backstop — enabled+forced at
+    // publish in mda-data::ddl; exercised by `rls_gates_meta_at_db_layer`.)
     let ctx = match setup().await {
         Some(c) => c,
         None => return,
@@ -2345,6 +2346,21 @@ async fn seed_owd(pool: &PgPool, tenant: Uuid, entity: &str, access: &str) {
     tx.commit().await.unwrap();
 }
 
+/// Make `child` a sub-team of `parent` (under the tenant GUC). This is the
+/// ADR-0013 team-hierarchy edge: a member of an ancestor team reads records
+/// owned by members of any descendant team.
+async fn set_team_parent(pool: &PgPool, tenant: Uuid, child: Uuid, parent: Uuid) {
+    let mut tx = pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, tenant).await.unwrap();
+    sqlx::query("UPDATE sec.sec_team SET parent_id = $1 WHERE id = $2")
+        .bind(parent)
+        .bind(child)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
 async fn team_owd_lets_teammates_read_owners_record() {
     // OWD = team: members of the owner's team may read each other's records
@@ -2467,5 +2483,162 @@ async fn team_owd_lets_teammates_read_owners_record() {
         st,
         StatusCode::NOT_FOUND,
         "team-OWD is read-only: write blocked: {body}"
+    );
+}
+
+// ===== team hierarchy (ADR-0013 sub-team visibility) =====
+//
+// The `parent_id` edge on `sec_team`: a member of an ancestor (manager) team
+// reads records owned by members of any descendant team; the reverse is denied,
+// write stays owner-only, and a sibling branch is isolated.
+
+#[tokio::test]
+async fn team_hierarchy_let_ancestor_read_descendant_record() {
+    // Tree:  parent
+    //          └─ child-a
+    //          └─ child-b
+    // A record owned in `child-a` is readable by a member of `child-a` (same
+    // team) AND by a member of `parent` (ancestor / manager). It is NOT readable
+    // by a member of `child-b` (sibling branch) nor by a member of `child-a`
+    // trying to read up into `parent` (visibility flows downward only).
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    seed_owd(&ctx.pool, ctx.tenant, "Customer", "team").await;
+
+    let parent = seed_team(&ctx.pool, ctx.tenant, "parent").await;
+    let child_a = seed_team(&ctx.pool, ctx.tenant, "child-a").await;
+    let child_b = seed_team(&ctx.pool, ctx.tenant, "child-b").await;
+    set_team_parent(&ctx.pool, ctx.tenant, child_a, parent).await;
+    set_team_parent(&ctx.pool, ctx.tenant, child_b, parent).await;
+
+    // owner: in child-a, creates a record.
+    let (owner_token, owner_id) =
+        limited_user(&ctx, &[("Customer", "create"), ("Customer", "read")]).await;
+    assign_team(&ctx.pool, ctx.tenant, owner_id, child_a).await;
+    // manager: in parent (ancestor), read only.
+    let (mgr_token, mgr_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+    assign_team(&ctx.pool, ctx.tenant, mgr_id, parent).await;
+    // sibling: in child-b (different branch), read only.
+    let (sib_token, sib_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+    assign_team(&ctx.pool, ctx.tenant, sib_id, child_b).await;
+    // sub-member: in child-a, but tries to read a record owned in `parent`.
+    let (sub_token, sub_id) =
+        limited_user(&ctx, &[("Customer", "create"), ("Customer", "read")]).await;
+    assign_team(&ctx.pool, ctx.tenant, sub_id, child_a).await;
+
+    // owner creates a record in child-a.
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &owner_token,
+        Some(json!({"name":"Owned-by-child-a"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // manager (ancestor `parent`) can read it + sees it in the list.
+    let (st, got) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &mgr_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "ancestor/manager can read: {got}");
+    assert_eq!(got["name"], "Owned-by-child-a");
+    let (_, list) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer",
+        &mgr_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        list["total"], 1,
+        "ancestor list sees the descendant record: {list}"
+    );
+
+    // sibling (child-b, different branch) cannot read it (404) nor list it.
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &sib_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "sibling branch is blocked");
+    let (_, list) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer",
+        &sib_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list["total"], 0, "sibling list is empty: {list}");
+
+    // visibility flows DOWNWARD only: a member of `child-a` cannot read a record
+    // owned in `parent`. Have the sub-member create one in child-a, then a
+    // manager-owned record in `parent`, and confirm the sub-member does NOT see
+    // the parent-owned one. (Re-use owner_token: put owner into parent to make a
+    // parent-owned record.)
+    assign_team(&ctx.pool, ctx.tenant, owner_id, parent).await;
+    let (_, parent_rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &owner_token,
+        Some(json!({"name":"Owned-by-parent"}).to_string()),
+        None,
+    )
+    .await;
+    let parent_id = parent_rec["id"].as_str().unwrap().to_string();
+    // sub-member is in child-a (a descendant of parent); it must NOT read the
+    // parent-owned record (descendants cannot read up).
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{parent_id}"),
+        &sub_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "descendant cannot read up into ancestor's record"
+    );
+
+    // write stays owner-only: the manager (ancestor) cannot update the
+    // child-a-owned record even with the update perm.
+    let (mgr_write_token, mgr_write_id) =
+        limited_user(&ctx, &[("Customer", "read"), ("Customer", "update")]).await;
+    assign_team(&ctx.pool, ctx.tenant, mgr_write_id, parent).await;
+    let (st, body) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &mgr_write_token,
+        Some(json!({"name":"mutated-by-manager"}).to_string()),
+        rec["version"].as_i64(),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::NOT_FOUND,
+        "hierarchy grants read only: manager write blocked: {body}"
     );
 }

@@ -12,6 +12,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use std::collections::HashMap;
 
+pub mod admin;
 pub mod auth;
 pub mod blobs;
 pub mod data;
@@ -74,6 +75,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(edge::routes())
         .merge(auth::routes())
         .merge(studio::routes())
+        .merge(admin::routes())
         .merge(data::routes())
         .merge(reports::routes())
         .merge(templates::routes())

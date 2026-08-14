@@ -246,10 +246,11 @@ async fn import_tenant(
     let mut report_map: HashMap<Uuid, Uuid> = HashMap::new();
     let mut flow_map: HashMap<Uuid, Uuid> = HashMap::new();
     let mut connector_map: HashMap<Uuid, Uuid> = HashMap::new();
+    let mut team_map: HashMap<Uuid, Uuid> = HashMap::new();
 
     // order respects FK references: teams/roles first, then role-keyed perms;
     // connectors before flows; reports + flows before schedules (target_id).
-    let n_teams = restore_teams(&mut tx, tenant, arr(&security, "teams")).await?;
+    let n_teams = restore_teams(&mut tx, tenant, arr(&security, "teams"), &mut team_map).await?;
     let n_roles = restore_roles(&mut tx, tenant, arr(&security, "roles"), &mut role_map).await?;
     let n_perms = restore_permissions(&mut tx, arr(&security, "permissions"), &role_map).await?;
     let n_field_perms =
@@ -327,8 +328,13 @@ async fn restore_teams(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
     rows: &[Value],
+    map: &mut HashMap<Uuid, Uuid>,
 ) -> Result<usize> {
     let mut n = 0;
+    // Pass 1: insert/update every team by natural key (name) and record the
+    // bundle-id → actual-id mapping. parent_id is left NULL here because a
+    // team's parent may be declared later in the bundle (and the self-FK needs
+    // the parent row to exist first).
     for r in rows {
         let id = j_uuid(r, "id")?;
         let name = j_str(r, "name")?;
@@ -339,7 +345,7 @@ async fn restore_teams(
                 .fetch_optional(&mut **tx)
                 .await
                 .map_err(Error::internal)?;
-        match existing {
+        let actual = match existing {
             Some((eid,)) => {
                 sqlx::query("UPDATE sec.sec_team SET name = $2 WHERE id = $1")
                     .bind(eid)
@@ -347,6 +353,7 @@ async fn restore_teams(
                     .execute(&mut **tx)
                     .await
                     .map_err(Error::internal)?;
+                eid
             }
             None => {
                 sqlx::query(
@@ -359,9 +366,31 @@ async fn restore_teams(
                 .execute(&mut **tx)
                 .await
                 .map_err(Error::internal)?;
+                id
             }
-        }
+        };
+        map.insert(id, actual);
         n += 1;
+    }
+    // Pass 2: re-link the hierarchy. parent_id is remapped through the map (a
+    // parent that already existed under a different id resolves correctly), and
+    // is dropped if the bundle references a parent that wasn't in the bundle.
+    for r in rows {
+        let id = j_uuid(r, "id")?;
+        let Some(actual) = map.get(&id).copied() else {
+            continue;
+        };
+        let parent = r
+            .get("parent_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let parent_actual = parent.and_then(|p| map.get(&p).copied());
+        sqlx::query("UPDATE sec.sec_team SET parent_id = $2 WHERE id = $1")
+            .bind(actual)
+            .bind(parent_actual)
+            .execute(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
     }
     Ok(n)
 }

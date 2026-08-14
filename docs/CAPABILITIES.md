@@ -132,12 +132,19 @@ Remaining, still-deferred (lower priority / tied to other work):
   `(tenant, version)` key remains the correctness guarantee (a publish rebuilds
   by advancing the version).
 - **Team hierarchy** (parent-team / sub-team visibility in record security +
-  recipient resolution). Flat **team-OWD is now honored** (ADR-0013
-  `owd_visible`): an entity whose OWD is `team` admits the owner's teammates
-  for read (write stays owner-only, mirroring `PublicRead`), in both the
-  record-visibility predicate and `record_readers` recipient resolution. The
-  remaining refinement is the *hierarchy* (a manager's team sees descendant
-  teams' records), which needs the role/team-hierarchy epoch machinery.
+  recipient resolution) is now **closed** (ADR-0025): `sec_team.parent_id` is the
+  visibility tree. Under team-OWD the record-visibility predicate walks the tree
+  **downward** from the viewer's team (`WITH RECURSIVE descendant_teams`), so a
+  member of an ancestor (manager) team reads records owned by members of any
+  descendant team; `resolve_record_readers` walks **upward** so a sub-team-owned
+  record notifies every ancestor team too. Write stays owner-only. Flat collapses
+  to same-team-only (no `parent_id` edges ⇒ the descent yields just the viewer's
+  team), so existing tenants are unaffected. A new superuser-only **admin
+  security API** (`/api/admin/{teams,roles,owd,users}`) makes the whole security
+  graph operable — teams CRUD + `parent_id` re-parent with a cycle guard, roles +
+  object/field permission grant/revoke, OWD per entity, users CRUD +
+  activate/deactivate + password reset + role assignment. The hierarchy
+  round-trips through tenant config import (id-remapped `parent_id`).
 - **Tenant-scoped *data* export/restore + data residency** remain tied to the
   tenant lifecycle (§5.4) and HA (U9). Tenant *configuration* export **and**
   import now ship: `GET /api/tenants/export` + `POST /api/tenants/import`
