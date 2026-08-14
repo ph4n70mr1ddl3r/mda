@@ -1457,6 +1457,142 @@ async fn record_sharing_makes_private_visible() {
 }
 
 #[tokio::test]
+async fn share_list_and_revoke() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+
+    // admin owns a private record
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Shared"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    let (_reader_token, reader_id) = limited_user(&ctx, &[("Customer", "read")]).await;
+
+    // initially no shares
+    let (st, list) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "list shares: {list}");
+    assert_eq!(list.as_array().unwrap().len(), 0, "no shares yet: {list}");
+
+    // grant + list reflects it (with the principal's name/email)
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"principal_id": reader_id, "access": "read"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "share");
+    let (_st, list) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list.as_array().unwrap().len(), 1, "one share: {list}");
+    assert_eq!(list[0]["principal_id"], json!(reader_id));
+    assert_eq!(list[0]["access"], "read");
+    assert!(
+        list[0]["email"].as_str().unwrap().contains('@'),
+        "name/email joined: {list}"
+    );
+
+    // re-grant upgrades access (still a single row)
+    let (_st, _) = call(
+        &ctx.app,
+        "POST",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"principal_id": reader_id, "access": "write"}).to_string()),
+        None,
+    )
+    .await;
+    let (_st, list) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        list.as_array().unwrap().len(),
+        1,
+        "re-grant is an upsert: {list}"
+    );
+    assert_eq!(list[0]["access"], "write");
+
+    // revoke + list is empty again
+    let (st, _) = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/shares/Customer/{id}/{reader_id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NO_CONTENT, "revoke");
+    let (_st, list) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/shares/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(list.as_array().unwrap().len(), 0, "revoked: {list}");
+
+    // revoking a non-existent share is 404
+    let (st, _) = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/shares/Customer/{id}/{reader_id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "revoke missing");
+
+    // a non-owner (the reader) may not list/revoke the admin's record's shares
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/shares/Customer/{id}"),
+        &_reader_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-owner cannot list shares");
+}
+
+#[tokio::test]
 async fn record_delete_archives_and_restore_recovers() {
     let ctx = match setup().await {
         Some(c) => c,

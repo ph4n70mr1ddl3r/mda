@@ -59,7 +59,14 @@ pub fn routes() -> Router<AppState> {
             axum::routing::post(import_records),
         )
         .route("/api/impex/:entity/export", get(export_records))
-        .route("/api/shares/:entity/:id", axum::routing::post(create_share))
+        .route(
+            "/api/shares/:entity/:id",
+            axum::routing::post(create_share).get(list_shares),
+        )
+        .route(
+            "/api/shares/:entity/:id/:principal_id",
+            axum::routing::delete(delete_share),
+        )
 }
 
 #[derive(Deserialize, Default)]
@@ -1222,13 +1229,11 @@ struct ShareReq {
     access: String, // read | write
 }
 
-async fn create_share(
-    State(st): State<AppState>,
-    AuthUser(user): AuthUser,
-    Path((entity, id)): Path<(String, Uuid)>,
-    Json(req): Json<ShareReq>,
-) -> ApiResult<StatusCode> {
-    let def = entity_def(&st, user.tenant_id, &entity).await?;
+/// Only the record owner (or a superuser) may manage a record's shares. Reads
+/// the record under a superuser scope so a non-reading owner can still manage
+/// their own shares (the AuthZ gate is ownership, not read).
+async fn require_owner(st: &AppState, user: &Identity, entity: &str, id: Uuid) -> ApiResult<()> {
+    let def = entity_def(st, user.tenant_id, entity).await?;
     let rec = mda_data::read(
         &st.pool,
         user.tenant_id,
@@ -1243,6 +1248,16 @@ async fn create_share(
     if !user.is_superuser && owner != Some(user.user_id) {
         return Err(Error::Forbidden("only the owner can share".into()).into());
     }
+    Ok(())
+}
+
+async fn create_share(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((entity, id)): Path<(String, Uuid)>,
+    Json(req): Json<ShareReq>,
+) -> ApiResult<StatusCode> {
+    require_owner(&st, &user, &entity, id).await?;
     if !matches!(req.access.as_str(), "read" | "write") {
         return Err(Error::Invalid("access must be 'read' or 'write'".into()).into());
     }
@@ -1277,4 +1292,86 @@ async fn create_share(
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(StatusCode::CREATED)
+}
+
+/// `GET /api/shares/:entity/:id` — list the record's **manual** shares
+/// (`rule_id IS NULL`; rule-derived shares are managed via their rule, §5.11),
+/// with the principal's name/email for usability. Owner/superuser only.
+async fn list_shares(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((entity, id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<Vec<Value>>> {
+    require_owner(&st, &user, &entity, id).await?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+    #[derive(sqlx::FromRow)]
+    struct ShareRow {
+        principal_id: Uuid,
+        access: String,
+        name: Option<String>,
+        email: Option<String>,
+        created_at: String,
+    }
+    let rows: Vec<ShareRow> = sqlx::query_as(
+        "SELECT rs.principal_id, rs.access, u.name, u.email, rs.created_at::text
+           FROM sec.sec_record_share rs
+           JOIN sec.sec_user u ON u.id = rs.principal_id
+          WHERE rs.tenant_id = $1 AND rs.entity = $2 AND rs.record_id = $3
+            AND rs.rule_id IS NULL
+          ORDER BY rs.created_at",
+    )
+    .bind(user.tenant_id)
+    .bind(&entity)
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    let out: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "principal_id": r.principal_id,
+                "access": r.access,
+                "name": r.name,
+                "email": r.email,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// `DELETE /api/shares/:entity/:id/:principal_id` — revoke a manual share.
+/// Owner/superuser only. Only manual shares (`rule_id IS NULL`) are revocable
+/// here; a rule-derived share is revoked by updating/deactivating its rule
+/// (which re-materializes through the epoch machinery, ADR-0013).
+async fn delete_share(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((entity, id, principal_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<StatusCode> {
+    require_owner(&st, &user, &entity, id).await?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+    let res = sqlx::query(
+        "DELETE FROM sec.sec_record_share
+          WHERE tenant_id = $1 AND entity = $2 AND record_id = $3
+            AND principal_id = $4 AND rule_id IS NULL",
+    )
+    .bind(user.tenant_id)
+    .bind(&entity)
+    .bind(id)
+    .bind(principal_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    if res.rows_affected() == 0 {
+        return Err(
+            Error::NotFound(format!("no manual share for principal {principal_id}")).into(),
+        );
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

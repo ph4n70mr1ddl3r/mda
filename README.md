@@ -89,6 +89,10 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 # Bulk import/export (§5.13) — mapped, validated, safe record import (CSV or JSON):
 #   POST /api/impex/:entity/import?mode=upsert&key=email&dry_run=true&on_error=abort  (text/csv body)
 #   GET  /api/impex/:entity/export  (-> text/csv; respects field-level read security)
+# Manual record sharing (§5.11) — grant / list / revoke (owner-or-superuser):
+#   POST   /api/shares/:entity/:id              {"principal_id":"…","access":"read|write"}
+#   GET    /api/shares/:entity/:id              -> [{principal_id, access, name, email, created_at}]
+#   DELETE /api/shares/:entity/:id/:principal_id -> 204
 ```
 
 Platform surfaces (ADR-0018) — record history & as-of, and the tenant
