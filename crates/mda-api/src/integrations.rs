@@ -51,9 +51,15 @@ async fn create_connector(
     AuthUser(user): AuthUser,
     Json(body): Json<CreateConnector>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    crate::admin::require_admin(&user)?;
     if body.name.trim().is_empty() || body.base_url.trim().is_empty() {
         return Err(Error::Invalid("name and base_url are required".into()).into());
     }
+    // SSRF guard: connector targets are operator config, but a tenant admin
+    // account must not be able to aim the platform at internal/metadata
+    // endpoints (re-checked at every fetch/push).
+    let target = mda_integration::net::parse_outbound_url(&body.base_url)?;
+    mda_integration::net::assert_public_egress(&target).await?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let row: Option<(Uuid,)> = sqlx::query_as(
@@ -83,6 +89,7 @@ async fn list_connectors(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> ApiResult<Json<Vec<Value>>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let rows: Vec<(Value,)> = sqlx::query_as(
@@ -136,6 +143,7 @@ async fn create_flow(
     AuthUser(user): AuthUser,
     Json(body): Json<CreateFlow>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    crate::admin::require_admin(&user)?;
     if !matches!(body.direction.as_str(), "inbound" | "outbound") {
         return Err(Error::Invalid("direction must be inbound|outbound".into()).into());
     }
@@ -178,6 +186,7 @@ async fn list_flows(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> ApiResult<Json<Vec<Value>>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let rows: Vec<(Value,)> =
@@ -195,6 +204,7 @@ async fn get_flow(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Value>> {
+    crate::admin::require_admin(&user)?;
     let flow = mda_integration::flow_by_id(&st.pool, user.tenant_id, id).await?;
     Ok(Json(json!({
         "id": flow.id, "name": flow.name, "direction": flow.direction, "entity": flow.entity,
@@ -222,6 +232,10 @@ async fn run_flow(
     Path(id): Path<Uuid>,
     Json(body): Json<RunBody>,
 ) -> ApiResult<Json<Value>> {
+    // Admin-gated: a manual run materializes data under the system write path
+    // (superuser record scope), so it must not be reachable by unprivileged
+    // users — the API-layer RBAC/FLS checks of /api/data don't apply here.
+    crate::admin::require_admin(&user)?;
     let flow = mda_integration::flow_by_id(&st.pool, user.tenant_id, id).await?;
     // resolve the entity definition (int flows target a canonical biz entity).
     let entity_id =
@@ -253,6 +267,7 @@ async fn list_runs(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<Value>>> {
+    crate::admin::require_admin(&user)?;
     let rows: Vec<(Value,)> = sqlx::query_as(
         "SELECT to_jsonb(r.*) FROM sys_integration_run r
           WHERE tenant_id = $1 AND flow_id = $2 ORDER BY started_at DESC LIMIT 50",
@@ -280,6 +295,7 @@ async fn lookup_external_id(
     Path((entity, key)): Path<(String, String)>,
     Query(q): Query<ExtIdQuery>,
 ) -> ApiResult<Json<Value>> {
+    crate::admin::require_admin(&user)?;
     let row: Option<(Uuid,)> = match q.system.as_deref() {
         Some(system) => sqlx::query_as(
             "SELECT record_id FROM int_external_id

@@ -33,5 +33,24 @@ pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     sqlx::migrate!("../../migrations")
         .run(pool)
         .await
-        .context("database migration failed")
+        .context("database migration failed")?;
+
+    // Optional operator rotation of the app-role credential: when
+    // MDA_APP_DB_PASSWORD is set, align the cluster role with it so deploy
+    // envs don't ship the migration-time default ('mda'). Idempotent; failures
+    // surface as startup errors (a wrong password here means the app role
+    // can't log in either).
+    if let Ok(pw) = std::env::var("MDA_APP_DB_PASSWORD") {
+        if !pw.is_empty() {
+            // ALTER ROLE takes a string literal, not a parameter — quote it
+            // (double any single quotes;Postgres escape rules for literals).
+            let escaped = pw.replace('\'', "''");
+            sqlx::query(&format!("ALTER ROLE mda_app PASSWORD '{escaped}'"))
+                .execute(pool)
+                .await
+                .context("applying MDA_APP_DB_PASSWORD to the mda_app role")?;
+            tracing::info!("mda_app role password applied from MDA_APP_DB_PASSWORD");
+        }
+    }
+    Ok(())
 }

@@ -26,6 +26,10 @@ use crate::AppState;
 /// requirement).
 static AUDIT_WRITE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// Hard cap on rows produced by one CSV/JSON export (bounded memory + response;
+/// larger exports belong in the async job path, §5.13).
+const EXPORT_MAX_ROWS: u64 = 100_000;
+
 /// Snapshot the current audit-failure counter (for the health endpoint).
 pub fn audit_failure_count() -> u64 {
     AUDIT_WRITE_FAILURES.load(Ordering::Relaxed)
@@ -238,7 +242,10 @@ pub(crate) async fn update_record_service(
 
 /// `POST /api/data/:entity/:id/restore` — re-insert the most recently archived
 /// copy of a hard-deleted record (admin undo). Single-record scope; batch /
-/// cascade restore is the full ADR-0015 design and a follow-up.
+/// cascade restore is the full ADR-0015 design and a follow-up. The caller's
+/// record-level write scope is enforced against the archived row — the entity
+/// `create` verb alone must not resurrect a record the caller could never
+/// write (e.g. a private-OWD record owned by someone else).
 async fn restore_record(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
@@ -246,7 +253,8 @@ async fn restore_record(
 ) -> ApiResult<Json<Value>> {
     authorize(&user, &entity, "create")?;
     let def = entity_def(&st, user.tenant_id, &entity).await?;
-    let rec = mda_data::restore(&st.pool, user.tenant_id, &def, id).await?;
+    let scope = scope_for(&st, &user, &entity).await?;
+    let rec = mda_data::restore(&st.pool, user.tenant_id, &def, id, &scope).await?;
     audit(
         &st,
         user.tenant_id,
@@ -630,11 +638,21 @@ async fn audit(
             } else {
                 true
             };
-            if audit_ok && event_ok {
+            if audit_ok {
+                // Commit even when only the event-log insert failed: the audit
+                // row is the integrity record and must not vanish with it —
+                // the degraded event path is counted + logged instead.
                 if let Err(e) = tx.commit().await {
                     tracing::warn!(?e, "audit tx commit failed");
                 }
-            } else if !audit_ok {
+                if !event_ok {
+                    let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::error!(
+                        failures = n,
+                        "event log insert failed (audit row committed)"
+                    );
+                }
+            } else {
                 let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
                 tracing::error!(failures = n, "audit log insert failed");
             }
@@ -1176,7 +1194,9 @@ async fn resolve_import_target(
 }
 
 /// `GET /api/impex/:entity/export` — list (filtered) as CSV, respecting field
-/// read security.
+/// read security. Pages through the full filtered set (the list surface caps
+/// page_size at 200 — an export must not silently truncate there), bounded by
+/// [`EXPORT_MAX_ROWS`].
 async fn export_records(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
@@ -1186,11 +1206,33 @@ async fn export_records(
     authorize(&user, &entity, "read")?;
     let def = entity_def(&st, user.tenant_id, &entity).await?;
     let scope = scope_for(&st, &user, &entity).await?;
-    let params = parse_list_params(q)?;
-    let mut res = mda_data::list(&st.pool, user.tenant_id, &def, &params, &scope).await?;
-    for item in res.items.iter_mut() {
-        *item = project(&user, &entity, &def, item.clone());
+    let mut params = parse_list_params(q)?;
+    // stable pagination: order by id unless the caller picked a sort
+    if params.sort.is_empty() {
+        params.sort.push(mda_data::Sort {
+            field: "id".to_string(),
+            asc: true,
+        });
     }
+    // export page size: the caller's explicit ask, clamped to the list cap
+    // (0 = the cap — an export walks the whole filtered set anyway).
+    params.page_size = if params.page_size == 0 {
+        mda_data::MAX_PAGE_SIZE
+    } else {
+        params.page_size.clamp(1, mda_data::MAX_PAGE_SIZE)
+    };
+    let mut items: Vec<Value> = Vec::new();
+    loop {
+        let res = mda_data::list(&st.pool, user.tenant_id, &def, &params, &scope).await?;
+        let n = res.items.len() as u64;
+        items.extend(res.items);
+        if n < params.page_size || items.len() as u64 >= EXPORT_MAX_ROWS {
+            break;
+        }
+        params.page += 1;
+    }
+    items.truncate(EXPORT_MAX_ROWS as usize);
+    let res_items = items;
     // columns: id + readable data fields + relationship columns
     let mut columns = vec!["id".to_string()];
     for f in &def.fields {
@@ -1201,9 +1243,9 @@ async fn export_records(
     for r in &def.relationships {
         columns.push(r.source_field_name.clone());
     }
-    let rows: Vec<Map<String, Value>> = res
-        .items
+    let rows: Vec<Map<String, Value>> = res_items
         .into_iter()
+        .map(|v| project(&user, &entity, &def, v))
         .map(|v| match v {
             Value::Object(m) => m,
             other => {
@@ -1276,6 +1318,26 @@ async fn create_share(
     .map_err(Error::internal)?;
     if principal_ok.is_none() {
         return Err(Error::Invalid("principal is not an active user in this tenant".into()).into());
+    }
+    // A rule-derived share (rule_id IS NOT NULL) must never be overwritten by a
+    // manual one: it would keep pointing at the rule (unrevocable here) while
+    // carrying the manual access — and the next rule recompute would silently
+    // revert it. Surface the collision instead.
+    let rule_owned: Option<(Option<Uuid>,)> = sqlx::query_as(
+        "SELECT rule_id FROM sec.sec_record_share
+          WHERE tenant_id = $1 AND record_id = $2 AND principal_id = $3",
+    )
+    .bind(user.tenant_id)
+    .bind(id)
+    .bind(req.principal_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    if let Some((Some(rule_id),)) = rule_owned {
+        return Err(Error::Conflict(format!(
+            "principal's access is managed by sharing rule {rule_id}; update the rule instead"
+        ))
+        .into());
     }
     sqlx::query(
         "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)

@@ -267,9 +267,14 @@ fn Home() -> impl IntoView {
                          }
                          _ => {
                              let url = item.url.clone().unwrap_or_default();
+                             // Nav URLs come from tenant-authored UI definitions —
+                             // only navigate to http(s) or same-app paths, never
+                             // javascript: (stored XSS via a modeler-crafted link).
+                             let safe = is_safe_nav_url(&url);
                              view! {
                                  <div style="padding:8px; margin:4px 0; border:1px solid #ddd; border-radius:4px;">
-                                     <a href=url.clone() target="_blank" rel="noopener noreferrer">{item.label.clone()}</a>
+                                     <a href={if safe { url.clone() } else { "#".to_string() }}
+                                        target="_blank" rel="noopener noreferrer">{item.label.clone()}</a>
                                  </div>
                              }.into_view()
                          }
@@ -1108,4 +1113,20 @@ fn coerce_field(types: &HashMap<String, String>, key: &str, val: &str) -> serde_
             .unwrap_or_else(|_| serde_json::Value::String(val.to_string())),
         _ => serde_json::Value::String(val.to_string()),
     }
+}
+
+/// Tenant-authored nav URLs are untrusted: allow only http(s) and same-app
+/// relative paths. Anything else (javascript:, data:, vbscript:, unknown
+/// schemes) renders as a dead link instead of executing.
+fn is_safe_nav_url(url: &str) -> bool {
+    let u = url.trim();
+    if u.is_empty() {
+        return false;
+    }
+    let lower = u.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return true;
+    }
+    // same-app relative path (starts with / but not //, which is protocol-relative)
+    u.starts_with('/') && !u.starts_with("//")
 }

@@ -84,9 +84,16 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 fn unauthorized(msg: &str) -> Response {
+    // Same four-key shape as the ADR-0018 envelope (code/error/status/message)
+    // so SDK/i18n clients can key on `code` for auth failures too.
     (
         StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "error": "unauthorized", "message": msg })),
+        Json(serde_json::json!({
+            "code": "mda.unauthorized",
+            "error": "unauthorized",
+            "status": 401,
+            "message": msg,
+        })),
     )
         .into_response()
 }
@@ -220,6 +227,9 @@ async fn verify_login(
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     let Some((user_id, _, hash)) = row else {
+        // Unknown user: still burn the Argon2 work against a fixed dummy hash —
+        // returning early would leak account existence through response time.
+        let _ = verify_password(password, dummy_hash());
         return Ok(None);
     };
     if !verify_password(password, &hash) {
@@ -228,26 +238,44 @@ async fn verify_login(
     Ok(Some(user_id))
 }
 
-/// Best-effort client IP for throttling. Prefers the left-most `X-Forwarded-For`
-/// (set by a trusted edge proxy), then `X-Real-IP`, then the TCP peer. Behind a
-/// load balancer the peer is the proxy, so the headers are authoritative; deploy
-/// behind a proxy that sets them and strips spoofed client values.
+/// A fixed Argon2 hash with the platform's default parameters, computed once —
+/// verifying against it equalizes the unknown-user login path's timing with the
+/// bad-password path (no account-existence side channel).
+fn dummy_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| hash_password("mda-timing-equalizer").expect("hash dummy password"))
+}
+
+/// Best-effort client IP for throttling. Forwarding headers (`X-Forwarded-For`,
+/// `X-Real-IP`) are honored only when the operator opted in with
+/// `MDA_TRUST_PROXY=1` — otherwise they are client-spoofable and would defeat
+/// the per-IP lockout. Without the opt-in (or with no headers), the TCP peer is
+/// used.
 fn client_ip(
     headers: &HeaderMap,
     conn: Option<&ConnectInfo<std::net::SocketAddr>>,
 ) -> Option<String> {
-    let from_header = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                let ip = s.split(',').next().unwrap_or("").trim();
-                (!ip.is_empty()).then(|| ip.to_string())
-            })
-    };
-    from_header("x-forwarded-for")
-        .or_else(|| from_header("x-real-ip"))
-        .or_else(|| conn.map(|c| c.0.ip().to_string()))
+    static TRUST_PROXY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let trust_proxy = *TRUST_PROXY.get_or_init(|| {
+        std::env::var("MDA_TRUST_PROXY")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    });
+    if trust_proxy {
+        let from_header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| {
+                    let ip = s.split(',').next().unwrap_or("").trim();
+                    (!ip.is_empty()).then(|| ip.to_string())
+                })
+        };
+        if let Some(ip) = from_header("x-forwarded-for").or_else(|| from_header("x-real-ip")) {
+            return Some(ip);
+        }
+    }
+    conn.map(|c| c.0.ip().to_string())
 }
 
 #[derive(Deserialize)]

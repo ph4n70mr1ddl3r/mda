@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-const MAX_PAGE_SIZE: u64 = 200;
+pub const MAX_PAGE_SIZE: u64 = 200;
 const DEFAULT_PAGE_SIZE: u64 = 50;
 
 /// Set the per-transaction tenant context used by the `biz.*` RLS policies
@@ -129,7 +129,7 @@ pub fn read_predicate(s: &RecordScope) -> Option<String> {
         " OR EXISTS (\
            WITH RECURSIVE descendant_teams(tid) AS (\
                 SELECT ${t} \
-                UNION ALL \
+                UNION \
                 SELECT child.id FROM sec.sec_team child \
                   JOIN descendant_teams d ON child.parent_id = d.tid) \
            SELECT 1 FROM sec.sec_user u2 \
@@ -557,7 +557,9 @@ pub async fn list(
     scope: &RecordScope,
 ) -> Result<ListResult> {
     ensure_active(def)?;
-    let page = params.page.max(1);
+    // Cap the page number: an unbounded u64 page overflows (page-1)*page_size
+    // (debug panic / release wrap) and a huge OFFSET makes Postgres grind.
+    let page = params.page.clamp(1, 1_000_000);
     let page_size = if params.page_size == 0 {
         DEFAULT_PAGE_SIZE
     } else {
@@ -688,10 +690,26 @@ fn build_list_where(
             "like" => "ILIKE",
             other => return Err(Error::Invalid(format!("unsupported filter op {other}"))),
         };
+        // Ordered comparison on a scalar field casts to numeric — allowed only
+        // for numeric-typed fields: casting a non-numeric text value raises a
+        // Postgres error (a user-triggerable 500 from ?filter=name:gt:1).
+        let numeric_typed = def.fields.iter().any(|d| {
+            d.name == f.field
+                && matches!(
+                    d.field_type.as_str(),
+                    "integer" | "auto_number" | "decimal" | "money"
+                )
+        });
         let (lhs, rhs_cast) = if fk.contains(f.field.as_str()) {
             (f.field.clone(), "::uuid")
         } else if scalar.contains(f.field.as_str()) {
             if matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte") {
+                if !numeric_typed {
+                    return Err(Error::Invalid(format!(
+                        "ordered comparison needs a numeric field ({} is not)",
+                        f.field
+                    )));
+                }
                 (format!("(attributes->>'{}')", f.field), "::numeric")
             } else {
                 (format!("(attributes->>'{}')", f.field), "")
@@ -880,11 +898,16 @@ fn uuid_or_null(v: Option<&Value>, field: &str) -> Result<Option<Uuid>> {
 // with a higher `version` (so any stale client hits a clean 409, §5.9) and
 // created_at preserved. Single-record scope here; batch/cascade restore (one
 // click for a whole cascade tree) is the full ADR-0015 design and a follow-up.
+//
+// The caller's `scope` write predicate is applied to the *archive* row: without
+// it, anyone with the entity `create` verb could resurrect (and read) records
+// they could never write — e.g. private-OWD records owned by others.
 pub async fn restore(
     pool: &PgPool,
     tenant: Uuid,
     def: &EntityDefinition,
     id: Uuid,
+    scope: &RecordScope,
 ) -> Result<Value> {
     ensure_active(def)?;
     // core + attributes + FK columns (same set as create; generated columns are
@@ -896,12 +919,22 @@ pub async fn restore(
         .map(|r| r.source_field_name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    // The write predicate references the row as alias `t`; the archive SELECT
+    // aliases it `a` — rewrite the row references (the predicate's only `t.`
+    // occurrences are row-column references; module-internal format).
+    let mut scope_binds: Vec<Uuid> = Vec::new();
+    let mut scope_sql = String::new();
+    if let Some(p) = write_predicate(scope) {
+        let (frag, binds) = pred_render(&p, scope, 3);
+        scope_sql = format!(" AND {}", frag.replace("t.", "a."));
+        scope_binds = binds;
+    }
     let sql = format!(
         "INSERT INTO biz.{table} AS t \
             (id, tenant_id, owner_id, state, version, created_at, updated_at, attributes{fk_head}) \
          SELECT id, tenant_id, owner_id, state, version + 1, created_at, now(), attributes{fk_head} \
          FROM biz_archive.{table} a \
-         WHERE a.id = $1 AND a.tenant_id = $2 \
+         WHERE a.id = $1 AND a.tenant_id = $2 {scope_sql} \
          ORDER BY a.archived_at DESC \
          LIMIT 1 \
          RETURNING to_jsonb(t.*) AS doc",
@@ -913,12 +946,11 @@ pub async fn restore(
     );
     let mut tx = pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, tenant).await?;
-    let row: Option<(Value,)> = sqlx::query_as(&sql)
-        .bind(id)
-        .bind(tenant)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(Error::internal)?;
+    let mut q = sqlx::query_as::<_, (Value,)>(&sql).bind(id).bind(tenant);
+    for b in scope_binds {
+        q = q.bind(b);
+    }
+    let row: Option<(Value,)> = q.fetch_optional(&mut *tx).await.map_err(Error::internal)?;
     if let Some((doc,)) = &row {
         // Restoring a record re-materializes its rule-derived visibility
         // (ADR-0013) — the archived row's shares were dropped at delete time.

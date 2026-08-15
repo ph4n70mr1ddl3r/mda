@@ -9,7 +9,9 @@ use uuid::Uuid;
 const TENANT: Uuid = Uuid::nil();
 
 /// Ensure a bootstrap admin (`admin@mda.local`) with a superuser role exists.
-/// Password from `MDA_BOOTSTRAP_PASSWORD` (default `admin123`).
+/// Password from `MDA_BOOTSTRAP_PASSWORD` — required (≥ 12 chars) in release
+/// builds; debug builds fall back to the documented `admin123` dev default,
+/// like `MDA_JWT_SECRET`.
 ///
 /// Runs under the bootstrap tenant's GUC because `sec_user` is RLS-gated: in
 /// production the owner role is a superuser (bypasses RLS anyway), but in dev it
@@ -28,8 +30,32 @@ pub async fn ensure_admin(pool: &PgPool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let password =
-        std::env::var("MDA_BOOTSTRAP_PASSWORD").unwrap_or_else(|_| "admin123".to_string());
+    let password = match std::env::var("MDA_BOOTSTRAP_PASSWORD") {
+        Ok(p) if p.len() >= 12 => p,
+        Ok(_) => {
+            let msg = "MDA_BOOTSTRAP_PASSWORD is too short (need ≥ 12 chars)";
+            if cfg!(debug_assertions) {
+                tracing::warn!("{msg} — using insecure dev default");
+                "admin123".to_string()
+            } else {
+                panic!("{msg}");
+            }
+        }
+        Err(_) => {
+            if cfg!(debug_assertions) {
+                tracing::warn!(
+                    "MDA_BOOTSTRAP_PASSWORD unset — using insecure dev default 'admin123' \
+                     (set it before deploying!)"
+                );
+                "admin123".to_string()
+            } else {
+                panic!(
+                    "MDA_BOOTSTRAP_PASSWORD is required in release mode \
+                     (the bootstrap admin is a superuser; never ship a known password)"
+                );
+            }
+        }
+    };
     let hash = mda_security::hash_password(&password)?;
 
     let (team_id,): (Uuid,) = sqlx::query_as(

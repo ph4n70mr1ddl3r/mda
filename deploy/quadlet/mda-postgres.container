@@ -2,6 +2,8 @@
 Image=docker.io/library/postgres:16
 ContainerName=mda-postgres
 Environment=POSTGRES_USER=mda
+# Change this for anything beyond a local single-host install: the superuser
+# password protects the whole cluster (the app itself connects as mda_app).
 Environment=POSTGRES_PASSWORD=mda
 Environment=POSTGRES_DB=mda
 # Reference the Quadlet volume by file basename.

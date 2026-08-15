@@ -18,6 +18,6 @@ pub mod sharing;
 
 pub use crud::{
     create, delete, list, mass_target_ids, pred_render, read, read_predicate, reconstruct, restore,
-    update, write_predicate, Filter, ListParams, ListResult, RecordScope, Sort,
+    update, write_predicate, Filter, ListParams, ListResult, RecordScope, Sort, MAX_PAGE_SIZE,
 };
 pub use sharing::{bump_epoch, drop_record_shares, load_rules, recompute_record, ShareRule};

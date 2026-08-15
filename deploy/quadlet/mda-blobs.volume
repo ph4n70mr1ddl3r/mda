@@ -1,0 +1,4 @@
+[Volume]
+# Local blob storage (§5.14 attachments) for mda-app. Owned by UID 1000
+# (the image's runtime user); create it once after first start with:
+#   podman unshare chown -R 1000:1000 $$(podman volume inspect mda-blobs --format '{{.Mountpoint}}')

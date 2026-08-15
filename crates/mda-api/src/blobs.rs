@@ -49,12 +49,29 @@ pub struct LocalBlobStore(std::sync::Arc<PathBuf>);
 
 impl LocalBlobStore {
     /// Create a local-FS store rooted at the directory given by
-    /// `MDA_BLOB_DIR` (default `/tmp/mda-blobs`). The directory is created
-    /// if it doesn't exist.
+    /// `MDA_BLOB_DIR` (dev default `/tmp/mda-blobs`; required in release — a
+    /// predictable shared-world-writable path is not acceptable for stored
+    /// business attachments). The directory is created 0700 if absent.
     pub fn from_env() -> Self {
-        let dir = std::env::var("MDA_BLOB_DIR").unwrap_or_else(|_| "/tmp/mda-blobs".to_string());
+        let dir = match std::env::var("MDA_BLOB_DIR") {
+            Ok(d) if !d.trim().is_empty() => d,
+            _ => {
+                if cfg!(debug_assertions) {
+                    "/tmp/mda-blobs".to_string()
+                } else {
+                    panic!("MDA_BLOB_DIR is required in release mode (local blob storage root)")
+                }
+            }
+        };
         let p = PathBuf::from(dir);
-        let _ = std::fs::create_dir_all(&p);
+        if let Err(e) = std::fs::create_dir_all(&p) {
+            tracing::warn!(?e, dir = %p.display(), "blob dir create failed");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+        }
         Self(std::sync::Arc::new(p))
     }
 }
@@ -109,7 +126,16 @@ async fn upload_attachment(
     // Dedup lookup + insert in one txn so two concurrent same-bytes uploads
     // can’t both miss the cache (at worst both write the file; dedup still
     // holds afterwards). sys_blob is app-layer tenant-filtered (no RLS).
+    // The advisory lock (keyed on the checksum) serializes this dedup against
+    // the delete path's refcount-0 cleanup: without it, a concurrent upload +
+    // delete of the same bytes can commit a metadata row whose file was just
+    // unlinked (every later download 404s).
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&checksum)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT storage_key FROM sys_blob WHERE tenant_id = $1 AND checksum = $2 AND storage = 'local' LIMIT 1")
             .bind(user.tenant_id)
@@ -213,18 +239,27 @@ async fn delete_attachment(
     // Load + authorize + delete + refcount in one txn (consistent view of who
     // else shares the storage_key). sys_blob is app-layer tenant-filtered.
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
-    let row: Option<(String, Option<Uuid>)> = sqlx::query_as(
-        "SELECT storage_key, owner_id FROM sys_blob WHERE id = $1 AND tenant_id = $2",
+    let row: Option<(String, Option<Uuid>, String)> = sqlx::query_as(
+        "SELECT storage_key, owner_id, checksum FROM sys_blob WHERE id = $1 AND tenant_id = $2",
     )
     .bind(id)
     .bind(user.tenant_id)
     .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
-    let (storage_key, owner_id) = row.ok_or_else(|| Error::NotFound(format!("blob {id}")))?;
+    let (storage_key, owner_id, checksum) =
+        row.ok_or_else(|| Error::NotFound(format!("blob {id}")))?;
     if !(user.is_superuser || owner_id == Some(user.user_id)) {
         return Err(Error::Forbidden("not the blob owner".into()).into());
     }
+    // Same checksum-keyed advisory lock as the upload path: a concurrent
+    // same-bytes upload's dedup must not reuse bytes this txn is about to
+    // reclaim as unreferenced.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(&checksum)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
     sqlx::query("DELETE FROM sys_blob WHERE id = $1 AND tenant_id = $2")
         .bind(id)
         .bind(user.tenant_id)

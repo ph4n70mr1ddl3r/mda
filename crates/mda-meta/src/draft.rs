@@ -242,6 +242,19 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
         .chain(draft.entities.iter())
         .map(|e| e.id)
         .collect();
+    // Field/relationship additions are identified by id, not by their entity:
+    // a new field on an *existing* entity is an addition too (and reaches the
+    // same DDL + runtime SQL interpolation), so it must pass the same gate.
+    let active_field_ids: HashSet<Uuid> = active
+        .entities
+        .iter()
+        .flat_map(|e| e.fields.iter().map(|f| f.id))
+        .collect();
+    let active_rel_ids: HashSet<Uuid> = active
+        .entities
+        .iter()
+        .flat_map(|e| e.relationships.iter().map(|r| r.id))
+        .collect();
 
     // new modules
     for m in &draft.modules {
@@ -263,39 +276,56 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
                 .push(format!("duplicate module name {}", m.name));
         }
     }
-    // new entities (+ their fields/relationships)
+    // new entities (entity-level checks) + all field/relationship additions
+    // (on new *and* existing entities — ids already active are "unchanged",
+    // verified in section 1 above).
     for e in &draft.entities {
-        if active_ents.contains_key(&e.id) {
-            continue;
-        }
-        report.additions.entities += 1;
-        if e.name.trim().is_empty() {
-            report.errors.push("a new entity has an empty name".into());
-        }
-        if e.table_name.trim().is_empty() {
-            report
-                .errors
-                .push(format!("entity {} has an empty table_name", e.name));
-        } else if !is_valid_table_name(&e.table_name) {
-            report.errors.push(format!(
-                "entity {} has an invalid table_name `{}`",
-                e.name, e.table_name
-            ));
-        }
-        if !ent_names.insert(e.name.as_str()) {
-            report
-                .errors
-                .push(format!("duplicate entity name {}", e.name));
-        }
-        if !table_names.insert(e.table_name.as_str()) {
-            report
-                .errors
-                .push(format!("duplicate table_name {}", e.table_name));
+        let active_ent = active_ents.get(&e.id);
+        if active_ent.is_none() {
+            report.additions.entities += 1;
+            if e.name.trim().is_empty() {
+                report.errors.push("a new entity has an empty name".into());
+            }
+            if e.table_name.trim().is_empty() {
+                report
+                    .errors
+                    .push(format!("entity {} has an empty table_name", e.name));
+            } else if !is_valid_table_name(&e.table_name) {
+                report.errors.push(format!(
+                    "entity {} has an invalid table_name `{}`",
+                    e.name, e.table_name
+                ));
+            }
+            if !ent_names.insert(e.name.as_str()) {
+                report
+                    .errors
+                    .push(format!("duplicate entity name {}", e.name));
+            }
+            if !table_names.insert(e.table_name.as_str()) {
+                report
+                    .errors
+                    .push(format!("duplicate table_name {}", e.table_name));
+            }
         }
 
-        let mut field_names: HashSet<&str> = HashSet::new();
-        let mut rel_names: HashSet<&str> = HashSet::new();
+        // Name-uniqueness within the entity is checked against the active
+        // entity's names too — a new field shadowing an active one (different
+        // id, same name) would collide with the hoisted column / attribute key.
+        let mut field_names: HashSet<&str> = active_ent
+            .map(|a| a.fields.iter().map(|f| f.name.as_str()).collect())
+            .unwrap_or_default();
+        let mut rel_names: HashSet<&str> = active_ent
+            .map(|a| {
+                a.relationships
+                    .iter()
+                    .map(|r| r.source_field_name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
         for f in &e.fields {
+            if active_field_ids.contains(&f.id) {
+                continue;
+            }
             report.additions.fields += 1;
             if !known.contains(f.field_type.as_str()) {
                 report.errors.push(format!(
@@ -320,6 +350,9 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
             }
         }
         for r in &e.relationships {
+            if active_rel_ids.contains(&r.id) {
+                continue;
+            }
             report.additions.relationships += 1;
             if !is_valid_identifier(&r.source_field_name) {
                 report.errors.push(format!(
@@ -471,8 +504,9 @@ fn is_valid_table_name(name: &str) -> bool {
 /// lowercase `[a-z][a-z0-9_]*`, ≤ 63 chars (PG `NAMEDATALEN-1`), and neither a
 /// SQL reserved word nor one of MDA's reserved core column names. This single
 /// gate is what lets us interpolate entity/field/relationship names into the
-/// generated `biz.*` SQL (PLAN §5.16 — metadata is untrusted).
-fn is_valid_identifier(name: &str) -> bool {
+/// generated `biz.*` SQL (PLAN §5.16 — metadata is untrusted). Re-used by the
+/// DDL layer as a defense-in-depth assert before interpolation.
+pub fn is_valid_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
         && name
@@ -709,6 +743,140 @@ mod tests {
         let r = diff(&DraftModel::empty(), &draft);
         assert!(!r.valid);
         assert!(r.errors.iter().any(|m| m.contains("invalid name")));
+    }
+
+    // Regression (Phase-11 review): a NEW field on an EXISTING entity used to
+    // skip the identifier gate entirely (diff only validated fields of brand-new
+    // entities) — a malicious name reached the DDL and runtime SQL interpolation.
+    #[test]
+    fn rejects_invalid_field_name_on_existing_entity() {
+        let mut active = DraftModel::empty();
+        let mut a = ent(1, "Customer");
+        a.fields.push(DraftField {
+            id: Uuid::from_u128(11),
+            name: "name".into(),
+            label: None,
+            field_type: "string".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        active.entities.push(a);
+
+        let mut draft = active.clone();
+        draft.entities[0].fields.push(DraftField {
+            id: Uuid::from_u128(12), // new id → an addition on an existing entity
+            name: "x' || (SELECT password FROM sec.sec_user) || 'y".into(),
+            label: None,
+            field_type: "string".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: true, // forces a hoisted generated column (DDL sink)
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        let r = diff(&active, &draft);
+        assert!(
+            !r.valid,
+            "malicious field on existing entity must be rejected"
+        );
+        assert!(r.errors.iter().any(|m| m.contains("invalid name")));
+        // the same bug class for relationships
+        let mut draft2 = active.clone();
+        draft2.entities[0].relationships.push(DraftRelationship {
+            id: Uuid::from_u128(13),
+            source_field_name: "evil col; --".into(),
+            target_entity_id: Uuid::from_u128(1),
+            cardinality: "many_to_one".into(),
+            strength: "lookup".into(),
+            on_delete: None,
+            required: false,
+            reference_qualifier: None,
+            rollup_summary: None,
+        });
+        let r2 = diff(&active, &draft2);
+        assert!(
+            !r2.valid,
+            "malicious relationship on existing entity must be rejected"
+        );
+        assert!(r2
+            .errors
+            .iter()
+            .any(|m| m.contains("not a valid SQL identifier")));
+    }
+
+    // Regression (Phase-11 review): a new field whose NAME collides with an
+    // active field on the same entity (different id) would collide with the
+    // hoisted column / attribute key at publish time.
+    #[test]
+    fn rejects_new_field_shadowing_active_field_name() {
+        let mut active = DraftModel::empty();
+        let mut a = ent(1, "Customer");
+        a.fields.push(DraftField {
+            id: Uuid::from_u128(11),
+            name: "name".into(),
+            label: None,
+            field_type: "string".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        active.entities.push(a);
+
+        let mut draft = active.clone();
+        draft.entities[0].fields.push(DraftField {
+            id: Uuid::from_u128(12),
+            name: "name".into(), // duplicate of the active field's name
+            label: None,
+            field_type: "text".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        let r = diff(&active, &draft);
+        assert!(!r.valid);
+        assert!(r.errors.iter().any(|m| m.contains("duplicate field name")));
+    }
+
+    // A well-formed new field on an existing entity IS a valid addition.
+    #[test]
+    fn accepts_valid_field_on_existing_entity() {
+        let mut active = DraftModel::empty();
+        let mut a = ent(1, "Customer");
+        a.fields.push(DraftField {
+            id: Uuid::from_u128(11),
+            name: "name".into(),
+            label: None,
+            field_type: "string".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        active.entities.push(a);
+
+        let mut draft = active.clone();
+        draft.entities[0].fields.push(DraftField {
+            id: Uuid::from_u128(12),
+            name: "tier".into(),
+            label: None,
+            field_type: "string".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        let r = diff(&active, &draft);
+        assert!(r.valid, "{:?}", r.errors);
+        assert_eq!(r.additions.fields, 1);
     }
 
     #[test]

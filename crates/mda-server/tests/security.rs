@@ -23,6 +23,8 @@ mod common;
 struct Ctx {
     app: axum::Router,
     token: String,
+    pool: sqlx::PgPool,
+    tenant: Uuid,
 }
 
 fn customer_model(table: &str) -> Value {
@@ -43,8 +45,11 @@ fn customer_model_field(table: &str, field: &str) -> Value {
     })
 }
 
-async fn setup() -> Option<Ctx> {
-    let url = std::env::var("DATABASE_URL").ok()?;
+async fn setup() -> Ctx {
+    // Panic (not silently pass) when the DB is unreachable — a vacuous
+    // security suite is worse than a failed one.
+    let url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for the security suite");
     let (pool, _db) = common::spawn_db(&url).await;
     let tenant = Uuid::nil();
     let role_id = common::seed_role(&pool, tenant, "admin", &[("*", "*")]).await;
@@ -59,7 +64,7 @@ async fn setup() -> Option<Ctx> {
     let secrets: Arc<dyn mda_core::SecretStore> =
         Arc::new(mda_api::secrets::LocalSecretStore::from_env());
     let app = mda_api::router(AppState {
-        pool,
+        pool: pool.clone(),
         cache: MetadataCache::new(),
         jwt,
         blobs,
@@ -68,7 +73,12 @@ async fn setup() -> Option<Ctx> {
         login_throttle: mda_security::LoginThrottle::default(),
         gql: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
-    Some(Ctx { app, token })
+    Ctx {
+        app,
+        token,
+        pool,
+        tenant,
+    }
 }
 
 async fn call(app: &axum::Router, method: &str, uri: &str, token: &str) -> (StatusCode, Value) {
@@ -103,7 +113,7 @@ async fn call_body(
 }
 
 async fn setup_with_customer() -> Option<Ctx> {
-    let ctx = setup().await?;
+    let ctx = setup().await;
     // publish a Customer entity through the Studio flow
     let (_, d) = call_body(
         &ctx.app,
@@ -154,9 +164,7 @@ async fn setup_with_customer() -> Option<Ctx> {
 /// ever be *values* — assertions: no 5xx, and the filter never widens results.
 #[tokio::test]
 async fn sql_injection_payloads_in_filters_and_paths() {
-    let Some(ctx) = setup_with_customer().await else {
-        return;
-    };
+    let ctx = setup_with_customer().await.expect("setup_with_customer");
 
     let payloads = [
         "' OR '1'='1",
@@ -176,7 +184,7 @@ async fn sql_injection_payloads_in_filters_and_paths() {
             "payload {p:?} → {st} (must be 2xx/422)"
         );
         if st.is_success() {
-            let total = v["total"].as_u64().unwrap_or(0);
+            let total = v["total"].as_u64().expect("list response carries total");
             assert_eq!(total, 0, "payload {p:?} must not widen results");
         }
     }
@@ -222,9 +230,7 @@ fn urlenc(s: &str) -> String {
 /// the gate runs at validate/publish time, so those must refuse it.
 #[tokio::test]
 async fn malicious_identifiers_rejected_at_publish() {
-    let Some(ctx) = setup().await else {
-        return;
-    };
+    let ctx = setup().await;
     for bad in [
         "customer; DROP TABLE meta.md_entity",
         "customer--",
@@ -260,8 +266,10 @@ async fn malicious_identifiers_rejected_at_publish() {
             ))
             .unwrap();
         let resp = ctx.app.clone().oneshot(req).await.unwrap();
+        // The PUT itself only stores the draft — the gate is validate/publish
+        // below. What must hold here: never a 5xx.
         assert!(
-            resp.status().is_success() || resp.status().is_client_error(),
+            !resp.status().is_server_error(),
             "PUT with identifier {bad:?} → {}",
             resp.status()
         );
@@ -296,9 +304,7 @@ async fn malicious_identifiers_rejected_at_publish() {
 /// Tampered / forged tokens never authenticate.
 #[tokio::test]
 async fn tampered_jwt_rejected() {
-    let Some(ctx) = setup_with_customer().await else {
-        return;
-    };
+    let ctx = setup_with_customer().await.expect("setup_with_customer");
     // garbage
     let (st, _) = call(&ctx.app, "GET", "/api/data/Customer", "not.a.token").await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
@@ -317,9 +323,7 @@ async fn tampered_jwt_rejected() {
 /// platform envelope (never reflected HTML → no XSS surface).
 #[tokio::test]
 async fn malformed_input_and_error_content_type() {
-    let Some(ctx) = setup_with_customer().await else {
-        return;
-    };
+    let ctx = setup_with_customer().await.expect("setup_with_customer");
     let req = Request::builder()
         .method("POST")
         .uri("/api/data/Customer")
@@ -401,4 +405,105 @@ async fn oversized_body_rejected() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let _ = token;
+}
+
+/// Operator surfaces (secrets / webhooks / connectors / flows / schedules) are
+/// admin-only: a plain authenticated user with zero granted permissions gets
+/// 403, not the management surface (Phase-11 review regression).
+#[tokio::test]
+async fn operator_surfaces_require_admin() {
+    let ctx = setup().await;
+    // seed a permission-less user in the same tenant
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("plain{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(&ctx.pool, ctx.tenant, &email, "plain", &hash).await;
+    let jwt = JwtConfig::from_env();
+    let plain = jwt.issue_access(uid, ctx.tenant, None).unwrap();
+
+    // (method, uri, minimal VALID body — extractors run before the handler,
+    // so a body that fails to parse would 415/422 before the gate is reached)
+    let cases: [(&str, &str, Option<String>); 10] = [
+        ("GET", "/api/secrets", None),
+        (
+            "POST",
+            "/api/secrets",
+            Some(json!({"name":"x","ref":"y"}).to_string()),
+        ),
+        ("GET", "/api/webhooks", None),
+        (
+            "POST",
+            "/api/webhooks",
+            Some(json!({"name":"x","url":"http://127.0.0.1:9/h","secret_ref":"s"}).to_string()),
+        ),
+        ("GET", "/api/connectors", None),
+        (
+            "POST",
+            "/api/connectors",
+            Some(json!({"name":"x","base_url":"http://127.0.0.1:9/"}).to_string()),
+        ),
+        ("GET", "/api/flows", None),
+        (
+            "POST",
+            "/api/flows",
+            Some(json!({"name":"x","direction":"inbound","entity":"Customer"}).to_string()),
+        ),
+        ("GET", "/api/schedules", None),
+        (
+            "POST",
+            "/api/schedules",
+            Some(
+                json!({"name":"x","kind":"custom","target_id":Uuid::nil(),"cron":"0 * * * * *"})
+                    .to_string(),
+            ),
+        ),
+    ];
+    for (method, uri, body) in cases {
+        let (st, v) = call_body(&ctx.app, method, uri, &plain, body).await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must be admin-only: {v}"
+        );
+    }
+    // cross-check: the admin token is NOT forbidden on the read surfaces
+    let (st, _) = call(&ctx.app, "GET", "/api/secrets", &ctx.token).await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+/// Ordered comparison filters on non-numeric fields are rejected as 422 — the
+/// old `::numeric` cast turned non-numeric data into a user-triggerable 500.
+#[tokio::test]
+async fn numeric_filter_on_text_field_is_rejected_not_500() {
+    let ctx = setup_with_customer().await.expect("setup_with_customer");
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=name:gt:1",
+        &ctx.token,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "gt on a text field must be a 422, never a 500"
+    );
+}
+
+/// The 401 envelope carries the ADR-0018 four-key shape (code/error/status/
+/// message) so SDK clients can branch on `code` for auth failures too.
+#[tokio::test]
+async fn unauthorized_envelope_shape() {
+    let ctx = setup().await;
+    let req = Request::builder()
+        .uri("/api/data/Customer")
+        .body(Body::empty())
+        .unwrap();
+    let resp = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["code"], "mda.unauthorized");
+    assert_eq!(v["error"], "unauthorized");
+    assert_eq!(v["status"], 401);
+    assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()));
 }

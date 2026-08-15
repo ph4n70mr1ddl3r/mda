@@ -21,7 +21,6 @@ pub mod data;
 pub mod edge;
 pub mod error;
 pub mod events;
-pub mod extract;
 pub mod graphql;
 pub mod history;
 pub mod i18n;

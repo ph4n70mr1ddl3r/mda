@@ -62,6 +62,7 @@ QUADLET_DIR ?= /etc/containers/systemd
 quadlet-install:
 	sudo mkdir -p $(QUADLET_DIR) /etc/mda
 	sudo cp deploy/quadlet/mda.network deploy/quadlet/mda-postgres.volume \
+	     deploy/quadlet/mda-blobs.volume \
 	     deploy/quadlet/mda-*.container $(QUADLET_DIR)/
 	sudo cp deploy/quadlet/mda-app.env.example /etc/mda/mda-app.env
 	@echo "edit /etc/mda/mda-app.env (MDA_APP_DATABASE_URL, MDA_JWT_SECRET), then:"

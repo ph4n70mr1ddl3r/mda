@@ -116,6 +116,7 @@ async fn list_schedules(
     AuthUser(user): AuthUser,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<ScheduleRow>>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, user.tenant_id).await?;
     let rows = match q.kind.as_deref() {
@@ -145,14 +146,19 @@ async fn get_schedule(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<ScheduleRow>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, user.tenant_id).await?;
-    let row: ScheduleRow = sqlx::query_as("SELECT * FROM sys_schedule WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(|| Error::NotFound(format!("schedule {id}")))?;
+    // sys_schedule intentionally carries no RLS (migration 20260126), so the
+    // GUC above is inert on it — the tenant predicate must be explicit.
+    let row: ScheduleRow =
+        sqlx::query_as("SELECT * FROM sys_schedule WHERE id = $1 AND tenant_id = $2")
+            .bind(id)
+            .bind(user.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(|| Error::NotFound(format!("schedule {id}")))?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(Json(row))
 }
@@ -163,6 +169,7 @@ async fn create_schedule(
     AuthUser(user): AuthUser,
     Json(body): Json<CreateSchedule>,
 ) -> ApiResult<(StatusCode, Json<ScheduleRow>)> {
+    crate::admin::require_admin(&user)?;
     validate_kind(&body.kind)?;
     let cron = parse_cron(&body.cron)?;
     let running_user = body.running_user_id.unwrap_or(user.user_id);
@@ -203,15 +210,19 @@ async fn update_schedule(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateSchedule>,
 ) -> ApiResult<Json<ScheduleRow>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, user.tenant_id).await?;
-    // Fetch under the tenant GUC so a wrong-tenant id is a 404.
-    let existing: ScheduleRow = sqlx::query_as("SELECT * FROM sys_schedule WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(Error::internal)?
-        .ok_or_else(|| Error::NotFound(format!("schedule {id}")))?;
+    // Fetch scoped to the tenant (sys_schedule has no RLS — the explicit
+    // predicate is what makes a wrong-tenant id a 404).
+    let existing: ScheduleRow =
+        sqlx::query_as("SELECT * FROM sys_schedule WHERE id = $1 AND tenant_id = $2")
+            .bind(id)
+            .bind(user.tenant_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?
+            .ok_or_else(|| Error::NotFound(format!("schedule {id}")))?;
 
     let name = body.name.unwrap_or(existing.name);
     let cron_str = body.cron.clone().unwrap_or_else(|| existing.cron.clone());
@@ -260,6 +271,7 @@ async fn delete_schedule(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, user.tenant_id).await?;
     let n = sqlx::query("DELETE FROM sys_schedule WHERE id = $1 AND tenant_id = $2")
@@ -281,10 +293,11 @@ async fn delete_schedule(
 /// a run row. Returns the run result.
 async fn trigger_schedule(
     State(st): State<AppState>,
-    AuthUser(_user): AuthUser,
+    AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let sched = fetch_for_dispatch(&st.pool, id).await?;
+    crate::admin::require_admin(&user)?;
+    let sched = fetch_for_dispatch(&st.pool, user.tenant_id, id).await?;
     let res = dispatch(&st.pool, st.secrets.as_ref(), &sched).await;
     // A manual trigger records history too, so the run surface is the same
     // whether the job fired on cadence or by hand.
@@ -298,6 +311,7 @@ async fn list_runs(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, user.tenant_id).await?;
     let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
@@ -422,8 +436,10 @@ struct DispatchTarget {
     config: serde_json::Value,
 }
 
-/// Fetch a schedule by id for dispatch (used by the manual trigger).
-async fn fetch_for_dispatch(pool: &PgPool, id: Uuid) -> Result<DispatchTarget> {
+/// Fetch a schedule by id for dispatch (used by the manual trigger). Tenant-
+/// scoped explicitly: `sys_schedule` has no RLS, so an unscoped `WHERE id`
+/// would let any tenant fire (and read the outcome of) another tenant's job.
+async fn fetch_for_dispatch(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<DispatchTarget> {
     type DueTuple = (
         Uuid,
         Uuid,
@@ -435,9 +451,10 @@ async fn fetch_for_dispatch(pool: &PgPool, id: Uuid) -> Result<DispatchTarget> {
     );
     let row: Option<DueTuple> = sqlx::query_as(
         "SELECT id, tenant_id, name, target_id, running_user_id, kind, config
-               FROM sys_schedule WHERE id = $1",
+               FROM sys_schedule WHERE id = $1 AND tenant_id = $2",
     )
     .bind(id)
+    .bind(tenant)
     .fetch_optional(pool)
     .await
     .map_err(Error::internal)?;

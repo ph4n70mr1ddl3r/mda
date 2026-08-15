@@ -106,6 +106,132 @@ Fixes, in migration order:
 - **Graceful shutdown** on SIGTERM/Ctrl-C; body-size limit; request-id +
   access-log + metrics middleware.
 
+## Third pass (2026-08-15): full-code review — trust boundaries, egress, races
+
+A four-sweep review of every crate (API authz, data/core/meta, security/rules/
+workflow/integration/reports, server/deploy/UI). Findings and fixes, most
+severe first; regression tests were added with each class of fix.
+
+### Metadata validation bypass → SQL injection (high)
+
+`mda-meta`'s `diff()` validated field/relationship identifiers only for
+*brand-new entities*: a new field on an **existing** entity skipped
+`is_valid_identifier` entirely — the single gate (§5.16) that makes DDL and
+runtime SQL interpolation safe. A tenant superuser could publish a field named
+`x' || (SELECT …) || 'y` and get a blind-exfiltration primitive inside list
+filters / UPDATE SET (crossing tenant isolation on non-RLS tables).
+`diff()` now validates every draft artifact whose id is not already active,
+and name-uniqueness is checked against the active entity's names (a new field
+can no longer shadow an active one). Defense-in-depth: the DDL layer
+(`mda-data/ddl.rs`) refuses to interpolate any identifier that fails
+`is_valid_identifier` (now `pub`). Regression: `rejects_invalid_field_name_on_existing_entity`,
+`rejects_new_field_shadowing_active_field_name` (`mda-meta`).
+
+### Operator surfaces were unauthenticated-but-for-a-token (high)
+
+`/api/secrets`, `/api/webhooks`, `/api/connectors`+`/api/flows`(+`/run`),
+`/api/schedules` required only a *valid login* — no role check. Any tenant
+user could list secret refs, rotate/delete them, register webhooks for **all**
+tenant events (`event_types: []`), aim connectors anywhere, run flows under the
+system write scope, or fire another tenant's schedule (see IDOR below). All of
+these surfaces are now superuser-gated (`require_admin`, same trust root as
+`/api/admin`). Regression: `operator_surfaces_require_admin` (security suite).
+
+### SSRF via connector / webhook URLs (high)
+
+Connector `base_url` and webhook `url` accepted any string, fetched by clients
+with **no timeout** and redirect-following (custom auth headers survive
+cross-host redirects). Now: scheme+host validation and a private-address guard
+(RFC1918, loopback, link-local incl. cloud metadata, IPv6 ULA/link-local,
+checked against *every* resolved address) at registration **and** per request
+(`mda-integration::net`); 15 s total / 5 s connect timeouts; redirects not
+followed; fetched bodies capped at 10 MiB. On-prem internal targets are an
+explicit operator opt-in (`MDA_ALLOW_PRIVATE_EGRESS=1`).
+
+### Production bug: `flow_steps()` ran outside the tenant GUC (high)
+
+`int.flow_step` is FORCE-RLS; the loader queried the pool directly, so as
+`mda_app` it returned **nothing** — every transform/filter/value_map/debatch
+step silently skipped in production (tests passed: they run as the owner).
+Fixed to run under `set_tenant` like its siblings.
+
+### Cross-tenant IDOR on schedules (high)
+
+`sys_schedule` deliberately carries no RLS, and `GET /api/schedules/:id` +
+`trigger`'s lookup (and `PATCH`'s pre-read) selected by bare `id` — the tenant
+GUC is inert on that table. All three now carry an explicit `tenant_id`
+predicate; wrong-tenant ids are 404.
+
+### Other fixes
+
+- **`restore` bypassed record-level security** — entity `create` alone could
+  resurrect (and read) any archived tenant record. The caller's write-scope
+  predicate is now applied to the archive row (`mda-data::restore`).
+- **Bootstrap admin password** — release builds refuse to boot on the
+  documented dev default (`admin123`); `MDA_BOOTSTRAP_PASSWORD` (≥ 12 chars)
+  is required, like `MDA_JWT_SECRET`. Wired into compose + the quadlet env
+  example.
+- **Admin password reset now revokes the user's sessions** in the same
+  transaction (a forced reset is a compromise response).
+- **Login user-enumeration timing** — the unknown-user path burns the Argon2
+  work against a fixed dummy hash, matching the bad-password path's timing.
+- **`X-Forwarded-For` is trusted only under `MDA_TRUST_PROXY=1`** (else the
+  socket peer is used) — spoofed XFFs could rotate the per-IP lockout key.
+- **401s now carry the full ADR-0018 envelope** (`code`/`error`/`status`/
+  `message`) — `code: mda.unauthorized` is stable for SDKs. Regression:
+  `unauthorized_envelope_shape`.
+- **GraphQL error scrubbing** — `Error::Internal`'s Display (SQL/driver
+  detail) reached `errors[].message`; now "internal error" with the `code`
+  extension preserved (REST already scrubbed).
+- **Webhook replay** — `limit` is clamped (a negative limit meant *no* limit:
+  one call could re-enqueue the tenant's whole event log) and replay now
+  honors the subscription's `event_types`/`entity_filter` (same predicate as
+  the relay).
+- **Inbound webhook dedupe without `X-MDA-Event-Id`** — the dedupe key is now
+  derived from `(webhook, signature timestamp, body)`, so a replay that drops
+  the header is still caught inside the replay window.
+- **Export truncation** — `/api/impex/:entity/export` silently emitted ≤ 200
+  rows; it now pages through the filtered set (bounded by 100k rows).
+- **Manual share vs rule-derived share** — a manual share can no longer
+  overwrite a rule-derived row (which became unrevocable + silently reverted
+  on the next recompute); the collision surfaces as a 409 naming the rule.
+- **Team-hierarchy CTE** — `UNION ALL` → `UNION` (a `parent_id` cycle made the
+  recursive CTE spin forever; the reimport path links parents unchecked).
+- **Ordered filters on text fields** — `gt/gte/lt/lte` on non-numeric fields
+  are a 422 instead of a numeric-cast 500 on non-numeric data. Regression:
+  `numeric_filter_on_text_field_is_rejected_not_500`.
+- **Unbounded `page`** — clamped (u64::MAX overflowed the OFFSET math).
+- **Reports without a limit** — default + clamp to 10k rows (statement_timeout
+  bounded time, not rows).
+- **Workflow transitions** — the caller's read scope is checked before any
+  superuser read, so transition errors can't disclose unreadable records'
+  state.
+- **Audit rows survive event-log failures** — the audit insert commits even
+  when the event-log insert fails (the degraded path is counted + logged).
+- **Blob dedup race** — upload/delete of the same bytes now serialize on a
+  checksum-keyed advisory lock (a concurrent pair could commit a row whose
+  file was just unlinked). Release builds require `MDA_BLOB_DIR` (dev default
+  `/tmp/mda-blobs`, dir created 0700).
+- **Runtime UI nav links** — tenant-authored nav URLs are scheme-checked
+  (`http(s)`/same-app path); `javascript:` URLs render inert.
+- **Dead `TenantId` extractor removed** — it trusted `X-Tenant-Id` from any
+  client; unused, but a footgun for future handlers.
+
+### Deployment surface
+
+- Dockerfile runs as a non-root user (uid 1000) with a writable blob dir.
+- The quadlet app container gains `NoNewPrivileges`, `DropCapability=all`,
+  read-only rootfs + tmpfs `/tmp`, and a dedicated `mda-blobs.volume`.
+- `mda_app`'s role password is rotatable via `MDA_APP_DB_PASSWORD` (applied at
+  startup); compose parameterizes `POSTGRES_PASSWORD`/app-role credentials and
+  requires `MDA_BOOTSTRAP_PASSWORD`.
+- Migration `20260136000001` sets `tenant_id NOT NULL` on the role-keyed
+  `sec.*` tables (backfilled by `20260114`; a NULL would fail closed by
+  silently disappearing — now unrepresentable).
+- Security suite no longer *silently passes* without `DATABASE_URL` (panics
+  instead), asserts on response `total` (was `unwrap_or(0)` = vacuous), and
+  the draft-PUT check says what it means (not-5xx, not success-or-client-error).
+
 ## Verifying a deployment yourself
 
 ```bash

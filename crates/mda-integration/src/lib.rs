@@ -36,6 +36,8 @@ use serde_json::{Map, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub mod net;
+
 /// A typed integration adapter. Core ships the HTTP transport; extension
 /// transports (DB/file/MQ/GraphQL/SOAP, EDI/IDoc/AS2) are add-ons. Auth is
 /// resolved server-side from the [`SecretStore`] (§5.20) — values never leave the
@@ -74,8 +76,19 @@ impl HttpConnector {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             auth,
-            client: reqwest::Client::new(),
+            // Hardened egress: timeouts + no redirect following (redirects
+            // must never re-send the auth headers to a third party).
+            client: net::egress_client(),
         }
+    }
+
+    /// Build + validate the full request URL for one egress call (scheme,
+    /// host, and the private-address guard — resolved immediately before the
+    /// request to keep the TOCTOU window minimal).
+    async fn egress_url(&self, path: &str) -> Result<reqwest::Url> {
+        let url = net::parse_outbound_url(&format!("{}{path}", self.base_url))?;
+        net::assert_public_egress(&url).await?;
+        Ok(url)
     }
 
     /// Resolve the auth header(s) server-side from the secret store.
@@ -154,8 +167,8 @@ impl Connector for HttpConnector {
         secrets: &dyn SecretStore,
         tenant: Uuid,
     ) -> Result<Vec<Value>> {
-        let url = format!("{}{path}", self.base_url);
-        let mut req = self.client.get(&url);
+        let url = self.egress_url(path).await?;
+        let mut req = self.client.get(url.clone());
         for (k, v) in self.auth_headers(secrets, tenant)? {
             req = req.header(k, v);
         }
@@ -166,7 +179,9 @@ impl Connector for HttpConnector {
                 resp.status()
             )));
         }
-        let v: Value = resp.json().await.map_err(Error::internal)?;
+        let body = net::read_capped(resp).await?;
+        let v: Value = serde_json::from_slice(&body)
+            .map_err(|e| Error::internal(anyhow::anyhow!("fetch {url}: bad json: {e}")))?;
         Ok(match v {
             Value::Array(a) => a,
             other => vec![other],
@@ -180,8 +195,8 @@ impl Connector for HttpConnector {
         secrets: &dyn SecretStore,
         tenant: Uuid,
     ) -> Result<()> {
-        let url = format!("{}{path}", self.base_url);
-        let mut req = self.client.post(&url).json(body);
+        let url = self.egress_url(path).await?;
+        let mut req = self.client.post(url.clone()).json(body);
         for (k, v) in self.auth_headers(secrets, tenant)? {
             req = req.header(k, v);
         }
@@ -347,15 +362,22 @@ pub async fn connector_for(pool: &PgPool, tenant: Uuid, id: Uuid) -> Result<(Str
     row.ok_or_else(|| Error::NotFound(format!("connector {id}")))
 }
 
-/// Load a flow's ordered transform steps.
-pub async fn flow_steps(pool: &PgPool, flow_id: Uuid) -> Result<Vec<FlowStep>> {
+/// Load a flow's ordered transform steps. `int.flow_step` is RLS-gated, so the
+/// query MUST run under the tenant GUC — a pool-direct read (as this once was)
+/// silently returns nothing when the app connects as the non-superuser
+/// `mda_app` role, skipping every transform/filter step in production while
+/// tests (superuser owner pool) still passed.
+pub async fn flow_steps(pool: &PgPool, tenant: Uuid, flow_id: Uuid) -> Result<Vec<FlowStep>> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
     let rows: Vec<(i32, String, Value)> = sqlx::query_as(
         "SELECT seq, kind, config FROM int.flow_step WHERE flow_id = $1 ORDER BY seq",
     )
     .bind(flow_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(rows
         .into_iter()
         .map(|(seq, kind, config)| FlowStep { seq, kind, config })
@@ -664,7 +686,7 @@ pub async fn run_inbound(
     system_user: Uuid,
 ) -> Result<Uuid> {
     let owner = flow.running_user_id.unwrap_or(system_user);
-    let steps = flow_steps(pool, flow.id).await?;
+    let steps = flow_steps(pool, flow.tenant_id, flow.id).await?;
     let value_maps = load_value_maps(pool, flow.tenant_id, &steps).await?;
     let reg = Registry::new();
     process_one(pool, def, flow, external, owner, &steps, &value_maps, &reg)
@@ -683,7 +705,7 @@ pub async fn run_inbound_batch(
     system_user: Uuid,
 ) -> Result<Vec<Uuid>> {
     let owner = flow.running_user_id.unwrap_or(system_user);
-    let steps = flow_steps(pool, flow.id).await?;
+    let steps = flow_steps(pool, flow.tenant_id, flow.id).await?;
     let value_maps = load_value_maps(pool, flow.tenant_id, &steps).await?;
     let reg = Registry::new();
     let mut ids = Vec::new();
@@ -717,7 +739,7 @@ pub async fn fetch_and_run_inbound(
     let fetched = connector.fetch(path, secrets, flow.tenant_id).await?;
 
     let owner = flow.running_user_id.unwrap_or(system_user);
-    let steps = flow_steps(pool, flow.id).await?;
+    let steps = flow_steps(pool, flow.tenant_id, flow.id).await?;
     let value_maps = load_value_maps(pool, flow.tenant_id, &steps).await?;
     let reg = Registry::new();
     let mut ids = Vec::new();
@@ -802,7 +824,7 @@ pub async fn run_outbound(
     let path = flow.endpoint_path.as_deref().unwrap_or("/");
     // map the biz record → external payload (inverse mapping: biz_field → external).
     let payload = map_outbound(&flow.mapping, record);
-    let _steps = flow_steps(pool, flow.id).await?;
+    let _steps = flow_steps(pool, flow.tenant_id, flow.id).await?;
     connector
         .push(path, &payload, secrets, flow.tenant_id)
         .await?;

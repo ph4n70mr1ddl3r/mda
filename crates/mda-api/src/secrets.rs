@@ -150,6 +150,7 @@ async fn list_secrets(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> ApiResult<Json<Vec<SecretRef>>> {
+    crate::admin::require_admin(&user)?;
     let rows: Vec<(
         String,
         String,
@@ -180,6 +181,7 @@ async fn get_secret(
     AuthUser(user): AuthUser,
     Path(name): Path<String>,
 ) -> ApiResult<Json<SecretRef>> {
+    crate::admin::require_admin(&user)?;
     let row: Option<(
         String,
         String,
@@ -209,6 +211,7 @@ async fn create_secret(
     AuthUser(user): AuthUser,
     Json(body): Json<CreateSecret>,
 ) -> ApiResult<(StatusCode, Json<SecretRef>)> {
+    crate::admin::require_admin(&user)?;
     if body.name.trim().is_empty() || body.r#ref.trim().is_empty() {
         return Err(Error::Invalid("name and ref are required".into()).into());
     }
@@ -246,6 +249,7 @@ async fn delete_secret(
     AuthUser(user): AuthUser,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     let n = sqlx::query("DELETE FROM sys_secret WHERE tenant_id = $1 AND name = $2")
         .bind(user.tenant_id)
         .bind(&name)
@@ -272,6 +276,7 @@ async fn rotate_secret(
     Path(name): Path<String>,
     Json(body): Json<RotateBody>,
 ) -> ApiResult<Json<SecretRef>> {
+    crate::admin::require_admin(&user)?;
     let row: Option<(
         String,
         String,

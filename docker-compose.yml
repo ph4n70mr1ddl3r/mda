@@ -19,7 +19,8 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: mda
-      POSTGRES_PASSWORD: mda
+      # Dev default 'mda'; override for anything exposed beyond localhost.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mda}
       POSTGRES_DB: mda
     ports:
       - "5433:5432"
@@ -47,14 +48,19 @@ services:
       dockerfile: Dockerfile
     profiles: ["app"]
     environment:
-      DATABASE_URL: postgres://mda:mda@postgres:5432/mda
+      DATABASE_URL: postgres://mda:${POSTGRES_PASSWORD:-mda}@postgres:5432/mda
       # The app serves as the non-superuser mda_app role so biz.* RLS engages.
-      # The role + grants are created at startup by migrations/...rls.sql.
-      MDA_APP_DATABASE_URL: postgres://mda_app:mda@postgres:5432/mda
+      # The role + grants are created at startup by migrations/...rls.sql; the
+      # role password defaults to 'mda' — set MDA_APP_DB_PASSWORD to rotate it
+      # (applied at startup) and keep the URL in sync.
+      MDA_APP_DATABASE_URL: postgres://mda_app:${MDA_APP_DB_PASSWORD:-mda}@postgres:5432/mda
+      MDA_APP_DB_PASSWORD: ${MDA_APP_DB_PASSWORD:-mda}
       # The image is a release build, which refuses to boot without a real
       # secret (≥ 32 bytes). Compose fails fast with this message if unset:
       # generate one with `openssl rand -hex 32` (e.g. in a gitignored .env).
       MDA_JWT_SECRET: ${MDA_JWT_SECRET:?MDA_JWT_SECRET is required for the app image — set it in .env (openssl rand -hex 32)}
+      # Release builds refuse the known dev default bootstrap password.
+      MDA_BOOTSTRAP_PASSWORD: ${MDA_BOOTSTRAP_PASSWORD:?MDA_BOOTSTRAP_PASSWORD is required for the app image — set it in .env (≥ 12 chars)}
       REDIS_URL: redis://redis:6379
       MDA_HOST: 0.0.0.0
       MDA_PORT: 8080

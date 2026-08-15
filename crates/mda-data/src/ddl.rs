@@ -39,6 +39,20 @@ fn gen_expr(name: &str, sqltype: &str) -> String {
     format!("((attributes->>'{name}')::{sqltype})")
 }
 
+/// Defense-in-depth assert before identifier interpolation: metadata names are
+/// validated at draft/publish time (`mda_meta::draft::is_valid_identifier`, the
+/// single gate per §5.16), so reaching here with an unsafe name means that gate
+/// was bypassed — refuse to build the SQL rather than interpolate.
+fn guard_ident(kind: &str, name: &str) -> Result<()> {
+    if mda_meta::draft::is_valid_identifier(name) {
+        Ok(())
+    } else {
+        Err(Error::internal(anyhow::anyhow!(
+            "unsafe {kind} identifier `{name}` reached DDL generation (metadata validation gate bypassed)"
+        )))
+    }
+}
+
 fn on_delete_clause(on_delete: &Option<String>) -> &'static str {
     match on_delete.as_deref() {
         Some("set_null") => "SET NULL",
@@ -56,6 +70,13 @@ pub fn ensure_schema() -> Vec<String> {
 /// unique/indexed scalar fields + `attributes` JSONB + tenant index + field
 /// indexes. Reference (FK) columns are added separately by [`add_relationship`].
 pub fn create_table(table: &str, e: &DraftEntity) -> Result<Vec<String>> {
+    guard_ident("table", table)?;
+    for f in &e.fields {
+        guard_ident("field", &f.name)?;
+    }
+    for r in &e.relationships {
+        guard_ident("relationship", &r.source_field_name)?;
+    }
     let mut out = Vec::new();
     let mut cols: Vec<String> = vec![
         "id UUID PRIMARY KEY".into(),
@@ -148,6 +169,8 @@ fn rls_stmts(schema: &str, table: &str) -> Vec<String> {
 /// Add a new field to an existing biz table. Only unique/indexed fields need a
 /// generated column; plain scalars already live in `attributes`.
 pub fn add_field(table: &str, f: &DraftField) -> Result<Vec<String>> {
+    guard_ident("table", table)?;
+    guard_ident("field", &f.name)?;
     if !(f.is_unique || f.is_indexed) {
         return Ok(vec![]);
     }
@@ -184,6 +207,9 @@ pub fn add_relationship(
     r: &DraftRelationship,
     target_table: &str,
 ) -> Result<Vec<String>> {
+    guard_ident("table", table)?;
+    guard_ident("table", target_table)?;
+    guard_ident("relationship", &r.source_field_name)?;
     let col = &r.source_field_name;
     let (nullspec, ondel) = match r.strength.as_str() {
         "master_detail" => (" NOT NULL", "CASCADE"),

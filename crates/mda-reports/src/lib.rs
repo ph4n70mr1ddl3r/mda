@@ -230,9 +230,16 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         sql.push_str(&format!(" GROUP BY {}", group_exprs.join(", ")));
     }
     sql.push_str(&format!(" ORDER BY {order_sql}"));
-    if let Some(lim) = ds.limit {
-        sql.push_str(&format!(" LIMIT {lim}"));
-    }
+    // No unbounded fetches: an absent limit gets the default cap (a wide table
+    // can return millions of rows well inside the 10 s statement timeout and
+    // OOM the process); an explicit limit is clamped to the same cap. Larger
+    // exports belong in the async job path (§5.13).
+    const DEFAULT_ROW_CAP: u64 = 10_000;
+    let lim = ds
+        .limit
+        .unwrap_or(DEFAULT_ROW_CAP)
+        .clamp(1, DEFAULT_ROW_CAP);
+    sql.push_str(&format!(" LIMIT {lim}"));
 
     // bind tenant + owner + filters (all text; casts applied in SQL). Run inside
     // a short-lived txn so the per-run statement_timeout is scoped to this query

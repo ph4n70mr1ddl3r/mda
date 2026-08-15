@@ -43,6 +43,9 @@ fn customer_model(table: &str) -> Value {
 }
 
 async fn setup() -> Option<Ctx> {
+    // Tests use loopback mock receivers — the SSRF egress guard allows private
+    // targets only under this opt-in (see mda_integration::net).
+    std::env::set_var("MDA_ALLOW_PRIVATE_EGRESS", "1");
     let url = std::env::var("DATABASE_URL").ok()?;
     let (pool, _db_url) = common::spawn_db(&url).await;
     let tenant = Uuid::new_v4();

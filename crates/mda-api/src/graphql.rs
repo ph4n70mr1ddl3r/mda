@@ -241,7 +241,16 @@ async fn load_one(
 }
 
 fn gql_err<E: std::fmt::Display>(e: E) -> async_graphql::Error {
-    async_graphql::Error::new(e.to_string())
+    // ADR-0018 parity: REST scrubs 5xx internals ("internal server error");
+    // GraphQL must not become the side door. `Error::Internal`'s Display would
+    // otherwise carry SQL/driver details into errors[].message.
+    let msg = e.to_string();
+    let scrubbed = if msg.starts_with("internal error") || msg.starts_with("config error") {
+        "internal error".to_string()
+    } else {
+        msg
+    };
+    async_graphql::Error::new(scrubbed)
 }
 
 /// Read a field off a GraphQL object value (None if not an object / missing).
@@ -573,7 +582,13 @@ fn parse_id(arg: Option<async_graphql::dynamic::ValueAccessor<'_>>) -> async_gra
 /// clients can branch on it just like the REST envelope.
 fn api_err_to_gql(e: crate::error::ApiError) -> async_graphql::Error {
     let code = e.0.code();
-    async_graphql::Error::new(e.0.to_string()).extend_with(move |_, v| v.set("code", code))
+    // internal/config details stay server-side (see gql_err); the stable
+    // `code` extension still tells SDK clients what happened.
+    let msg = match e.0 {
+        mda_core::Error::Internal(_) | mda_core::Error::Config(_) => "internal error".to_string(),
+        other => other.to_string(),
+    };
+    async_graphql::Error::new(msg).extend_with(move |_, v| v.set("code", code))
 }
 
 /// `PascalCase` → `camelCase` for query field names.

@@ -19,6 +19,15 @@ Environment=DATABASE_URL=postgres://mda:mda@mda-postgres:5432/mda
 EnvironmentFile=/etc/mda/mda-app.env
 PublishPort=8080:8080
 Network=mda.network
+
+# Hardening: no privilege escalation, no Linux capabilities, read-only rootfs
+# with a private /tmp. The app writes only to the blob volume (and Postgres).
+NoNewPrivileges=true
+DropCapability=all
+ReadOnly=true
+Tmpfs=/tmp:rw,size=64m,mode=1777
+# Blob storage root (image default MDA_BLOB_DIR) — must be writable.
+Volume=mda-blobs.volume:/var/lib/mda/blobs
 # The image's CMD runs /app/mda-server; no Exec override needed.
 
 [Service]

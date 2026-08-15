@@ -41,6 +41,9 @@ fn customer_model(table: &str) -> Value {
 }
 
 async fn setup() -> Option<Ctx> {
+    // The integration-pull test binds a loopback mock source — allow private
+    // egress for it (SSRF guard opt-in, see mda_integration::net).
+    std::env::set_var("MDA_ALLOW_PRIVATE_EGRESS", "1");
     let url = std::env::var("DATABASE_URL").ok()?;
     let (pool, _db_url) = common::spawn_db(&url).await;
     let tenant = Uuid::new_v4();

@@ -27,7 +27,7 @@ pub fn spawn_drain(pool: PgPool) {
         pool,
         notifications::default_channels(),
         secrets,
-        reqwest::Client::new(),
+        mda_integration::net::egress_client(),
     );
 }
 

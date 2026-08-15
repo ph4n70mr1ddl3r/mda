@@ -187,8 +187,14 @@ pub async fn deliver(
     let ts = chrono::Utc::now().timestamp();
     let sig = sign(&secret, ts, &body);
 
+    // SSRF guard: subscriptions are admin-authored, but re-validate at delivery
+    // time — the URL lives in the DB and may predate validation or point at a
+    // host that has since been repointed internally.
+    let target = mda_integration::net::parse_outbound_url(&url)?;
+    mda_integration::net::assert_public_egress(&target).await?;
+
     let resp = http
-        .post(&url)
+        .post(target.clone())
         .header("X-MDA-Signature", sig)
         .header("content-type", "application/json")
         .body(body.clone())
@@ -417,12 +423,17 @@ async fn create_webhook(
     AuthUser(user): AuthUser,
     Json(body): Json<CreateBody>,
 ) -> ApiResult<(StatusCode, Json<WebhookOut>)> {
+    crate::admin::require_admin(&user)?;
     if body.name.trim().is_empty()
         || body.url.trim().is_empty()
         || body.secret_ref.trim().is_empty()
     {
         return Err(Error::Invalid("name, url, and secret_ref are required".into()).into());
     }
+    // SSRF guard: scheme + host must be outbound-public at registration time
+    // (re-checked at every delivery).
+    let target = mda_integration::net::parse_outbound_url(&body.url)?;
+    mda_integration::net::assert_public_egress(&target).await?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let row: Option<WebhookRow> = sqlx::query_as(
@@ -450,6 +461,7 @@ async fn list_webhooks(
     State(st): State<AppState>,
     AuthUser(user): AuthUser,
 ) -> ApiResult<Json<Vec<WebhookOut>>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let rows: Vec<WebhookRow> = sqlx::query_as(
@@ -469,6 +481,7 @@ async fn get_webhook(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<WebhookOut>> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let row: Option<WebhookRow> = sqlx::query_as(
@@ -490,6 +503,7 @@ async fn delete_webhook(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let n = sqlx::query("DELETE FROM int.webhook WHERE tenant_id = $1 AND id = $2")
@@ -511,6 +525,7 @@ async fn list_deliveries(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<Value>>> {
+    crate::admin::require_admin(&user)?;
     let rows: Vec<(Value,)> = sqlx::query_as(
         "SELECT to_jsonb(d.*) AS doc FROM sys_webhook_delivery d
           WHERE tenant_id = $1 AND webhook_id = $2 ORDER BY created_at DESC LIMIT 50",
@@ -543,26 +558,32 @@ async fn replay(
     Path(id): Path<Uuid>,
     Query(q): Query<ReplayQuery>,
 ) -> ApiResult<Json<Value>> {
-    // Resolve the webhook (must exist + be active).
+    crate::admin::require_admin(&user)?;
+    // Resolve the webhook (must exist + be active) with its subscription filters
+    // — a replay delivers what this subscription would have matched, nothing
+    // more (same predicate as the relay).
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM int.webhook WHERE tenant_id = $1 AND id = $2 AND active = TRUE)",
+    let sub: Option<(Vec<String>, Option<String>)> = sqlx::query_as(
+        "SELECT event_types, entity_filter FROM int.webhook
+          WHERE tenant_id = $1 AND id = $2 AND active = TRUE",
     )
     .bind(user.tenant_id)
     .bind(id)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
-    if !exists {
-        return Err(Error::NotFound(format!("webhook {id}")).into());
-    }
+    let (event_types, entity_filter) =
+        sub.ok_or_else(|| Error::NotFound(format!("webhook {id}")))?;
 
     let from_seq: i64 = match q.from.as_deref() {
         Some(s) => s.parse().unwrap_or(0),
         None => 0,
     };
+    // Clamp: a negative limit would mean "no limit" in Postgres — one request
+    // must not be able to re-enqueue the tenant's entire event log.
+    let limit = q.limit.clamp(1, 1000);
     #[allow(clippy::type_complexity)]
     type ReplayEvent = (
         i64,
@@ -576,11 +597,15 @@ async fn replay(
         "SELECT seq, type, entity, record_id, actor_id, payload
                FROM sys_event_log
               WHERE tenant_id = $1 AND seq > $2
+                AND ($4::text[] = '{}' OR type = ANY($4) OR '*' = ANY($4))
+                AND ($5::text IS NULL OR entity IS NULL OR entity = $5)
               ORDER BY seq LIMIT $3",
     )
     .bind(user.tenant_id)
     .bind(from_seq)
-    .bind(q.limit)
+    .bind(limit)
+    .bind(&event_types)
+    .bind(entity_filter)
     .fetch_all(&st.pool)
     .await
     .map_err(Error::internal)?;
@@ -652,10 +677,20 @@ async fn inbound(
     .await?;
     let _ts = verify(&secret, sig, body_str, now)?;
 
-    let event_id = headers
-        .get("x-mda-event-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    // Dedupe key: the client's X-MDA-Event-Id when supplied; otherwise a hash
+    // of (webhook, signature timestamp, body) — a replayed signed request that
+    // simply drops the header still dedupes within the replay window.
+    let event_id: String = match headers.get("x-mda-event-id").and_then(|v| v.to_str().ok()) {
+        Some(eid) => eid.to_string(),
+        None => {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(id.as_bytes());
+            h.update(_ts.to_le_bytes());
+            h.update(&body);
+            hex::encode(h.finalize())
+        }
+    };
     let payload: Value =
         serde_json::from_slice(&body).map_err(|e| Error::Invalid(format!("bad json: {e}")))?;
     let event_type = payload
@@ -663,36 +698,22 @@ async fn inbound(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    // dedupe on (webhook_id, event_id) when an id is supplied.
-    if let Some(eid) = &event_id {
-        let inserted = sqlx::query(
-            "INSERT INTO sys_inbound_webhook (tenant_id, webhook_id, event_id, event_type, payload)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (webhook_id, event_id) DO NOTHING",
-        )
-        .bind(tenant)
-        .bind(id)
-        .bind(eid)
-        .bind(&event_type)
-        .bind(&payload)
-        .execute(&st.pool)
-        .await
-        .map_err(Error::internal)?;
-        if inserted.rows_affected() == 0 {
-            return Ok(StatusCode::OK); // duplicate — already received (idempotent ack).
-        }
-    } else {
-        sqlx::query(
-            "INSERT INTO sys_inbound_webhook (tenant_id, webhook_id, event_type, payload)
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(tenant)
-        .bind(id)
-        .bind(&event_type)
-        .bind(&payload)
-        .execute(&st.pool)
-        .await
-        .map_err(Error::internal)?;
+    // dedupe on (webhook_id, event_id).
+    let inserted = sqlx::query(
+        "INSERT INTO sys_inbound_webhook (tenant_id, webhook_id, event_id, event_type, payload)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (webhook_id, event_id) DO NOTHING",
+    )
+    .bind(tenant)
+    .bind(id)
+    .bind(&event_id)
+    .bind(&event_type)
+    .bind(&payload)
+    .execute(&st.pool)
+    .await
+    .map_err(Error::internal)?;
+    if inserted.rows_affected() == 0 {
+        return Ok(StatusCode::OK); // duplicate — already received (idempotent ack).
     }
 
     // enqueue for the integration flow runner (§5.22) to consume.

@@ -68,6 +68,11 @@ pub async fn run_transition(
     .map_err(Error::internal)?;
     let wf = wf.ok_or_else(|| Error::NotFound(format!("no workflow for {entity}")))?;
 
+    // Visibility check first, with the caller's real scope: reading with the
+    // superuser scope before the scope check would let error messages ("no
+    // transition X from state Y", "guard failed") disclose the current state of
+    // records the caller cannot even read.
+    mda_data::read(pool, tenant, def, record_id, scope).await?;
     let current =
         mda_data::read(pool, tenant, def, record_id, &RecordScope::superuser(actor)).await?;
     let state = current["state"]

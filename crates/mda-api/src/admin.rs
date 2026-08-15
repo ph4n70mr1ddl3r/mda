@@ -85,8 +85,10 @@ pub fn routes() -> Router<AppState> {
 
 // ===== gate =====
 
-/// Every admin-security handler is superuser-only.
-fn require_admin(user: &mda_security::Identity) -> ApiResult<()> {
+/// Every admin-security handler is superuser-only. Shared by the other
+/// operator surfaces (secrets, webhooks, integrations, schedules) — the same
+/// trust root governs everything that can move data in/out of the tenant.
+pub(crate) fn require_admin(user: &mda_security::Identity) -> ApiResult<()> {
     if user.is_superuser {
         Ok(())
     } else {
@@ -898,6 +900,17 @@ async fn reset_password(
             .await
             .map_err(Error::internal)?
             .rows_affected();
+    // A forced reset is a compromise response — kill the user's sessions in the
+    // same transaction so outstanding refresh tokens stop rotating immediately.
+    sqlx::query(
+        "UPDATE sec.sec_session SET revoked_at = now() \
+          WHERE user_id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .bind(user.tenant_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     if n == 0 {
         Err(Error::NotFound(format!("user {id}")).into())
