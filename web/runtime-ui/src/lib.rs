@@ -11,7 +11,7 @@
 mod api;
 mod studio;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -206,19 +206,10 @@ fn Login() -> impl IntoView {
                         match api::login(&t, &e, &p).await {
                             Ok(token) => {
                                 local_set("mda_token", &token);
-                                s.token.set(Some(token.clone()));
-                                if let Ok(m) = api::get_model(&token).await {
-                                    s.model.set(Some(m));
-                                }
-                                if let Ok(items) = api::get_navigation(&token).await {
-                                    s.nav.set(items);
-                                }
-                                if let Ok(d) = api::list_dashboards(&token).await {
-                                    s.dashboards.set(d);
-                                }
-                                if let Ok(admin) = api::is_admin(&token).await {
-                                    s.is_admin.set(admin);
-                                }
+                                s.token.set(Some(token));
+                                // Model/nav/dashboards/admin bootstrap rides the
+                                // token effect in `App` — fetching here too
+                                // would duplicate every request.
                                 s.page.set(Page::Home);
                             }
                             Err(err) => set_error.set(err),
@@ -250,7 +241,15 @@ fn Home() -> impl IntoView {
 
             <h3>"Navigation"</h3>
             <For each=move || s.nav.get()
-                 key=|i| format!("{}-{}-{}", i.kind, i.label, i.url.clone().unwrap_or_default())
+                 // Key by kind + target (entity name or URL): two items that
+                 // share a label (e.g. two entities with the same display
+                 // label) would collide under a label-based key and break the
+                 // For diff.
+                 key=|i| format!(
+                     "{}::{}",
+                     i.kind,
+                     i.entity.clone().unwrap_or_else(|| i.url.clone().unwrap_or_default())
+                 )
                  children=move |item: NavItem| {
                      let s2 = s;
                      match item.kind.as_str() {
@@ -529,7 +528,9 @@ fn EntityList(entity: String) -> impl IntoView {
                                                                 }>"Edit"</button>
                                                             <button style="cursor:pointer; margin-left:4px; color:#a00;"
                                                                 on:click=move |_: leptos::ev::MouseEvent| {
-                                                                    // Destructive: confirm before the API call.
+                                                                    // Destructive: confirm before the API call — and
+                                                                    // default to *not* deleting if confirm() is
+                                                                    // unavailable (e.g. blocked dialogs).
                                                                     let confirmed = web_sys::window()
                                                                         .and_then(|w| {
                                                                             w.confirm_with_message(&format!(
@@ -537,7 +538,7 @@ fn EntityList(entity: String) -> impl IntoView {
                                                                                 ent_sig_del.get()))
                                                                                 .ok()
                                                                         })
-                                                                        .unwrap_or(true);
+                                                                        .unwrap_or(false);
                                                                     if !confirmed {
                                                                         return;
                                                                     }
@@ -711,6 +712,11 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     // closed/dropped on unmount via `on_cleanup`, so navigating the SPA back to
     // the list releases the connection instead of leaking one per form visit.
     let es_holder: EsHandle = Rc::new(RefCell::new(None));
+    // Set by on_cleanup: if the ticket fetch / EventSource creation completes
+    // *after* the form unmounted, the late-created EventSource must be closed
+    // immediately — dropping its Rust wrapper does not close a JS EventSource,
+    // so it would otherwise reconnect forever.
+    let es_closed = Rc::new(Cell::new(false));
     {
         if let Some(rid) = id.clone() {
             if let Some(tok) = token.get() {
@@ -718,6 +724,7 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                 let my_id = rid.clone();
                 let set_conflict = conflict;
                 let es_holder2 = es_holder.clone();
+                let es_closed2 = es_closed.clone();
                 // EventSource can't set headers, so first fetch a short-lived,
                 // one-shot ticket — never putting the access JWT in the URL.
                 spawn_local(async move {
@@ -728,6 +735,10 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                     let Ok(es) = web_sys::EventSource::new(&url) else {
                         return;
                     };
+                    if es_closed2.get() {
+                        es.close();
+                        return;
+                    }
                     let cb = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
                         move |ev: web_sys::MessageEvent| {
                             if let Some(data) = ev.data().as_string() {
@@ -750,7 +761,9 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
         }
     }
     let es_holder_cleanup = es_holder.clone();
+    let es_closed_cleanup = es_closed.clone();
     on_cleanup(move || {
+        es_closed_cleanup.set(true);
         if let Some((es, _cb)) = es_holder_cleanup.borrow_mut().take() {
             es.close();
             // `cb` drops here too, unlinking the JS callback.

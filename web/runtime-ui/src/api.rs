@@ -83,9 +83,7 @@ pub async fn login(tenant: &str, email: &str, password: &str) -> Result<String, 
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
-        return Err(format!("Login failed ({})", resp.status()));
-    }
+    let resp = expect_ok("Login failed", resp).await?;
     let body: TokenResp = resp.json().await.map_err(|e| e.to_string())?;
     Ok(body.access_token)
 }
@@ -96,6 +94,7 @@ pub async fn get_model(token: &str) -> Result<ModelInfo, String> {
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    let resp = expect_ok("Model fetch failed", resp).await?;
     resp.json::<ModelInfo>().await.map_err(|e| e.to_string())
 }
 
@@ -105,6 +104,7 @@ pub async fn list_records(token: &str, entity: &str) -> Result<ListResult, Strin
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    let resp = expect_ok("List fetch failed", resp).await?;
     resp.json::<ListResult>().await.map_err(|e| e.to_string())
 }
 
@@ -114,6 +114,7 @@ pub async fn get_record(token: &str, entity: &str, id: &str) -> Result<serde_jso
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    let resp = expect_ok("Record fetch failed", resp).await?;
     resp.json::<serde_json::Value>()
         .await
         .map_err(|e| e.to_string())
@@ -128,9 +129,7 @@ pub async fn create_record(token: &str, entity: &str, body: String) -> Result<()
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
-        return Err(format!("Create failed ({})", resp.status()));
-    }
+    expect_ok("Create failed", resp).await?;
     Ok(())
 }
 
@@ -150,9 +149,8 @@ pub async fn update_record(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
-        return Err(format!("Update failed ({})", resp.status()));
-    }
+    // Status stays in the message: RecordForm detects 409 conflicts by substring.
+    expect_ok("Update failed", resp).await?;
     Ok(())
 }
 
@@ -162,9 +160,7 @@ pub async fn delete_record(token: &str, entity: &str, id: &str) -> Result<(), St
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
-        return Err(format!("Delete failed ({})", resp.status()));
-    }
+    expect_ok("Delete failed", resp).await?;
     Ok(())
 }
 
@@ -190,9 +186,7 @@ pub async fn event_ticket(token: &str) -> Result<String, String> {
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
-        return Err(format!("event-ticket failed ({})", resp.status()));
-    }
+    let resp = expect_ok("event-ticket failed", resp).await?;
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     body["ticket"]
         .as_str()
@@ -203,6 +197,7 @@ pub async fn event_ticket(token: &str) -> Result<String, String> {
 /// Minimal percent-encoder for the query-safe (RFC 3986 unreserved) set. Keeps
 /// us off `js_sys::encodeURIComponent` (and its dependency) for two short inputs.
 fn pct_enc(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -211,7 +206,8 @@ fn pct_enc(s: &str) -> String {
             }
             _ => {
                 out.push('%');
-                out.push_str(&format!("{:02X}", b));
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
             }
         }
     }
@@ -260,6 +256,7 @@ pub async fn get_navigation(token: &str) -> Result<Vec<NavItem>, String> {
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    let resp = expect_ok("Navigation fetch failed", resp).await?;
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     serde_json::from_value(body["items"].clone()).map_err(|e| e.to_string())
 }
@@ -289,9 +286,7 @@ pub async fn get_view(token: &str, entity: &str) -> Result<Option<ViewInfo>, Str
     if resp.status() == 404 {
         return Ok(None);
     }
-    if !resp.ok() {
-        return Err(format!("View fetch failed ({})", resp.status()));
-    }
+    let resp = expect_ok("View fetch failed", resp).await?;
     resp.json::<ViewInfo>()
         .await
         .map(Some)
@@ -335,9 +330,7 @@ pub async fn get_form(token: &str, entity: &str) -> Result<Option<FormInfo>, Str
     if resp.status() == 404 {
         return Ok(None);
     }
-    if !resp.ok() {
-        return Err(format!("Form fetch failed ({})", resp.status()));
-    }
+    let resp = expect_ok("Form fetch failed", resp).await?;
     resp.json::<FormInfo>()
         .await
         .map(Some)
@@ -360,9 +353,7 @@ pub async fn list_dashboards(token: &str) -> Result<Vec<DashSummary>, String> {
     if resp.status() == 404 {
         return Ok(vec![]);
     }
-    if !resp.ok() {
-        return Err(format!("Dashboards fetch failed ({})", resp.status()));
-    }
+    let resp = expect_ok("Dashboards fetch failed", resp).await?;
     resp.json::<Vec<DashSummary>>()
         .await
         .map_err(|e| e.to_string())
@@ -396,6 +387,7 @@ pub async fn get_dashboard(token: &str, id: &str) -> Result<DashboardInfo, Strin
         .send()
         .await
         .map_err(|e| e.to_string())?;
+    let resp = expect_ok("Dashboard fetch failed", resp).await?;
     resp.json::<DashboardInfo>()
         .await
         .map_err(|e| e.to_string())
@@ -449,15 +441,7 @@ async fn send_json(
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !resp_ok(status) {
-        let msg = serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v["message"]
-                    .as_str()
-                    .or_else(|| v["error"].as_str())
-                    .map(String::from)
-            })
-            .unwrap_or(text);
+        let msg = body_msg(&text).unwrap_or(text);
         return Err(format!("HTTP {status}: {msg}"));
     }
     if text.is_empty() {
@@ -469,6 +453,38 @@ async fn send_json(
 
 fn resp_ok(status: u16) -> bool {
     (200..300).contains(&status)
+}
+
+/// Pull a human-readable message out of an error body (the `message` or
+/// `error` field), if the body is JSON with one.
+fn body_msg(text: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| {
+            v["message"]
+                .as_str()
+                .or_else(|| v["error"].as_str())
+                .map(String::from)
+        })
+}
+
+/// Fail with `"<prefix> (HTTP <status>): <server message>"` unless the response
+/// is 2xx; on success hand the response back for body parsing. The status
+/// stays in the message so callers can match on it (e.g. 409 conflicts).
+async fn expect_ok(
+    prefix: &str,
+    resp: gloo_net::http::Response,
+) -> Result<gloo_net::http::Response, String> {
+    let status = resp.status();
+    if resp_ok(status) {
+        return Ok(resp);
+    }
+    let text = resp.text().await.unwrap_or_default();
+    match body_msg(&text) {
+        Some(m) => Err(format!("{prefix} (HTTP {status}): {m}")),
+        None if text.is_empty() => Err(format!("{prefix} (HTTP {status})")),
+        None => Err(format!("{prefix} (HTTP {status}): {text}")),
+    }
 }
 
 pub async fn sget(token: &str, path: &str) -> Result<serde_json::Value, String> {

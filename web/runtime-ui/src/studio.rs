@@ -1191,11 +1191,7 @@ struct FieldPick {
 
 /// Load the stored form/view definition for an entity into editor rows
 /// (default: every model field included, widget auto, model labels).
-fn seed_picks(
-    fields: &[(String, String)],
-    stored: Option<&Value>,
-    with_widgets: bool,
-) -> Vec<FieldPick> {
+fn seed_picks(fields: &[(String, String)], stored: Option<&Value>) -> Vec<FieldPick> {
     let mut used: Vec<String> = Vec::new();
     let mut rows: Vec<FieldPick> = Vec::new();
     let empty = vec![];
@@ -1230,7 +1226,6 @@ fn seed_picks(
             });
         }
     }
-    let _ = with_widgets;
     rows
 }
 
@@ -1288,7 +1283,6 @@ fn FormsTab() -> impl IntoView {
 
     let load = move |ent: String| {
         let t = token.get().unwrap_or_default();
-        let (rows, section_title, msg) = (rows, section_title, msg);
         spawn_local(async move {
             let fields = entity_field_list(&state, &ent);
             match api::sget(&t, &format!("/api/forms/{ent}")).await {
@@ -1299,14 +1293,13 @@ fn FormsTab() -> impl IntoView {
                             .unwrap_or_default()
                             .to_string(),
                     );
-                    rows.set(seed_picks(&fields, Some(&stored), true));
+                    rows.set(seed_picks(&fields, Some(&stored)));
                 }
                 Err(_) => {
                     section_title.set(String::new());
-                    rows.set(seed_picks(&fields, None, true));
+                    rows.set(seed_picks(&fields, None));
                 }
             }
-            let _ = &msg;
         });
     };
 
@@ -1442,11 +1435,11 @@ fn ViewsTab() -> impl IntoView {
                             .map(|v| v.to_string())
                             .unwrap_or_default(),
                     );
-                    rows.set(seed_picks(&fields, Some(&stored), false));
+                    rows.set(seed_picks(&fields, Some(&stored)));
                 }
                 Err(_) => {
                     page_size.set(String::new());
-                    rows.set(seed_picks(&fields, None, false));
+                    rows.set(seed_picks(&fields, None));
                 }
             }
         });
@@ -2846,20 +2839,39 @@ fn TeamsTab() -> impl IntoView {
                      let id_set = t["id"].as_str().unwrap_or_default().to_string();
                      let id_del = t["id"].as_str().unwrap_or_default().to_string();
                      let parent_id = t["parent_id"].as_str().unwrap_or_default().to_string();
-                     let parent_name = name_of(&parent_id);
+                     // Read the parent live from the teams signal: `For` reuses
+                     // children by key, so values captured at creation go stale
+                     // after the post-action reload.
+                     let teams_disp = teams;
+                     let name_of_disp = name_of;
+                     let tid_disp = id_set.clone();
+                     let parent_line = move || {
+                         let pid = teams_disp
+                             .get()
+                             .iter()
+                             .find(|x| x["id"].as_str() == Some(tid_disp.as_str()))
+                             .and_then(|x| x["parent_id"].as_str())
+                             .unwrap_or("")
+                             .to_string();
+                         if pid.is_empty() {
+                             "root team".to_string()
+                         } else {
+                             format!("under {}", name_of_disp(&pid))
+                         }
+                     };
                      let row_parent = create_rw_signal(parent_id.clone());
                      view! {
                          <div style=row_style()>
                              <strong style="min-width:140px;">{t["name"].as_str().unwrap_or_default().to_string()}</strong>
                              <span style="color:#667; font-size:12px;">
-                                 {if parent_id.is_empty() { "root team".to_string() } else { format!("under {parent_name}") }}
+                                 {parent_line}
                              </span>
                              <span style="flex:1;"></span>
                              {lbl("re-parent")}
                              <select prop:value=move || row_parent.get()
                                  on:input=move |ev| row_parent.set(event_target_value(&ev))
                                  style=fmt_style("auto")>
-                                 {team_opts().into_iter()
+                                 {move || team_opts().into_iter()
                                      .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                                      .collect_view()}
                              </select>
@@ -2909,7 +2921,9 @@ fn TeamsTab() -> impl IntoView {
                 <select prop:value=move || new_parent.get()
                     on:input=move |ev| new_parent.set(event_target_value(&ev))
                     style=fmt_style("auto")>
-                    {team_opts().into_iter()
+                    {/* Reactive: the teams list arrives async after mount, so
+                        options computed once at render would stay empty. */}
+                    {move || team_opts().into_iter()
                         .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                         .collect_view()}
                 </select>
@@ -3316,18 +3330,29 @@ fn OwdTab() -> impl IntoView {
             <p style="font-size:12px; color:#667; margin-top:0;">
                 "The org-wide default is the baseline visibility for every record; sharing rules and manual shares only widen it."
             </p>
-            <For each=move || ents.clone()
-                 key=|(name, _)| name.clone()
-                 children=move |pair| {
-                     let (name, label): (String, String) = pair;
+            {/* The `each` closure reads the OWD list (so it tracks reloads) and
+                rows are keyed by entity + current level: a reload after "Set"
+                remounts the row with the fresh value — `For` children captured
+                at creation would keep showing the pre-fetch default. */}
+            <For each=move || {
+                    let list = owd.get();
+                    ents.iter()
+                        .map(|(name, label)| {
+                            let current = list
+                                .iter()
+                                .find(|o| o["entity"].as_str() == Some(name.as_str()))
+                                .and_then(|o| o["default_access"].as_str())
+                                .unwrap_or("team")
+                                .to_string();
+                            (name.clone(), label.clone(), current)
+                        })
+                        .collect::<Vec<_>>()
+                }
+                 key=|(name, _, current)| format!("{name}::{current}")
+                 children=move |(name, label, current): (String, String, String)| {
                      let token = token;
                      let msg = msg;
                      let owd = owd;
-                     let current = owd.get().iter()
-                         .find(|o| o["entity"].as_str() == Some(name.as_str()))
-                         .and_then(|o| o["default_access"].as_str())
-                         .unwrap_or("team")
-                         .to_string();
                      let sig = create_rw_signal(current);
                      view! {
                          <div style=row_style()>
@@ -3418,7 +3443,9 @@ fn UsersTab() -> impl IntoView {
                 <select prop:value=move || n_team.get()
                     on:input=move |ev| n_team.set(event_target_value(&ev))
                     style=fmt_style("auto")>
-                    {team_opts().into_iter()
+                    {/* Reactive: the teams list arrives async after mount, so
+                        options computed once at render would stay empty. */}
+                    {move || team_opts().into_iter()
                         .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                         .collect_view()}
                 </select>
@@ -3464,7 +3491,18 @@ fn UserRow(
     let email = user["email"].as_str().unwrap_or_default().to_string();
     let name = user["name"].as_str().unwrap_or_default().to_string();
     let team_id = create_rw_signal(user["team_id"].as_str().unwrap_or_default().to_string());
-    let active = user["active"].as_bool().unwrap_or(true);
+    // Read live from the users list: `For` reuses children by key, so a value
+    // captured at creation would go stale after the post-action reload (the
+    // disable/activate button would show — and send — the wrong state).
+    let users_live = users;
+    let active = move || {
+        users_live
+            .get()
+            .iter()
+            .find(|u| u["id"].as_str() == Some(uid.get().as_str()))
+            .and_then(|u| u["active"].as_bool())
+            .unwrap_or(true)
+    };
     let team_name = move || {
         teams_sig
             .get()
@@ -3511,8 +3549,8 @@ fn UserRow(
             <strong style="min-width:190px;">{email.clone()}</strong>
             <span style="color:#667; font-size:12px; min-width:110px;">{name.clone()}</span>
             <span style="color:#667; font-size:12px;">{move || team_name()}</span>
-            <span style=format!("font-size:11px; color:{};", if active { "#3a9d5d" } else { "#b00" })>
-                {if active { "active" } else { "disabled" }}
+            <span style=move || format!("font-size:11px; color:{};", if active() { "#3a9d5d" } else { "#b00" })>
+                {move || if active() { "active" } else { "disabled" }}
             </span>
             <span style="flex:1;"></span>
             <button style=btn(false)
@@ -3571,7 +3609,7 @@ fn UserRow(
                                 let t = token.get().unwrap_or_default();
                                 let msg = msg;
                                 let id = uid.get_untracked();
-                                let to = !active;
+                                let to = !active();
                                 let users = users;
                                 spawn_local(async move {
                                     match api::spatch(&t, &format!("/api/admin/users/{id}"), json!({"active": to})).await {
@@ -3584,7 +3622,7 @@ fn UserRow(
                                         Err(e) => set_msg(&msg, false, e),
                                     }
                                 });
-                            }>{if active { "disable" } else { "activate" }}</button>
+                            }>{move || if active() { "disable" } else { "activate" }}</button>
                     </div>
 
                     <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
@@ -3804,7 +3842,9 @@ fn ShareTab() -> impl IntoView {
                         on:input=move |ev| n_principal.set(event_target_value(&ev))
                         style=fmt_style("220px")>
                         <option value="">"— user or team —"</option>
-                        {principal_opts().into_iter()
+                        {/* Reactive: users/teams arrive async after mount, so
+                            options computed once at render would stay empty. */}
+                        {move || principal_opts().into_iter()
                             .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                             .collect_view()}
                     </select>
