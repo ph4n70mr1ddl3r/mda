@@ -289,6 +289,13 @@ fn entity_options(state: &AppState) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Entity pick list for permission grants ("*" = every entity).
+fn role_ent_opts(state: &AppState) -> Vec<(String, String)> {
+    let mut v = vec![("*".to_string(), "* (every entity)".to_string())];
+    v.extend(entity_options(state));
+    v
+}
+
 /// field/op/value → bounded-DSL `Cmp` expression.
 fn cmp_expr(field: &str, op: &str, value: &str) -> Value {
     json!({"op":"Cmp","kind":op,
@@ -455,7 +462,8 @@ fn StudioModel() -> impl IntoView {
                             <Txt sig=new_name ph="draft name" w="200px"/>
                             <button style=btn(true)
                                 on:click=move |_: leptos::ev::MouseEvent| {
-                                    let name = new_name.get();
+                                    let name = new_name.get().trim().to_string();
+                                    if name.is_empty() { return; }
                                     let t = token.get().unwrap_or_default();
                                     let msg = msg;
                                     let open = open;
@@ -1737,7 +1745,14 @@ fn NavigationTab() -> impl IntoView {
                     nav.into_iter()
                         .map(|i| NavRow {
                             id: new_uuid(),
-                            kind: "entity".into(),
+                            // Preserve the fetched kind: a stored link item
+                            // must prefill as a link, not silently become an
+                            // entity row with an empty target.
+                            kind: if i.kind == "entity" {
+                                "entity".into()
+                            } else {
+                                "link".into()
+                            },
                             entity: i.entity.clone().unwrap_or_default(),
                             url: i.url.clone().unwrap_or_default(),
                             label: i.label.clone(),
@@ -2990,8 +3005,6 @@ fn RolesTab() -> impl IntoView {
         v.extend(VERBS.iter().map(|x| (x.to_string(), x.to_string())));
         v
     };
-    let mut ent_opts = vec![("*".to_string(), "* (every entity)".to_string())];
-    ent_opts.extend(entity_options(&state));
 
     let selected = move || {
         let id = sel_role.get()?;
@@ -3085,6 +3098,7 @@ fn RolesTab() -> impl IntoView {
                                  children=move |p: Value| {
                                      let token = token;
                                      let msg = msg;
+                                     let roles = roles;
                                      let rid = rid.get_untracked();
                                      let (e, v) = (p["entity"].as_str().unwrap_or_default().to_string(), p["verb"].as_str().unwrap_or_default().to_string());
                                      view! {
@@ -3094,10 +3108,16 @@ fn RolesTab() -> impl IntoView {
                                                  on:click=move |_: leptos::ev::MouseEvent| {
                                                      let t = token.get().unwrap_or_default();
                                                      let msg = msg;
+                                                     let roles = roles;
                                                      let (rid, e, v) = (rid.clone(), e.clone(), v.clone());
                                                      spawn_local(async move {
                                                          match api::sdelete(&t, &format!("/api/admin/roles/{rid}/permissions/{e}/{v}")).await {
-                                                             Ok(_) => set_msg(&msg, true, "permission revoked — reload to refresh"),
+                                                             Ok(_) => {
+                                                                 set_msg(&msg, true, "permission revoked");
+                                                                 if let Ok(l) = api::sget(&t, "/api/admin/roles").await {
+                                                                     roles.set(l.as_array().cloned().unwrap_or_default());
+                                                                 }
+                                                             }
                                                              Err(e) => set_msg(&msg, false, e),
                                                          }
                                                      });
@@ -3106,7 +3126,10 @@ fn RolesTab() -> impl IntoView {
                                      }
                                  }/>
                             <div style="display:flex; gap:6px; align-items:center; margin:6px 0;">
-                                <Sel sig=p_ent options=ent_opts.clone()/>
+                                {/* Reactive: entity options come from the
+                                    (async-loaded) model — a once-at-mount list
+                                    stays empty if the model lands late. */}
+                                {move || view! { <Sel sig=p_ent options=role_ent_opts(&state)/> }.into_view()}
                                 <Sel sig=p_verb options=verb_opts.clone()/>
                                 <button style=btn(false)
                                     on:click=move |_: leptos::ev::MouseEvent| {
@@ -3114,9 +3137,15 @@ fn RolesTab() -> impl IntoView {
                                         let msg = msg;
                                         let rid = rid.get_untracked();
                                         let body = json!({"entity": p_ent.get(), "verb": p_verb.get()});
+                                        let roles = roles;
                                         spawn_local(async move {
                                             match api::spost(&t, &format!("/api/admin/roles/{rid}/permissions"), body).await {
-                                                Ok(_) => set_msg(&msg, true, "permission granted — reload to refresh"),
+                                                Ok(_) => {
+                                                    set_msg(&msg, true, "permission granted");
+                                                    if let Ok(l) = api::sget(&t, "/api/admin/roles").await {
+                                                        roles.set(l.as_array().cloned().unwrap_or_default());
+                                                    }
+                                                }
                                                 Err(e) => set_msg(&msg, false, e),
                                             }
                                         });
@@ -3129,6 +3158,7 @@ fn RolesTab() -> impl IntoView {
                                  children=move |p: Value| {
                                      let token = token;
                                      let msg = msg;
+                                     let roles = roles;
                                      let rid = rid.get_untracked();
                                      let (e, f) = (p["entity"].as_str().unwrap_or_default().to_string(), p["field"].as_str().unwrap_or_default().to_string());
                                      let a = p["access"].as_str().unwrap_or_default().to_string();
@@ -3139,10 +3169,16 @@ fn RolesTab() -> impl IntoView {
                                                  on:click=move |_: leptos::ev::MouseEvent| {
                                                      let t = token.get().unwrap_or_default();
                                                      let msg = msg;
+                                                     let roles = roles;
                                                      let (rid, e, f) = (rid.clone(), e.clone(), f.clone());
                                                      spawn_local(async move {
                                                          match api::sdelete(&t, &format!("/api/admin/roles/{rid}/field-permissions/{e}/{f}")).await {
-                                                             Ok(_) => set_msg(&msg, true, "field permission removed — reload to refresh"),
+                                                             Ok(_) => {
+                                                                 set_msg(&msg, true, "field permission removed");
+                                                                 if let Ok(l) = api::sget(&t, "/api/admin/roles").await {
+                                                                     roles.set(l.as_array().cloned().unwrap_or_default());
+                                                                 }
+                                                             }
                                                              Err(e) => set_msg(&msg, false, e),
                                                          }
                                                      });
@@ -3151,7 +3187,7 @@ fn RolesTab() -> impl IntoView {
                                      }
                                  }/>
                             <div style="display:flex; gap:6px; align-items:center; margin:6px 0; flex-wrap:wrap;">
-                                <Sel sig=fp_ent options=ent_opts.clone()/>
+                                {move || view! { <Sel sig=fp_ent options=role_ent_opts(&state)/> }.into_view()}
                                 {move || {
                                     let e = fp_ent.get();
                                     let fields = entity_field_list(&state, &e);
@@ -3177,9 +3213,15 @@ fn RolesTab() -> impl IntoView {
                                         let msg = msg;
                                         let rid = rid.get_untracked();
                                         let body = json!({"entity": fp_ent.get(), "field": fp_field.get(), "access": fp_access.get()});
+                                        let roles = roles;
                                         spawn_local(async move {
                                             match api::spost(&t, &format!("/api/admin/roles/{rid}/field-permissions"), body).await {
-                                                Ok(_) => set_msg(&msg, true, "field permission set — reload to refresh"),
+                                                Ok(_) => {
+                                                    set_msg(&msg, true, "field permission set");
+                                                    if let Ok(l) = api::sget(&t, "/api/admin/roles").await {
+                                                        roles.set(l.as_array().cloned().unwrap_or_default());
+                                                    }
+                                                }
                                                 Err(e) => set_msg(&msg, false, e),
                                             }
                                         });
@@ -3199,6 +3241,36 @@ fn RolesTab() -> impl IntoView {
     }
 }
 
+/// (Re)fetch a role's parent roles into `parents` (used at mount and after
+/// add/detach, so the displayed list updates in place).
+fn fetch_role_parents(
+    token: RwSignal<Option<String>>,
+    rid: &str,
+    parents: RwSignal<Vec<(String, String)>>,
+) {
+    let t = token.get().unwrap_or_default();
+    let id = rid.to_string();
+    spawn_local(async move {
+        if let Ok(v) = api::sget(&t, &format!("/api/admin/roles/{id}/parents")).await {
+            parents.set(
+                v["parents"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|p| {
+                                (
+                                    p["id"].as_str().unwrap_or_default().to_string(),
+                                    p["name"].as_str().unwrap_or_default().to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            );
+        }
+    });
+}
+
 /// Parent-role list + add/remove for the selected role (fetched live).
 #[component]
 fn RoleParents(
@@ -3210,33 +3282,7 @@ fn RoleParents(
 ) -> impl IntoView {
     let rid = create_rw_signal(rid);
     let parents = create_rw_signal(Vec::<(String, String)>::new());
-    {
-        let t = token.get().unwrap_or_default();
-        spawn_local(async move {
-            if let Ok(v) = api::sget(
-                &t,
-                &format!("/api/admin/roles/{}/parents", rid.get_untracked()),
-            )
-            .await
-            {
-                parents.set(
-                    v["parents"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .map(|p| {
-                                    (
-                                        p["id"].as_str().unwrap_or_default().to_string(),
-                                        p["name"].as_str().unwrap_or_default().to_string(),
-                                    )
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                );
-            }
-        });
-    }
+    fetch_role_parents(token, &rid.get_untracked(), parents);
     let role_opts = move || {
         roles
             .get()
@@ -3259,6 +3305,7 @@ fn RoleParents(
                      let (pid, pname): (String, String) = pair;
                      let token = token;
                      let msg = msg;
+                     let parents = parents;
                      let rid = rid2;
                      view! {
                          <div style="font-size:12px; display:flex; gap:6px; align-items:center; margin:2px 0;">
@@ -3268,9 +3315,13 @@ fn RoleParents(
                                      let t = token.get().unwrap_or_default();
                                      let msg = msg;
                                      let (rid, pid) = (rid.get_untracked(), pid.clone());
+                                     let parents = parents;
                                      spawn_local(async move {
                                          match api::sdelete(&t, &format!("/api/admin/roles/{rid}/parents/{pid}")).await {
-                                             Ok(_) => set_msg(&msg, true, "parent detached — effective on next query"),
+                                             Ok(_) => {
+                                                 set_msg(&msg, true, "parent detached — effective on next query");
+                                                 fetch_role_parents(token, &rid, parents);
+                                             }
                                              Err(e) => set_msg(&msg, false, e),
                                          }
                                      });
@@ -3292,9 +3343,13 @@ fn RoleParents(
                         let t = token.get().unwrap_or_default();
                         let msg = msg;
                         let (rid, pid) = (rid.get_untracked(), parent_role.get_untracked());
+                        let parents = parents;
                         spawn_local(async move {
                             match api::spost(&t, &format!("/api/admin/roles/{rid}/parents/{pid}"), json!({})).await {
-                                Ok(_) => set_msg(&msg, true, "parent added — effective on next query"),
+                                Ok(_) => {
+                                    set_msg(&msg, true, "parent added — effective on next query");
+                                    fetch_role_parents(token, &rid, parents);
+                                }
                                 Err(e) => set_msg(&msg, false, e),
                             }
                         });
@@ -3323,20 +3378,22 @@ fn OwdTab() -> impl IntoView {
     };
     reload();
 
-    let ents = entity_options(&state);
     view! {
         <div>
             <MsgLine sig=msg/>
             <p style="font-size:12px; color:#667; margin-top:0;">
                 "The org-wide default is the baseline visibility for every record; sharing rules and manual shares only widen it."
             </p>
-            {/* The `each` closure reads the OWD list (so it tracks reloads) and
-                rows are keyed by entity + current level: a reload after "Set"
-                remounts the row with the fresh value — `For` children captured
-                at creation would keep showing the pre-fetch default. */}
+            {/* The `each` closure reads the OWD list *and* the model (both
+                reactive — rows appear when the async-loaded model lands and
+                follow publishes without a tab remount), and rows are keyed by
+                entity + current level: a reload after "Set" remounts the row
+                with the fresh value — `For` children captured at creation
+                would keep showing the pre-fetch default. */}
             <For each=move || {
                     let list = owd.get();
-                    ents.iter()
+                    entity_options(&state)
+                        .iter()
                         .map(|(name, label)| {
                             let current = list
                                 .iter()
@@ -3518,30 +3575,30 @@ fn UserRow(
     let assign_role = create_rw_signal(String::new());
     let new_pw = create_rw_signal(String::new());
 
-    let refresh_roles = {
-        move || {
-            let t = token.get().unwrap_or_default();
-            let id = uid.get_untracked();
-            let my_roles = my_roles;
-            spawn_local(async move {
-                if let Ok(v) = api::sget(&t, &format!("/api/admin/users/{id}/roles")).await {
-                    my_roles.set(
-                        v.as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .map(|r| {
-                                        (
-                                            r["id"].as_str().unwrap_or_default().to_string(),
-                                            r["name"].as_str().unwrap_or_default().to_string(),
-                                        )
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    );
-                }
-            });
-        }
+    // (Re)fetch this user's roles — at expand and after every assign/revoke,
+    // so the chip list updates in place instead of going stale.
+    let refresh_roles = move || {
+        let t = token.get().unwrap_or_default();
+        let id = uid.get_untracked();
+        let my_roles = my_roles;
+        spawn_local(async move {
+            if let Ok(v) = api::sget(&t, &format!("/api/admin/users/{id}/roles")).await {
+                my_roles.set(
+                    v.as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|r| {
+                                    (
+                                        r["id"].as_str().unwrap_or_default().to_string(),
+                                        r["name"].as_str().unwrap_or_default().to_string(),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+        });
     };
 
     view! {
@@ -3644,7 +3701,10 @@ fn UserRow(
                                                  let (id, rid) = (uid.get_untracked(), rid.clone());
                                                  spawn_local(async move {
                                                      match api::sdelete(&t, &format!("/api/admin/users/{id}/roles/{rid}")).await {
-                                                         Ok(_) => set_msg(&msg, true, "role revoked"),
+                                                         Ok(_) => {
+                                                             set_msg(&msg, true, "role revoked");
+                                                             refresh_roles();
+                                                         }
                                                          Err(e) => set_msg(&msg, false, e),
                                                      }
                                                  });
@@ -3668,7 +3728,10 @@ fn UserRow(
                                 let rid = assign_role.get();
                                 spawn_local(async move {
                                     match api::spost(&t, &format!("/api/admin/users/{id}/roles"), json!({"role_id": rid})).await {
-                                        Ok(_) => set_msg(&msg, true, "role assigned"),
+                                        Ok(_) => {
+                                            set_msg(&msg, true, "role assigned");
+                                            refresh_roles();
+                                        }
                                         Err(e) => set_msg(&msg, false, e),
                                     }
                                 });

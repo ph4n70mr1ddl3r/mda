@@ -171,18 +171,53 @@ pub fn App() -> impl IntoView {
 
 // ===== login =====
 
+/// Demo-login prefill — present in debug builds only, so a release bundle
+/// never ships default credentials in its login form.
+fn dev_prefill(v: &str) -> String {
+    if cfg!(debug_assertions) {
+        v.to_string()
+    } else {
+        String::new()
+    }
+}
+
 #[component]
 fn Login() -> impl IntoView {
     let state = use_context::<AppState>().unwrap();
     let (tenant, set_tenant) = create_signal("default".to_string());
-    let (email, set_email) = create_signal("admin@mda.local".to_string());
-    let (password, set_password) = create_signal("admin123".to_string());
+    let (email, set_email) = create_signal(dev_prefill("admin@mda.local"));
+    let (password, set_password) = create_signal(dev_prefill("admin123"));
     let (error, set_error) = create_signal(String::new());
     let (loading, set_loading) = create_signal(false);
 
     let s = state;
+    // Shared by the submit button and Enter-in-a-field (a real form submit,
+    // so logging in never requires a mouse round-trip).
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        if loading.get_untracked() {
+            return;
+        }
+        set_loading.set(true);
+        set_error.set(String::new());
+        let (t, e, p) = (tenant.get(), email.get(), password.get());
+        spawn_local(async move {
+            match api::login(&t, &e, &p).await {
+                Ok(token) => {
+                    local_set("mda_token", &token);
+                    s.token.set(Some(token));
+                    // Model/nav/dashboards/admin bootstrap rides the
+                    // token effect in `App` — fetching here too
+                    // would duplicate every request.
+                    s.page.set(Page::Home);
+                }
+                Err(err) => set_error.set(err),
+            }
+            set_loading.set(false);
+        });
+    };
     view! {
-        <div style="max-width: 300px; margin: 2rem auto;">
+        <form style="max-width: 300px; margin: 2rem auto;" on:submit=submit>
             <h2>"Login"</h2>
             <p><label>"Tenant"</label><br/>
                 <input prop:value=tenant
@@ -196,27 +231,8 @@ fn Login() -> impl IntoView {
                 <input type="password" prop:value=password
                     on:input=move |ev| set_password.set(event_target_value(&ev))
                     style="width:100%; padding:4px;" /></p>
-            <button
+            <button type="submit"
                 disabled=move || loading.get()
-                on:click=move |_: leptos::ev::MouseEvent| {
-                    set_loading.set(true);
-                    set_error.set(String::new());
-                    let (t, e, p) = (tenant.get(), email.get(), password.get());
-                    spawn_local(async move {
-                        match api::login(&t, &e, &p).await {
-                            Ok(token) => {
-                                local_set("mda_token", &token);
-                                s.token.set(Some(token));
-                                // Model/nav/dashboards/admin bootstrap rides the
-                                // token effect in `App` — fetching here too
-                                // would duplicate every request.
-                                s.page.set(Page::Home);
-                            }
-                            Err(err) => set_error.set(err),
-                        }
-                        set_loading.set(false);
-                    });
-                }
                 style="padding:6px 16px; cursor:pointer;">
                 "Login"
             </button>
@@ -225,7 +241,7 @@ fn Login() -> impl IntoView {
                 if e.is_empty() { ().into_view() }
                 else { view!{ <p style="color:red;">{e}</p> }.into_view() }
             }}
-        </div>
+        </form>
     }
 }
 
@@ -424,6 +440,15 @@ fn cell_text(row: &serde_json::Value, col: &str) -> String {
     }
 }
 
+/// Server-managed columns: never user-editable (excluded from saves), and
+/// never a good display label (excluded from fallback columns / ref pickers).
+fn is_system_field(k: &str) -> bool {
+    matches!(
+        k,
+        "id" | "version" | "owner_id" | "state" | "created_at" | "updated_at"
+    )
+}
+
 // ===== entity list (view-definition driven grid) =====
 
 #[component]
@@ -432,6 +457,9 @@ fn EntityList(entity: String) -> impl IntoView {
     let token = state.token;
     let refresh = state.refresh;
     let entity_fetch = entity.clone();
+    // Delete failures surface here (403 / restrict / network …) — a silent
+    // no-op would look like a broken button.
+    let error = create_rw_signal(String::new());
     let resource = create_resource(
         move || refresh.get(),
         move |_| {
@@ -461,6 +489,11 @@ fn EntityList(entity: String) -> impl IntoView {
                     "+ New"
                 </button>
             </div>
+            {move || {
+                let e = error.get();
+                if e.is_empty() { ().into_view() }
+                else { view!{ <p style="color:red;">{e}</p> }.into_view() }
+            }}
             <Suspense fallback=move || view!{ <p>"Loading…"</p> }>
                 {move || match resource.get() {
                     Some((view, Ok(data))) => {
@@ -495,6 +528,7 @@ fn EntityList(entity: String) -> impl IntoView {
                                                 let id_edit2 = id.clone();
                                                 let id_del = id.clone();
                                                 let token_del = token;
+                                                let err_del = error;
                                                 let ent_sig_edit = ent_sig;
                                                 let ent_sig_del = ent_sig;
                                                 let res_ref = resource;
@@ -547,7 +581,10 @@ fn EntityList(entity: String) -> impl IntoView {
                                                                     let idd = id_del.clone();
                                                                     let res = res_ref;
                                                                     spawn_local(async move {
-                                                                        let _ = api::delete_record(&tok, &ent, &idd).await;
+                                                                        match api::delete_record(&tok, &ent, &idd).await {
+                                                                            Ok(_) => err_del.set(String::new()),
+                                                                            Err(e) => err_del.set(e),
+                                                                        }
                                                                         res.refetch();
                                                                     });
                                                                 }>"Delete"</button>
@@ -579,10 +616,7 @@ fn fallback_columns(data: &ListResult) -> Vec<ViewColumn> {
     if let Some(first) = data.items.first() {
         if let Some(obj) = first.as_object() {
             for (k, _) in obj.iter() {
-                if matches!(
-                    k.as_str(),
-                    "id" | "version" | "owner_id" | "state" | "created_at" | "updated_at"
-                ) {
+                if is_system_field(k) {
                     continue;
                 }
                 cols.push(ViewColumn {
@@ -609,6 +643,8 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     let version = create_rw_signal::<Option<i64>>(None);
     let loaded = create_rw_signal(false);
     let error = create_rw_signal(String::new());
+    // In-flight guard: a second click while a save runs would double-create.
+    let saving = create_rw_signal(false);
     // remote new version from the SSE channel (None = no concurrent change).
     let conflict = create_rw_signal::<Option<i64>>(None);
     // the resolved form definition (None until fetched; None+loaded => fall back to the model)
@@ -655,18 +691,7 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                                 .map(|r| {
                                     let label = r
                                         .as_object()
-                                        .and_then(|o| {
-                                            o.iter().find(|(k, _)| {
-                                                !matches!(
-                                                    k.as_str(),
-                                                    "id" | "version"
-                                                        | "owner_id"
-                                                        | "state"
-                                                        | "created_at"
-                                                        | "updated_at"
-                                                )
-                                            })
-                                        })
+                                        .and_then(|o| o.iter().find(|(k, _)| !is_system_field(k)))
                                         .map(|(_, v)| match v {
                                             serde_json::Value::String(x) => x.clone(),
                                             o => o.to_string(),
@@ -773,6 +798,12 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
     let entity_save = entity.clone();
     let id_save = id.clone();
     let on_save = move |_: leptos::ev::MouseEvent| {
+        // Ignore clicks while a save is in flight or before the definition +
+        // record have loaded (an early click would send an empty body).
+        if saving.get_untracked() || !loaded.get_untracked() {
+            return;
+        }
+        saving.set(true);
         let tok = token.get().unwrap_or_default();
         let ent = entity_save.clone();
         let ver = version.get();
@@ -794,10 +825,7 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
                 .get()
                 .iter()
                 .filter_map(|(k, v)| {
-                    if matches!(
-                        k.as_str(),
-                        "id" | "version" | "owner_id" | "state" | "created_at" | "updated_at"
-                    ) {
+                    if is_system_field(k) {
                         None
                     } else {
                         Some((k.clone(), coerce_field(&field_types, k, v)))
@@ -816,11 +844,15 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
             };
             match res {
                 Ok(_) => {
+                    // Reset before navigating away (the unmount disposes the
+                    // signal; write-then-navigate keeps the ordering safe).
+                    saving.set(false);
                     // Refresh the list so the change is visible on return.
                     s_nav.refresh.update(|n| *n += 1);
                     s_nav.page.set(Page::List(ent));
                 }
                 Err(e) => {
+                    saving.set(false);
                     if e.contains("409") {
                         error.set(
                             "Conflict — the record was changed by someone else. Go back, reopen, and re-apply."
@@ -884,7 +916,11 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
             }.into_view()}
 
             <div style="margin-top:1rem;">
-                <button on:click=on_save style="padding:6px 16px; cursor:pointer;">"Save"</button>
+                <button on:click=on_save
+                    disabled=move || !loaded.get() || saving.get()
+                    style="padding:6px 16px; cursor:pointer;">
+                    {move || if saving.get() { "Saving…" } else { "Save" }}
+                </button>
                 <button on:click=on_cancel style="margin-left:6px; cursor:pointer;">"Cancel"</button>
             </div>
             {move || {
