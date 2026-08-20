@@ -404,7 +404,14 @@ async fn send_json(
         "PATCH" => Method::PATCH,
         _ => Method::DELETE,
     };
-    let url = format!("{}/{path}", api_base());
+    // Callers pass paths with a leading slash ("/api/…") and api_base() may
+    // carry a trailing slash (served env) — normalize both so the join never
+    // produces "//" (axum would 404 the doubled path).
+    let url = format!(
+        "{}/{}",
+        api_base().trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
     let b = gloo_net::http::RequestBuilder::new(&url)
         .method(method)
         .header("Authorization", &format!("Bearer {token}"));
