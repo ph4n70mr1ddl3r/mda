@@ -392,9 +392,14 @@ fn ReportTable(res: ReportResult) -> impl IntoView {
                     </tr>
                 </thead>
                 <tbody>
-                    <For each=move || res.rows.clone()
-                         key=|r| r.to_string()
-                         children=move |row| {
+                    {/* Key rows by position, not content: projected report rows
+                        carry no unique id, so identical rows would collide
+                        under a content key and break the For diff. */}
+                    <For each=move || {
+                            res.rows.clone().into_iter().enumerate().collect::<Vec<_>>()
+                        }
+                         key=|(i, _)| *i
+                         children=move |(_i, row)| {
                              let cols2 = res.columns.clone();
                              view! {
                                  <tr>
@@ -502,7 +507,6 @@ fn EntityList(entity: String) -> impl IntoView {
                                                             view! {
                                                                 <td style="border:1px solid #eee; cursor:pointer;"
                                                                     on:click={
-                                                                        let s_edit = s_edit;
                                                                         let id_edit2 = id_edit2.clone();
                                                                         move |_: leptos::ev::MouseEvent| {
                                                                             s_edit.page.set(Page::Form {
@@ -525,6 +529,18 @@ fn EntityList(entity: String) -> impl IntoView {
                                                                 }>"Edit"</button>
                                                             <button style="cursor:pointer; margin-left:4px; color:#a00;"
                                                                 on:click=move |_: leptos::ev::MouseEvent| {
+                                                                    // Destructive: confirm before the API call.
+                                                                    let confirmed = web_sys::window()
+                                                                        .and_then(|w| {
+                                                                            w.confirm_with_message(&format!(
+                                                                                "Delete this {} record?",
+                                                                                ent_sig_del.get()))
+                                                                                .ok()
+                                                                        })
+                                                                        .unwrap_or(true);
+                                                                    if !confirmed {
+                                                                        return;
+                                                                    }
                                                                     let tok = token_del.get().unwrap_or_default();
                                                                     let ent = ent_sig_del.get();
                                                                     let idd = id_del.clone();

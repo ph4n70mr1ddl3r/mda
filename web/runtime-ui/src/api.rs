@@ -8,17 +8,27 @@ use serde::Deserialize;
 ///    static bundle works in any environment; an empty string means same-origin.
 /// 2. build-time `MDA_API_BASE` env (`MDA_API_BASE=https://api.example.com trunk build`)
 /// 3. the dev default (Trunk on :8081, API on :8080).
+///
+/// Trailing slashes are trimmed so callers can join with `{base}/api/...`
+/// without producing `//api/...` (axum 404s the doubled path) — a served base
+/// like `https://api.example.com/` is as valid as one without the slash.
 pub fn api_base() -> String {
     if let Some(w) = web_sys::window() {
         let key = wasm_bindgen::JsValue::from_str("__MDA_API_BASE__");
         if let Ok(v) = js_sys::Reflect::get(&w.into(), &key) {
-            if let Some(s) = v.as_string() {
-                return s;
+            // Only honor a property that is actually set: a string (even "",
+            // which means same-origin) wins; anything else falls through.
+            if v.is_string() {
+                return v
+                    .as_string()
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
             }
         }
     }
     option_env!("MDA_API_BASE")
-        .map(str::to_string)
+        .map(|s| s.trim_end_matches('/').to_string())
         .unwrap_or_else(|| "http://localhost:8080".to_string())
 }
 
@@ -267,16 +277,20 @@ pub struct ViewInfo {
     pub columns: Vec<ViewColumn>,
 }
 
-/// The default list-view definition (None when the API has no view — the
-/// caller falls back to the raw model fields).
+/// The stored view definition (None only when the API truly has none — a 404;
+/// auth failures and server errors surface as Err instead of silently
+/// degrading to fallback columns).
 pub async fn get_view(token: &str, entity: &str) -> Result<Option<ViewInfo>, String> {
     let resp = gloo_net::http::Request::get(&format!("{}/api/views/{entity}", api_base()))
         .header("Authorization", &format!("Bearer {token}"))
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
+    if resp.status() == 404 {
         return Ok(None);
+    }
+    if !resp.ok() {
+        return Err(format!("View fetch failed ({})", resp.status()));
     }
     resp.json::<ViewInfo>()
         .await
@@ -318,8 +332,11 @@ pub async fn get_form(token: &str, entity: &str) -> Result<Option<FormInfo>, Str
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
+    if resp.status() == 404 {
         return Ok(None);
+    }
+    if !resp.ok() {
+        return Err(format!("Form fetch failed ({})", resp.status()));
     }
     resp.json::<FormInfo>()
         .await
@@ -340,8 +357,11 @@ pub async fn list_dashboards(token: &str) -> Result<Vec<DashSummary>, String> {
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if !resp.ok() {
+    if resp.status() == 404 {
         return Ok(vec![]);
+    }
+    if !resp.ok() {
+        return Err(format!("Dashboards fetch failed ({})", resp.status()));
     }
     resp.json::<Vec<DashSummary>>()
         .await
@@ -404,14 +424,9 @@ async fn send_json(
         "PATCH" => Method::PATCH,
         _ => Method::DELETE,
     };
-    // Callers pass paths with a leading slash ("/api/…") and api_base() may
-    // carry a trailing slash (served env) — normalize both so the join never
-    // produces "//" (axum would 404 the doubled path).
-    let url = format!(
-        "{}/{}",
-        api_base().trim_end_matches('/'),
-        path.trim_start_matches('/')
-    );
+    // api_base() is already slash-normalized; trim the path side too so the
+    // join never produces "//" (axum would 404 the doubled path).
+    let url = format!("{}/{}", api_base(), path.trim_start_matches('/'));
     let b = gloo_net::http::RequestBuilder::new(&url)
         .method(method)
         .header("Authorization", &format!("Bearer {token}"));

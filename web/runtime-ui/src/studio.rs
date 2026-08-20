@@ -419,9 +419,6 @@ fn StudioModel() -> impl IntoView {
     let new_name = create_rw_signal(String::new());
 
     let reload = {
-        let token = token;
-        let drafts = drafts;
-        let msg = msg;
         move || {
             let t = token.get().unwrap_or_default();
             let drafts = drafts;
@@ -453,9 +450,9 @@ fn StudioModel() -> impl IntoView {
             } else {
                 view! {
                     <div>
-                        <MsgLine sig=msg.clone()/>
+                        <MsgLine sig=msg/>
                         <div style="display:flex; gap:6px; align-items:center; margin-bottom:10px;">
-                            <Txt sig=new_name.clone() ph="draft name" w="200px"/>
+                            <Txt sig=new_name ph="draft name" w="200px"/>
                             <button style=btn(true)
                                 on:click=move |_: leptos::ev::MouseEvent| {
                                     let name = new_name.get();
@@ -540,8 +537,7 @@ fn DraftEditor(id: String) -> impl IntoView {
     {
         let t = token.get().unwrap_or_default();
         let id = id.clone();
-        let (etag, status, name, model, active_ids, msg, loaded) =
-            (etag, status, name, model, active_ids, msg, loaded);
+
         spawn_local(async move {
             let draft = match api::sget(&t, &format!("/api/studio/drafts/{id}")).await {
                 Ok(d) => d,
@@ -663,10 +659,7 @@ fn DraftEditor(id: String) -> impl IntoView {
     };
 
     let validate = {
-        let token = token;
         let id = id.clone();
-        let report = report;
-        let msg = msg;
         move |_: leptos::ev::MouseEvent| {
             let t = token.get().unwrap_or_default();
             let id = id.clone();
@@ -695,10 +688,10 @@ fn DraftEditor(id: String) -> impl IntoView {
                     on:click=save_pub>"Save + Publish"</button>
                 <button style=btn(false) on:click=validate>"Validate"</button>
             </div>
-            <MsgLine sig=msg.clone()/>
-            <DiffReportView report=report.clone()/>
+            <MsgLine sig=msg/>
+            <DiffReportView report=report/>
             <Show when=move || loaded.get() && status.get() == "draft">
-                <EntityDesigner model_sig=model.clone() sel=sel.clone() active=active_ids.clone()/>
+                <EntityDesigner model_sig=model sel=sel active=active_ids/>
             </Show>
         </div>
     }
@@ -756,8 +749,8 @@ fn EntityDesigner(
             <div style="min-width:270px;">
                 {h3("Entities")}
                 <div style="display:flex; gap:6px; margin-bottom:8px;">
-                    <Txt sig=new_name.clone() ph="name" w="110px"/>
-                    <Txt sig=new_label.clone() ph="label" w="110px"/>
+                    <Txt sig=new_name ph="name" w="110px"/>
+                    <Txt sig=new_label ph="label" w="110px"/>
                     <button style=btn(true)
                         on:click=move |_: leptos::ev::MouseEvent| {
                             let name = new_name.get().trim().to_string();
@@ -784,9 +777,9 @@ fn EntityDesigner(
                      children=move |pair| {
                          let (eid, ename) = pair;
                          let eid = create_rw_signal(eid);
-                         let model2 = model_sig.clone();
-                         let sel2 = sel.clone();
-                         let active2 = active.clone();
+                         let model2 = model_sig;
+                         let sel2 = sel;
+                         let active2 = active;
                          view! {
                              <div style="display:flex; gap:6px; align-items:center; padding:4px 8px; margin:2px 0; border:1px solid #e2e6ea; border-radius:4px; cursor:pointer;"
                                  on:click=move |_: leptos::ev::MouseEvent| sel2.set(Some(eid.get_untracked()))>
@@ -815,7 +808,7 @@ fn EntityDesigner(
             <div style="flex:1; min-width:0;">
                 {move || match sel.get() {
                     None => view! { <p style="color:#889;">"Select an entity."</p> }.into_view(),
-                    Some(eid) => view! { <EntityEditor model_sig=model_sig.clone() eid=eid active=active.clone()/> }.into_view(),
+                    Some(eid) => view! { <EntityEditor model_sig=model_sig eid=eid active=active/> }.into_view(),
                 }}
             </div>
         </div>
@@ -874,13 +867,13 @@ fn EntityEditor(
                 }
                  key=|fid| fid.clone()
                  children=move |fid| {
-                     view! { <FieldRow model_sig=model_sig.clone() eid=eid.get_untracked() fid=fid active=active.clone()/> }
+                     view! { <FieldRow model_sig=model_sig eid=eid.get_untracked() fid=fid active=active/> }
                  }/>
 
             <div style="display:flex; gap:6px; align-items:center; margin:8px 0 16px; flex-wrap:wrap;">
-                <Txt sig=new_f_name.clone() ph="field name" w="130px"/>
-                <Sel sig=new_f_type.clone() options=opts(FIELD_TYPES)/>
-                <Txt sig=new_f_label.clone() ph="label (optional)" w="150px"/>
+                <Txt sig=new_f_name ph="field name" w="130px"/>
+                <Sel sig=new_f_type options=opts(FIELD_TYPES)/>
+                <Txt sig=new_f_label ph="label (optional)" w="150px"/>
                 <button style=btn(true)
                     on:click=move |_: leptos::ev::MouseEvent| {
                         let name = new_f_name.get().trim().to_string();
@@ -915,10 +908,10 @@ fn EntityEditor(
                 }
                  key=|rid| rid.clone()
                  children=move |rid| {
-                     view! { <RelRow model_sig=model_sig.clone() eid=eid.get_untracked() rid=rid active=active.clone()/> }
+                     view! { <RelRow model_sig=model_sig eid=eid.get_untracked() rid=rid active=active/> }
                  }/>
             <div style="display:flex; gap:6px; align-items:center; margin-top:8px; flex-wrap:wrap;">
-                <Txt sig=new_r_field.clone() ph="field name (ref_…)" w="140px"/>
+                <Txt sig=new_r_field ph="field name (ref_…)" w="140px"/>
                 <select prop:value=move || new_r_target.get()
                     on:input=move |ev| new_r_target.set(event_target_value(&ev))
                     style=fmt_style("auto")>
@@ -930,8 +923,8 @@ fn EntityEditor(
                             .collect_view()
                     }}
                 </select>
-                <Sel sig=new_r_strength.clone() options=opts(STRENGTHS)/>
-                <Sel sig=new_r_ondelete.clone() options=opts(ON_DELETE)/>
+                <Sel sig=new_r_strength options=opts(STRENGTHS)/>
+                <Sel sig=new_r_ondelete options=opts(ON_DELETE)/>
                 <button style=btn(true)
                     on:click=move |_: leptos::ev::MouseEvent| {
                         let field = new_r_field.get().trim().to_string();
@@ -1011,16 +1004,10 @@ fn FieldRow(
 
     // Mirror the bound widgets into the draft model on every change.
     {
-        let ms = model_sig.clone();
+        let ms = model_sig;
         let (eid2, fid2) = (eid, fid);
         let (n, l, t, r, u, i, e) = (
-            name_sig.clone(),
-            label_sig.clone(),
-            type_sig.clone(),
-            req_sig.clone(),
-            uniq_sig.clone(),
-            idx_sig.clone(),
-            enum_sig.clone(),
+            name_sig, label_sig, type_sig, req_sig, uniq_sig, idx_sig, enum_sig,
         );
         create_effect(move |_| {
             let (n, l, t, r, u, i, e) = (
@@ -1055,7 +1042,7 @@ fn FieldRow(
     }
 
     let read_name = {
-        let ms = model_sig.clone();
+        let ms = model_sig;
         move || {
             field_of(&ms.get(), &eid.get(), &fid.get())
                 .map(|f| f.name)
@@ -1063,7 +1050,7 @@ fn FieldRow(
         }
     };
     let read_label = {
-        let ms = model_sig.clone();
+        let ms = model_sig;
         move || {
             field_of(&ms.get(), &eid.get(), &fid.get())
                 .map(|f| f.label.unwrap_or_default())
@@ -1071,7 +1058,7 @@ fn FieldRow(
         }
     };
     let read_type = {
-        let ms = model_sig.clone();
+        let ms = model_sig;
         move || {
             field_of(&ms.get(), &eid.get(), &fid.get())
                 .map(|f| f.field_type)
@@ -1089,16 +1076,16 @@ fn FieldRow(
                     <span style="min-width:90px; color:#2563eb; font-size:12px;">{move || read_type()}</span>
                 }.into_view()>
                 <span style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                    <Txt sig=name_sig.clone() ph="name" w="130px"/>
-                    <Txt sig=label_sig.clone() ph="label" w="130px"/>
-                    <Sel sig=type_sig.clone() options=opts(FIELD_TYPES)/>
-                    {lbl("required")} <Chk sig=req_sig.clone()/>
-                    {lbl("unique")} <Chk sig=uniq_sig.clone()/>
-                    {lbl("indexed")} <Chk sig=idx_sig.clone()/>
+                    <Txt sig=name_sig ph="name" w="130px"/>
+                    <Txt sig=label_sig ph="label" w="130px"/>
+                    <Sel sig=type_sig options=opts(FIELD_TYPES)/>
+                    {lbl("required")} <Chk sig=req_sig/>
+                    {lbl("unique")} <Chk sig=uniq_sig/>
+                    {lbl("indexed")} <Chk sig=idx_sig/>
                     {move || if type_sig.get() == "enum" {
                         view! {
                             <span style="display:flex; gap:4px; align-items:center;">
-                                {lbl("options")} <Txt sig=enum_sig.clone() ph="A, B, C" w="140px"/>
+                                {lbl("options")} <Txt sig=enum_sig ph="A, B, C" w="140px"/>
                             </span>
                         }.into_view()
                     } else { ().into_view() }}
@@ -1129,15 +1116,15 @@ fn RelRow(
     let rid = create_rw_signal(rid);
     let is_active = move || active.get().rels.contains(&rid.get());
     let read_field = {
-        let ms = model_sig.clone();
+        let ms = model_sig;
         move || rel_of(&ms.get(), &eid.get(), &rid.get())
     };
     let read_field2 = {
-        let ms = model_sig.clone();
+        let ms = model_sig;
         move || rel_of(&ms.get(), &eid.get(), &rid.get())
     };
     let target_name = {
-        let ms = model_sig.clone();
+        let ms = model_sig;
         move || {
             let target = read_field2().map(|r| r.target_entity_id.clone());
             ms.get()
@@ -1178,7 +1165,7 @@ fn StudioPages() -> impl IntoView {
     let tab = create_rw_signal(0usize);
     view! {
         <div>
-            <Tabs sig=tab.clone() labels=vec!["Forms", "Views", "Dashboards", "Navigation"]/>
+            <Tabs sig=tab labels=vec!["Forms", "Views", "Dashboards", "Navigation"]/>
             {move || match tab.get() {
                 0 => view! { <FormsTab/> }.into_view(),
                 1 => view! { <ViewsTab/> }.into_view(),
@@ -1191,6 +1178,9 @@ fn StudioPages() -> impl IntoView {
 
 /// One editable pick-list row shared by the form/view designers: a model
 /// field with an include toggle, a label override, and (forms) a widget.
+/// Bound to the field *name* (stable identity), never a positional index —
+/// `For` reuses same-key children across list edits, so an index captured at
+/// creation goes stale as soon as a row above is removed.
 #[derive(Clone)]
 struct FieldPick {
     name: String,
@@ -1245,16 +1235,16 @@ fn seed_picks(
 }
 
 #[component]
-fn PickRow(rows: RwSignal<Vec<FieldPick>>, idx: usize, widgets: bool) -> impl IntoView {
+fn PickRow(rows: RwSignal<Vec<FieldPick>>, name: String, widgets: bool) -> impl IntoView {
     let read = {
-        let rows = rows.clone();
-        move || rows.get().get(idx).cloned()
+        let name = name.clone();
+        move || rows.get().iter().find(|r| r.name == name).cloned()
     };
     let set = {
-        let rows = rows.clone();
+        let name = name.clone();
         move |f: &dyn Fn(&mut FieldPick)| {
             rows.update(|rs| {
-                if let Some(r) = rs.get_mut(idx) {
+                if let Some(r) = rs.iter_mut().find(|r| r.name == name) {
                     f(r);
                 }
             })
@@ -1264,7 +1254,7 @@ fn PickRow(rows: RwSignal<Vec<FieldPick>>, idx: usize, widgets: bool) -> impl In
     let lab = create_rw_signal(read().map(|r| r.label).unwrap_or_default());
     let wid = create_rw_signal(read().map(|r| r.widget).unwrap_or_default());
     {
-        let (inc, lab, wid) = (inc.clone(), lab.clone(), wid.clone());
+        let (inc, lab, wid) = (inc, lab, wid);
         create_effect(move |_| {
             let (i, l, w) = (inc.get(), lab.get(), wid.get());
             set(&move |r| {
@@ -1277,11 +1267,11 @@ fn PickRow(rows: RwSignal<Vec<FieldPick>>, idx: usize, widgets: bool) -> impl In
     let name = read().map(|r| r.name).unwrap_or_default();
     view! {
         <div style=row_style()>
-            <Chk sig=inc.clone()/>
+            <Chk sig=inc/>
             <span style="min-width:150px;">{name.clone()}</span>
-            <Txt sig=lab.clone() ph="label" w="150px"/>
+            <Txt sig=lab ph="label" w="150px"/>
             {move || if widgets {
-                view! { <Sel sig=wid.clone() options=opts(WIDGETS)/> }.into_view()
+                view! { <Sel sig=wid options=opts(WIDGETS)/> }.into_view()
             } else { ().into_view() }}
         </div>
     }
@@ -1322,11 +1312,11 @@ fn FormsTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">
                 {lbl("entity")}
                 {move || {
-                    let e = entity.clone();
+                    let e = entity;
                     let load = load;
                     view! {
                         <select prop:value=move || e.get()
@@ -1349,26 +1339,32 @@ fn FormsTab() -> impl IntoView {
                 if ent.is_empty() {
                     return view! { <p style="color:#889;">"Pick an entity to design its form."</p> }.into_view();
                 }
-                // NB: this closure must track ONLY `entity`. Reading `rows`
-                // here would re-run it on every PickRow edit-effect write,
-                // tearing down + recreating the keyed rows in a loop until
-                // the runtime panics (OwnerDisposed) — found by browser test.
-                let rows_c = rows.clone();
+                // Track ONLY `entity` in this outer closure (see the NB below
+                // inside the For). Reading `rows` here would re-run it on every
+                // PickRow edit-effect write, tearing down + recreating the
+                // keyed rows in a loop until the runtime panics (OwnerDisposed)
+                // — found by browser test.
+                let rows_c = rows;
+                let entity_c = entity;
                 view! {
                     <div>
                         <div style="display:flex; gap:8px; align-items:center; margin:6px 0;">
-                            {lbl("section title")} <Txt sig=section_title.clone() ph="e.g. Details" w="180px"/>
+                            {lbl("section title")} <Txt sig=section_title ph="e.g. Details" w="180px"/>
                         </div>
                         <For each=move || {
                             let rows_c = rows_c;
-                            let idx: Vec<(usize, String)> = (0..rows_c.get().len())
-                                .map(|i| (i, rows_c.get()[i].name.clone())).collect();
-                            idx
+                            let ent = entity_c.get();
+                            (0..rows_c.get().len())
+                                .map(|i| (ent.clone(), rows_c.get()[i].name.clone()))
+                                .collect::<Vec<(String, String)>>()
                         }
-                             key=|(_, name)| name.clone()
-                             children=move |pair| {
-                                 let (i, _) = pair;
-                                 view! { <PickRow rows=rows.clone() idx=i widgets=true/> }
+                             // The entity is part of the key: switching entity
+                             // remounts the rows with fresh values instead of
+                             // reusing same-name children whose input signals
+                             // still hold the previous entity's data.
+                             key=|(ent, name)| format!("{ent}::{name}")
+                             children=move |(_, name)| {
+                                 view! { <PickRow rows=rows name=name widgets=true/> }
                              }/>
                         <div style="margin-top:10px;">
                             <button style=btn(true)
@@ -1458,11 +1454,11 @@ fn ViewsTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">
                 {lbl("entity")}
                 {move || {
-                    let e = entity.clone();
+                    let e = entity;
                     let load = load;
                     view! {
                         <select prop:value=move || e.get()
@@ -1486,22 +1482,25 @@ fn ViewsTab() -> impl IntoView {
                     return view! { <p style="color:#889;">"Pick an entity to design its list view."</p> }.into_view();
                 }
                 // Track ONLY `entity` here (see the FormsTab note above).
-                let rows_c = rows.clone();
+                let rows_c = rows;
+                let entity_c = entity;
                 view! {
                     <div>
                         <For each=move || {
                             let rows_c = rows_c;
-                            let idx: Vec<(usize, String)> = (0..rows_c.get().len())
-                                .map(|i| (i, rows_c.get()[i].name.clone())).collect();
-                            idx
+                            let ent = entity_c.get();
+                            (0..rows_c.get().len())
+                                .map(|i| (ent.clone(), rows_c.get()[i].name.clone()))
+                                .collect::<Vec<(String, String)>>()
                         }
-                             key=|(_, name)| name.clone()
-                             children=move |pair| {
-                                 let (i, _) = pair;
-                                 view! { <PickRow rows=rows.clone() idx=i widgets=false/> }
+                             // Entity-scoped key: rows remount (with fresh
+                             // values) when the designed entity changes.
+                             key=|(ent, name)| format!("{ent}::{name}")
+                             children=move |(_, name)| {
+                                 view! { <PickRow rows=rows name=name widgets=false/> }
                              }/>
                         <div style="display:flex; gap:8px; align-items:center; margin-top:10px;">
-                            {lbl("page size")} <Num sig=page_size.clone() w="80px"/>
+                            {lbl("page size")} <Num sig=page_size w="80px"/>
                             <button style=btn(true)
                                 on:click=move |_: leptos::ev::MouseEvent| {
                                     let t = token.get().unwrap_or_default();
@@ -1596,7 +1595,7 @@ fn DashboardsTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             {h3("Existing dashboards")}
             <For each=move || existing.get()
                  key=|d| d["id"].as_str().unwrap_or_default().to_string()
@@ -1636,32 +1635,38 @@ fn DashboardsTab() -> impl IntoView {
 
             {h3("New / replace dashboard")}
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
-                {lbl("name (unique)")} <Txt sig=name.clone() ph="sales" w="140px"/>
-                {lbl("label")} <Txt sig=label.clone() ph="Sales overview" w="180px"/>
+                {lbl("name (unique)")} <Txt sig=name ph="sales" w="140px"/>
+                {lbl("label")} <Txt sig=label ph="Sales overview" w="180px"/>
             </div>
             <For each=move || {
-                let list: Vec<(usize, String)> = (0..tiles.get().len())
-                    .map(|i| (i, tiles.get()[i].id.clone())).collect();
+                let list: Vec<String> = tiles.get().iter().map(|t| t.id.clone()).collect();
                 list
             }
-                 key=|(_, rid)| rid.clone()
-                 children=move |pair| {
-                     let (i, _rid) = pair;
-                     let tiles2 = tiles.clone();
-                     let reports2 = reports.clone();
-                     let title_sig = create_rw_signal(tiles2.get_untracked().get(i).map(|t| t.title.clone()).unwrap_or_default());
-                     let title_sig2 = title_sig.clone();
+                 key=|rid| rid.clone()
+                 children=move |rid| {
+                     let tiles2 = tiles;
+                     let reports2 = reports;
+                     // Children are keyed by id and reused across edits, so all
+                     // reads/writes resolve the row by id — never by position.
+                     let title_sig = create_rw_signal(
+                         tiles2.get_untracked().iter().find(|t| t.id == rid)
+                             .map(|t| t.title.clone()).unwrap_or_default(),
+                     );
+                     let title_sig2 = title_sig;
+                     let rid_eff = rid.clone();
                      create_effect(move |_| {
                          let v = title_sig2.get();
-                         tiles2.update(|ts| { if let Some(t) = ts.get_mut(i) { t.title = v.clone(); } });
+                         tiles2.update(|ts| { if let Some(t) = ts.iter_mut().find(|t| t.id == rid_eff) { t.title = v.clone(); } });
                      });
+                     let rid_sel = rid.clone();
+                     let rid_inp = rid.clone();
                      view! {
                          <div style=row_style()>
                              {lbl("report")}
-                             <select prop:value=move || tiles2.get().get(i).map(|t| t.report_id.clone()).unwrap_or_default()
+                             <select prop:value=move || tiles2.get().iter().find(|t| t.id == rid_sel).map(|t| t.report_id.clone()).unwrap_or_default()
                                  on:input=move |ev| {
                                      let v = event_target_value(&ev);
-                                     tiles2.update(|ts| { if let Some(t) = ts.get_mut(i) { t.report_id = v; } });
+                                     tiles2.update(|ts| { if let Some(t) = ts.iter_mut().find(|t| t.id == rid_inp) { t.report_id = v; } });
                                  }
                                  style=fmt_style("auto")>
                                  <option value="">"— report —"</option>
@@ -1669,10 +1674,11 @@ fn DashboardsTab() -> impl IntoView {
                                      .map(|(id, n)| view! { <option value=id.clone()>{n.clone()}</option> })
                                      .collect_view()}
                              </select>
-                             {lbl("tile title")} <Txt sig=title_sig.clone() ph="optional" w="160px"/>
+                             {lbl("tile title")} <Txt sig=title_sig ph="optional" w="160px"/>
                              <button style=del_btn()
                                  on:click=move |_: leptos::ev::MouseEvent| {
-                                     tiles2.update(|ts| { ts.remove(i); });
+                                     let rid = rid.clone();
+                                     tiles2.update(|ts| { ts.retain(|t| t.id != rid); });
                                  }>"×"</button>
                          </div>
                      }
@@ -1732,7 +1738,6 @@ fn NavigationTab() -> impl IntoView {
     // prefill from the current (permission-filtered) navigation
     {
         let t = token.get().unwrap_or_default();
-        let rows = rows;
         spawn_local(async move {
             if let Ok(nav) = api::get_navigation(&t).await {
                 rows.set(
@@ -1752,50 +1757,68 @@ fn NavigationTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             <For each=move || {
-                let list: Vec<(usize, String)> = (0..rows.get().len())
-                    .map(|i| (i, rows.get()[i].id.clone())).collect();
+                let list: Vec<String> = rows.get().iter().map(|r| r.id.clone()).collect();
                 list
             }
-                 key=|(_, rid)| rid.clone()
-                 children=move |pair| {
-                     let (i, _rid) = pair;
-                     let rows2 = rows.clone();
+                 key=|rid| rid.clone()
+                 children=move |rid| {
+                     let rows2 = rows;
                      let state2 = state;
-                     let kind_sig = create_rw_signal(rows2.get_untracked().get(i).map(|r| r.kind.clone()).unwrap_or_default());
-                     let label_sig = create_rw_signal(rows2.get_untracked().get(i).map(|r| r.label.clone()).unwrap_or_default());
-                     let label_sig2 = label_sig.clone();
+                     // Keyed children are reused across edits/removals, so the
+                     // row is always resolved by id — never by position.
+                     let row_by_id = {
+                         let rid = rid.clone();
+                         move || rows2.get().iter().find(|r| r.id == rid).cloned()
+                     };
+                     let kind_sig = create_rw_signal(row_by_id().map(|r| r.kind.clone()).unwrap_or_default());
+                     let label_sig = create_rw_signal(row_by_id().map(|r| r.label.clone()).unwrap_or_default());
+                     let label_sig2 = label_sig;
+                     let rid_lab = rid.clone();
                      create_effect(move |_| {
                          let v = label_sig2.get();
-                         rows2.update(|rs| { if let Some(r) = rs.get_mut(i) { r.label = v.clone(); } });
+                         rows2.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_lab) { r.label = v.clone(); } });
                      });
+                     let rid_kind = rid.clone();
+                     let rid_url0 = rid.clone();
+                     let rid_url = rid.clone();
+                     let rid_ent = rid.clone();
+                     let rid_ent_sel = rid.clone();
                      view! {
                          <div style=row_style()>
                              <select prop:value=move || kind_sig.get()
                                  on:input=move |ev| {
                                      let v = event_target_value(&ev);
                                      kind_sig.set(v.clone());
-                                     rows2.update(|rs| { if let Some(r) = rs.get_mut(i) { r.kind = v; } });
+                                     rows2.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_kind) { r.kind = v; } });
                                  }
                                  style=fmt_style("auto")>
                                  <option value="entity">"entity"</option>
                                  <option value="link">"link"</option>
                              </select>
                              {move || if kind_sig.get() == "link" {
-                                 let url_sig = create_rw_signal(rows2.get_untracked().get(i).map(|r| r.url.clone()).unwrap_or_default());
-                                 let url_sig2 = url_sig.clone();
+                                 // Per-run clone: this reactive closure re-runs on
+                                 // every kind toggle and must stay `Fn`.
+                                 let rid_url = rid_url.clone();
+                                 let url_sig = create_rw_signal(
+                                     rows2.get_untracked().iter().find(|r| r.id == rid_url0)
+                                         .map(|r| r.url.clone()).unwrap_or_default(),
+                                 );
+                                 let url_sig2 = url_sig;
                                  create_effect(move |_| {
                                      let v = url_sig2.get();
-                                     rows2.update(|rs| { if let Some(r) = rs.get_mut(i) { r.url = v.clone(); } });
+                                     rows2.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_url) { r.url = v.clone(); } });
                                  });
-                                 view! { <Txt sig=url_sig.clone() ph="https://…" w="260px"/> }.into_view()
+                                 view! { <Txt sig=url_sig ph="https://…" w="260px"/> }.into_view()
                              } else {
+                                 let rid_ent = rid_ent.clone();
+                                 let rid_ent_sel = rid_ent_sel.clone();
                                  view! {
-                                     <select prop:value=move || rows2.get().get(i).map(|r| r.entity.clone()).unwrap_or_default()
+                                     <select prop:value=move || rows2.get().iter().find(|r| r.id == rid_ent_sel).map(|r| r.entity.clone()).unwrap_or_default()
                                          on:input=move |ev| {
                                              let v = event_target_value(&ev);
-                                             rows2.update(|rs| { if let Some(r) = rs.get_mut(i) { r.entity = v; } });
+                                             rows2.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_ent) { r.entity = v; } });
                                          }
                                          style=fmt_style("auto")>
                                          <option value="">"— entity —"</option>
@@ -1805,10 +1828,11 @@ fn NavigationTab() -> impl IntoView {
                                      </select>
                                  }.into_view()
                              }}
-                             {lbl("label")} <Txt sig=label_sig.clone() ph="menu label" w="160px"/>
+                             {lbl("label")} <Txt sig=label_sig ph="menu label" w="160px"/>
                              <button style=del_btn()
                                  on:click=move |_: leptos::ev::MouseEvent| {
-                                     rows2.update(|rs| { rs.remove(i); });
+                                     let rid = rid.clone();
+                                     rows2.update(|rs| { rs.retain(|r| r.id != rid); });
                                  }>"×"</button>
                          </div>
                      }
@@ -1906,7 +1930,7 @@ fn StudioReports() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             {h3("Saved reports")}
             <For each=move || reports.get()
                  key=|r| r["id"].as_str().unwrap_or_default().to_string()
@@ -1965,7 +1989,7 @@ fn StudioReports() -> impl IntoView {
                         <strong style="font-size:13px;">"Result"</strong>
                         {value_table(
                             &res["columns"].as_array().map(|a| a.iter().map(|c| c.as_str().unwrap_or_default().to_string()).collect::<Vec<_>>()).unwrap_or_default(),
-                            res["rows"].as_array().map(|a| a.clone()).unwrap_or_default().as_slice(),
+                            res["rows"].as_array().cloned().unwrap_or_default().as_slice(),
                         )}
                     </div>
                 }.into_view(),
@@ -1973,7 +1997,7 @@ fn StudioReports() -> impl IntoView {
 
             {h3("New / replace report")}
             <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
-                {lbl("name")} <Txt sig=name.clone() ph="sales-by-month" w="160px"/>
+                {lbl("name")} <Txt sig=name ph="sales-by-month" w="160px"/>
                 {lbl("base entity")}
                 <select prop:value=move || entity.get()
                     on:input=move |ev| {
@@ -1987,8 +2011,8 @@ fn StudioReports() -> impl IntoView {
                         .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                         .collect_view()}
                 </select>
-                {lbl("group by (comma-separated)")} <Txt sig=group_by.clone() ph="tier, status" w="160px"/>
-                {lbl("limit")} <Num sig=limit.clone() w="70px"/>
+                {lbl("group by (comma-separated)")} <Txt sig=group_by ph="tier, status" w="160px"/>
+                {lbl("limit")} <Num sig=limit w="70px"/>
             </div>
 
             {move || {
@@ -1996,27 +2020,32 @@ fn StudioReports() -> impl IntoView {
                 if ent.is_empty() {
                     return ().into_view();
                 }
-                let selects2 = selects.clone();
-                let filters2 = filters.clone();
+                let selects2 = selects;
+                let filters2 = filters;
                 view! {
                     <div>
                         <For each=move || {
-                            let list: Vec<(usize, String)> = (0..selects2.get().len())
-                                .map(|i| (i, selects2.get()[i].id.clone())).collect();
+                            let list: Vec<String> = selects2.get().iter().map(|r| r.id.clone()).collect();
                             list
                         }
-                             key=|(_, rid)| rid.clone()
-                             children=move |pair| {
-                                 let (i, _) = pair;
-                                 let sel3 = selects.clone();
+                             key=|rid| rid.clone()
+                             children=move |rid| {
+                                 let sel3 = selects;
                                  let fields3 = entity_field_list(&state, &entity.get());
+                                 // Keyed children are reused across edits, so
+                                 // all reads/writes resolve the row by id — a
+                                 // captured index would go stale after any
+                                 // removal above.
+                                 let rid_field = rid.clone();
+                                 let rid_inp = rid.clone();
+                                 let rid_del = rid.clone();
                                  view! {
                                      <div style=row_style()>
                                          {lbl("select")}
-                                         <select prop:value=move || sel3.get().get(i).map(|r| r.field.clone()).unwrap_or_default()
+                                         <select prop:value=move || sel3.get().iter().find(|r| r.id == rid_field).map(|r| r.field.clone()).unwrap_or_default()
                                              on:input=move |ev| {
                                                  let v = event_target_value(&ev);
-                                                 sel3.update(|rs| { if let Some(r) = rs.get_mut(i) { r.field = v; } });
+                                                 sel3.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_inp) { r.field = v; } });
                                              }
                                              style=fmt_style("auto")>
                                              <option value="">"— field —"</option>
@@ -2025,11 +2054,11 @@ fn StudioReports() -> impl IntoView {
                                                  .collect_view()}
                                              <option value="*">"* (count only)"</option>
                                          </select>
-                                         <AggSel rows=selects.clone() idx=i/>
-                                         <AliasInput rows=selects.clone() idx=i/>
+                                         <AggSel rows=selects rid=rid.clone()/>
+                                         <AliasInput rows=selects rid=rid/>
                                          <button style=del_btn()
                                              on:click=move |_: leptos::ev::MouseEvent| {
-                                                 sel3.update(|rs| { rs.remove(i); });
+                                                 sel3.update(|rs| { rs.retain(|r| r.id != rid_del); });
                                              }>"×"</button>
                                      </div>
                                  }
@@ -2044,22 +2073,27 @@ fn StudioReports() -> impl IntoView {
                         </div>
 
                         <For each=move || {
-                            let list: Vec<(usize, String)> = (0..filters2.get().len())
-                                .map(|i| (i, filters2.get()[i].id.clone())).collect();
+                            let list: Vec<String> = filters2.get().iter().map(|r| r.id.clone()).collect();
                             list
                         }
-                             key=|(_, rid)| rid.clone()
-                             children=move |pair| {
-                                 let (i, _) = pair;
-                                 let fil3 = filters.clone();
+                             key=|rid| rid.clone()
+                             children=move |rid| {
+                                 let fil3 = filters;
                                  let fields3 = entity_field_list(&state, &entity.get());
+                                 let rid_field = rid.clone();
+                                 let rid_field_inp = rid.clone();
+                                 let rid_op_sel = rid.clone();
+                                 let rid_op_inp = rid.clone();
+                                 let rid_val = rid.clone();
+                                 let rid_val_inp = rid.clone();
+                                 let rid_del = rid.clone();
                                  view! {
                                      <div style=row_style()>
                                          {lbl("filter")}
-                                         <select prop:value=move || fil3.get().get(i).map(|r| r.field.clone()).unwrap_or_default()
+                                         <select prop:value=move || fil3.get().iter().find(|r| r.id == rid_field).map(|r| r.field.clone()).unwrap_or_default()
                                              on:input=move |ev| {
                                                  let v = event_target_value(&ev);
-                                                 fil3.update(|rs| { if let Some(r) = rs.get_mut(i) { r.field = v; } });
+                                                 fil3.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_field_inp) { r.field = v; } });
                                              }
                                              style=fmt_style("auto")>
                                              <option value="">"— field —"</option>
@@ -2067,25 +2101,25 @@ fn StudioReports() -> impl IntoView {
                                                  .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                                                  .collect_view()}
                                          </select>
-                                         <select prop:value=move || fil3.get().get(i).map(|r| r.op.clone()).unwrap_or_default()
+                                         <select prop:value=move || fil3.get().iter().find(|r| r.id == rid_op_sel).map(|r| r.op.clone()).unwrap_or_default()
                                              on:input=move |ev| {
                                                  let v = event_target_value(&ev);
-                                                 fil3.update(|rs| { if let Some(r) = rs.get_mut(i) { r.op = v; } });
+                                                 fil3.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_op_inp) { r.op = v; } });
                                              }
                                              style=fmt_style("auto")>
                                              {opts(FILTER_OPS).into_iter()
                                                  .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                                                  .collect_view()}
                                          </select>
-                                         <input placeholder="value" prop:value=move || fil3.get().get(i).map(|r| r.value.clone()).unwrap_or_default()
+                                         <input placeholder="value" prop:value=move || fil3.get().iter().find(|r| r.id == rid_val).map(|r| r.value.clone()).unwrap_or_default()
                                              on:input=move |ev| {
                                                  let v = event_target_value(&ev);
-                                                 fil3.update(|rs| { if let Some(r) = rs.get_mut(i) { r.value = v; } });
+                                                 fil3.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_val_inp) { r.value = v; } });
                                              }
                                              style=fmt_style("140px") />
                                          <button style=del_btn()
                                              on:click=move |_: leptos::ev::MouseEvent| {
-                                                 fil3.update(|rs| { rs.remove(i); });
+                                                 fil3.update(|rs| { rs.retain(|r| r.id != rid_del); });
                                              }>"×"</button>
                                      </div>
                                  }
@@ -2147,14 +2181,16 @@ fn StudioReports() -> impl IntoView {
     }
 }
 
-/// Aggregate select for a report column row.
+/// Aggregate select for a report column row (bound to the row's stable id).
 #[component]
-fn AggSel(rows: RwSignal<Vec<SelectRow>>, idx: usize) -> impl IntoView {
+fn AggSel(rows: RwSignal<Vec<SelectRow>>, rid: String) -> impl IntoView {
+    let rid_sel = rid.clone();
+    let rid_inp = rid;
     view! {
-        <select prop:value=move || rows.get().get(idx).map(|r| r.aggregate.clone()).unwrap_or_default()
+        <select prop:value=move || rows.get().iter().find(|r| r.id == rid_sel).map(|r| r.aggregate.clone()).unwrap_or_default()
             on:input=move |ev| {
                 let v = event_target_value(&ev);
-                rows.update(|rs| { if let Some(r) = rs.get_mut(idx) { r.aggregate = v; } });
+                rows.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_inp) { r.aggregate = v; } });
             }
             style=fmt_style("auto")>
             {opts(AGGREGATES).into_iter()
@@ -2165,12 +2201,14 @@ fn AggSel(rows: RwSignal<Vec<SelectRow>>, idx: usize) -> impl IntoView {
 }
 
 #[component]
-fn AliasInput(rows: RwSignal<Vec<SelectRow>>, idx: usize) -> impl IntoView {
+fn AliasInput(rows: RwSignal<Vec<SelectRow>>, rid: String) -> impl IntoView {
+    let rid_sel = rid.clone();
+    let rid_inp = rid;
     view! {
-        <input placeholder="alias" prop:value=move || rows.get().get(idx).map(|r| r.alias.clone()).unwrap_or_default()
+        <input placeholder="alias" prop:value=move || rows.get().iter().find(|r| r.id == rid_sel).map(|r| r.alias.clone()).unwrap_or_default()
             on:input=move |ev| {
                 let v = event_target_value(&ev);
-                rows.update(|rs| { if let Some(r) = rs.get_mut(idx) { r.alias = v; } });
+                rows.update(|rs| { if let Some(r) = rs.iter_mut().find(|r| r.id == rid_inp) { r.alias = v; } });
             }
             style=fmt_style("120px") />
     }
@@ -2183,7 +2221,7 @@ fn StudioAutomation() -> impl IntoView {
     let tab = create_rw_signal(0usize);
     view! {
         <div>
-            <Tabs sig=tab.clone() labels=vec!["Rules", "Workflows"]/>
+            <Tabs sig=tab labels=vec!["Rules", "Workflows"]/>
             {move || match tab.get() {
                 0 => view! { <RulesTab/> }.into_view(),
                 _ => view! { <WorkflowsTab/> }.into_view(),
@@ -2205,7 +2243,7 @@ fn CondBuilder(
     let fields2 = fields.clone();
     view! {
         <span style="display:flex; gap:4px; align-items:center;">
-            <Sel sig=mode.clone() options=vec![
+            <Sel sig=mode options=vec![
                 ("always".into(), if prefix.is_empty() { "always".to_string() } else { format!("{prefix}: always") }),
                 ("when".into(), if prefix.is_empty() { "when…".to_string() } else { format!("{prefix}: when") }),
             ]/>
@@ -2219,8 +2257,8 @@ fn CondBuilder(
                             .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                             .collect_view()}
                     </select>
-                    <Sel sig=op.clone() options=cmp_opts()/>
-                    <Txt sig=value.clone() ph="value" w="110px"/>
+                    <Sel sig=op options=cmp_opts()/>
+                    <Txt sig=value ph="value" w="110px"/>
                 }.into_view()
             } else { ().into_view() }}
         </span>
@@ -2258,7 +2296,7 @@ fn RulesTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             {h3("Business rules")}
             <For each=move || rules.get()
                  key=|r| r["id"].as_str().unwrap_or_default().to_string()
@@ -2333,14 +2371,14 @@ fn RulesTab() -> impl IntoView {
                             .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                             .collect_view()}
                     </select>
-                    <Sel sig=event.clone() options=opts(RULE_EVENTS)/>
-                    <ConditionEditor state=state.clone() ent=ent.clone() c_mode=c_mode.clone() c_field=c_field.clone() c_op=c_op.clone() c_val=c_val.clone()/>
+                    <Sel sig=event options=opts(RULE_EVENTS)/>
+                    <ConditionEditor state=state ent=ent c_mode=c_mode c_field=c_field c_op=c_op c_val=c_val/>
                 </div>
                 <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
                     {lbl("→ set")}
                     {move || {
                         let e = ent.get();
-                        let a_field = a_field.clone();
+                        let a_field = a_field;
                         let fields = entity_field_list(&state, &e);
                         view! {
                             <select prop:value=move || a_field.get()
@@ -2354,7 +2392,7 @@ fn RulesTab() -> impl IntoView {
                         }
                     }}
                     {lbl("=")}
-                    <Sel sig=a_kind.clone() options=vec![
+                    <Sel sig=a_kind options=vec![
                         ("text".into(), "text".into()),
                         ("number".into(), "number".into()),
                         ("bool".into(), "true/false".into()),
@@ -2362,7 +2400,7 @@ fn RulesTab() -> impl IntoView {
                         ("empty".into(), "empty".into()),
                     ]/>
                     {move || if a_kind.get() != "now" && a_kind.get() != "empty" {
-                        view! { <Txt sig=a_val.clone() ph="value" w="130px"/> }.into_view()
+                        view! { <Txt sig=a_val ph="value" w="130px"/> }.into_view()
                     } else { ().into_view() }}
                     <button style=btn(true)
                         on:click=move |_: leptos::ev::MouseEvent| {
@@ -2413,7 +2451,7 @@ fn ConditionEditor(
         {move || {
             let e = ent.get();
             let fields = entity_field_list(&state, &e);
-            let (m, f, o, v) = (c_mode.clone(), c_field.clone(), c_op.clone(), c_val.clone());
+            let (m, f, o, v) = (c_mode, c_field, c_op, c_val);
             view! {
                 <CondBuilder mode=m field=f op=o value=v fields=fields prefix="if"/>
             }.into_view()
@@ -2472,7 +2510,7 @@ fn WorkflowsTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             {h3("Workflows (state machines)")}
             <For each=move || wfs.get()
                  key=|w| w["id"].as_str().unwrap_or_default().to_string()
@@ -2546,45 +2584,52 @@ fn WorkflowsTab() -> impl IntoView {
                             .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                             .collect_view()}
                     </select>
-                    {lbl("name")} <Txt sig=name.clone() ph="approval" w="120px"/>
-                    {lbl("states")} <Txt sig=states_txt.clone() ph="new, active, closed" w="200px"/>
+                    {lbl("name")} <Txt sig=name ph="approval" w="120px"/>
+                    {lbl("states")} <Txt sig=states_txt ph="new, active, closed" w="200px"/>
                     <span style="font-size:11px; color:#667;">"(new records start in “active”)"</span>
                 </div>
 
                 <For each=move || {
-                    let list: Vec<(usize, String)> = (0..trans.get().len())
-                        .map(|i| (i, trans.get()[i].id.clone())).collect();
+                    let list: Vec<String> = trans.get().iter().map(|r| r.id.clone()).collect();
                     list
                 }
-                     key=|(_, rid)| rid.clone()
-                     children=move |pair| {
-                         let (i, _) = pair;
-                         let t2 = trans.clone();
-                         let ent2 = ent.clone();
-                         let name_sig = create_rw_signal(t2.get_untracked().get(i).map(|r| r.name.clone()).unwrap_or_default());
+                     key=|rid| rid.clone()
+                     children=move |rid| {
+                         let t2 = trans;
+                         let ent2 = ent;
+                         // Keyed children are reused across edits/removals, so
+                         // the row is always resolved by id — never by position.
+                         let init = t2.get_untracked().iter().find(|r| r.id == rid).cloned();
+                         let name_sig = create_rw_signal(init.as_ref().map(|r| r.name.clone()).unwrap_or_default());
                          let (g_m, g_f, g_o, g_v, af, ak, av, ct) = (
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.g_mode.clone()).unwrap_or_default()),
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.g_field.clone()).unwrap_or_default()),
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.g_op.clone()).unwrap_or_default()),
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.g_val.clone()).unwrap_or_default()),
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.action_field.clone()).unwrap_or_default()),
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.a_kind.clone()).unwrap_or_default()),
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.a_val.clone()).unwrap_or_default()),
-                             create_rw_signal(t2.get_untracked().get(i).map(|r| r.creates_task).unwrap_or(false)),
+                             create_rw_signal(init.as_ref().map(|r| r.g_mode.clone()).unwrap_or_default()),
+                             create_rw_signal(init.as_ref().map(|r| r.g_field.clone()).unwrap_or_default()),
+                             create_rw_signal(init.as_ref().map(|r| r.g_op.clone()).unwrap_or_default()),
+                             create_rw_signal(init.as_ref().map(|r| r.g_val.clone()).unwrap_or_default()),
+                             create_rw_signal(init.as_ref().map(|r| r.action_field.clone()).unwrap_or_default()),
+                             create_rw_signal(init.as_ref().map(|r| r.a_kind.clone()).unwrap_or_default()),
+                             create_rw_signal(init.as_ref().map(|r| r.a_val.clone()).unwrap_or_default()),
+                             create_rw_signal(init.as_ref().map(|r| r.creates_task).unwrap_or(false)),
                          );
-                         let name_sig2 = name_sig.clone();
+                         let name_sig2 = name_sig;
+                         let rid_name = rid.clone();
                          create_effect(move |_| {
                              let v = name_sig2.get();
-                             t2.update(|ts| { if let Some(r) = ts.get_mut(i) { r.name = v.clone(); } });
+                             t2.update(|ts| { if let Some(r) = ts.iter_mut().find(|r| r.id == rid_name) { r.name = v.clone(); } });
                          });
+                         let rid_from_sel = rid.clone();
+                         let rid_from_inp = rid.clone();
+                         let rid_to_sel = rid.clone();
+                         let rid_to_inp = rid.clone();
+                         let rid_del = rid;
                          view! {
                              <div style="border:1px solid #e8ebef; border-radius:4px; padding:8px; margin:6px 0;">
                                  <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                                     {lbl("transition")} <Txt sig=name_sig.clone() ph="approve" w="110px"/>
-                                     <select prop:value=move || t2.get().get(i).map(|r| r.from_state.clone()).unwrap_or_default()
+                                     {lbl("transition")} <Txt sig=name_sig ph="approve" w="110px"/>
+                                     <select prop:value=move || t2.get().iter().find(|r| r.id == rid_from_sel).map(|r| r.from_state.clone()).unwrap_or_default()
                                          on:input=move |ev| {
                                              let v = event_target_value(&ev);
-                                             t2.update(|ts| { if let Some(r) = ts.get_mut(i) { r.from_state = v; } });
+                                             t2.update(|ts| { if let Some(r) = ts.iter_mut().find(|r| r.id == rid_from_inp) { r.from_state = v; } });
                                          }
                                          style=fmt_style("auto")>
                                          <option value="">"— from —"</option>
@@ -2593,10 +2638,10 @@ fn WorkflowsTab() -> impl IntoView {
                                              .collect_view()}
                                      </select>
                                      <span>{"→"}</span>
-                                     <select prop:value=move || t2.get().get(i).map(|r| r.to_state.clone()).unwrap_or_default()
+                                     <select prop:value=move || t2.get().iter().find(|r| r.id == rid_to_sel).map(|r| r.to_state.clone()).unwrap_or_default()
                                          on:input=move |ev| {
                                              let v = event_target_value(&ev);
-                                             t2.update(|ts| { if let Some(r) = ts.get_mut(i) { r.to_state = v; } });
+                                             t2.update(|ts| { if let Some(r) = ts.iter_mut().find(|r| r.id == rid_to_inp) { r.to_state = v; } });
                                          }
                                          style=fmt_style("auto")>
                                          <option value="">"— to —"</option>
@@ -2604,20 +2649,20 @@ fn WorkflowsTab() -> impl IntoView {
                                              .map(|s| view! { <option value=s.clone()>{s.clone()}</option> })
                                              .collect_view()}
                                      </select>
-                                     {lbl("creates task")} <Chk sig=ct.clone()/>
+                                     {lbl("creates task")} <Chk sig=ct/>
                                      <button style=del_btn()
                                          on:click=move |_: leptos::ev::MouseEvent| {
-                                             t2.update(|ts| { ts.remove(i); });
+                                             t2.update(|ts| { ts.retain(|r| r.id != rid_del); });
                                          }>"×"</button>
                                  </div>
                                  <div style="display:flex; gap:6px; align-items:center; margin-top:6px; flex-wrap:wrap;">
-                                     <GuardEditor ent=ent2.clone() g_m=g_m.clone() g_f=g_f.clone() g_o=g_o.clone() g_v=g_v.clone()/>
+                                     <GuardEditor ent=ent2 g_m=g_m g_f=g_f g_o=g_o g_v=g_v/>
                                  </div>
                                  <div style="display:flex; gap:6px; align-items:center; margin-top:6px; flex-wrap:wrap;">
                                      {lbl("on run: set")}
                                      {move || {
                                          let e = ent2.get();
-                                         let af = af.clone();
+                                         let af = af;
                                          let fields = entity_field_list(&state, &e);
                                          view! {
                                              <select prop:value=move || af.get()
@@ -2630,7 +2675,7 @@ fn WorkflowsTab() -> impl IntoView {
                                              </select>
                                          }
                                      }}
-                                     <Sel sig=ak.clone() options=vec![
+                                     <Sel sig=ak options=vec![
                                          ("text".into(), "text".into()),
                                          ("number".into(), "number".into()),
                                          ("bool".into(), "true/false".into()),
@@ -2638,7 +2683,7 @@ fn WorkflowsTab() -> impl IntoView {
                                          ("empty".into(), "empty".into()),
                                      ]/>
                                      {move || if ak.get() != "now" && ak.get() != "empty" {
-                                         view! { <Txt sig=av.clone() ph="value" w="120px"/> }.into_view()
+                                         view! { <Txt sig=av ph="value" w="120px"/> }.into_view()
                                      } else { ().into_view() }}
                                  </div>
                              </div>
@@ -2724,7 +2769,7 @@ fn GuardEditor(
         {move || {
             let e = ent.get();
             let fields = entity_field_list(&state, &e);
-            let (m, f, o, v) = (g_m.clone(), g_f.clone(), g_o.clone(), g_v.clone());
+            let (m, f, o, v) = (g_m, g_f, g_o, g_v);
             view! { <CondBuilder mode=m field=f op=o value=v fields=fields prefix="guard"/> }.into_view()
         }}
     }
@@ -2737,7 +2782,7 @@ fn StudioSecurity() -> impl IntoView {
     let tab = create_rw_signal(0usize);
     view! {
         <div>
-            <Tabs sig=tab.clone() labels=vec!["Teams", "Roles", "Org-wide defaults", "Users", "Sharing rules"]/>
+            <Tabs sig=tab labels=vec!["Teams", "Roles", "Org-wide defaults", "Users", "Sharing rules"]/>
             {move || match tab.get() {
                 0 => view! { <TeamsTab/> }.into_view(),
                 1 => view! { <RolesTab/> }.into_view(),
@@ -2791,7 +2836,7 @@ fn TeamsTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             <For each=move || teams.get()
                  key=|t| t["id"].as_str().unwrap_or_default().to_string()
                  children=move |t: Value| {
@@ -2860,7 +2905,7 @@ fn TeamsTab() -> impl IntoView {
                      }
                  }/>
             <div style="display:flex; gap:6px; align-items:center; margin-top:10px;">
-                <Txt sig=new_name.clone() ph="new team name" w="160px"/>
+                <Txt sig=new_name ph="new team name" w="160px"/>
                 <select prop:value=move || new_parent.get()
                     on:input=move |ev| new_parent.set(event_target_value(&ev))
                     style=fmt_style("auto")>
@@ -2944,7 +2989,7 @@ fn RolesTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             {h3("Roles")}
             <For each=move || roles.get()
                  key=|r| r["id"].as_str().unwrap_or_default().to_string()
@@ -2987,7 +3032,7 @@ fn RolesTab() -> impl IntoView {
                      }
                  }/>
             <div style="display:flex; gap:6px; align-items:center; margin:8px 0 14px;">
-                <Txt sig=new_role.clone() ph="new role name" w="160px"/>
+                <Txt sig=new_role ph="new role name" w="160px"/>
                 <button style=btn(true)
                     on:click=move |_: leptos::ev::MouseEvent| {
                         let t = token.get().unwrap_or_default();
@@ -3047,8 +3092,8 @@ fn RolesTab() -> impl IntoView {
                                      }
                                  }/>
                             <div style="display:flex; gap:6px; align-items:center; margin:6px 0;">
-                                <Sel sig=p_ent.clone() options=ent_opts.clone()/>
-                                <Sel sig=p_verb.clone() options=verb_opts.clone()/>
+                                <Sel sig=p_ent options=ent_opts.clone()/>
+                                <Sel sig=p_verb options=verb_opts.clone()/>
                                 <button style=btn(false)
                                     on:click=move |_: leptos::ev::MouseEvent| {
                                         let t = token.get().unwrap_or_default();
@@ -3092,7 +3137,7 @@ fn RolesTab() -> impl IntoView {
                                      }
                                  }/>
                             <div style="display:flex; gap:6px; align-items:center; margin:6px 0; flex-wrap:wrap;">
-                                <Sel sig=fp_ent.clone() options=ent_opts.clone()/>
+                                <Sel sig=fp_ent options=ent_opts.clone()/>
                                 {move || {
                                     let e = fp_ent.get();
                                     let fields = entity_field_list(&state, &e);
@@ -3107,7 +3152,7 @@ fn RolesTab() -> impl IntoView {
                                         </select>
                                     }
                                 }}
-                                <Sel sig=fp_access.clone() options=vec![
+                                <Sel sig=fp_access options=vec![
                                     ("none".into(), "no access".into()),
                                     ("read".into(), "read".into()),
                                     ("write".into(), "write".into()),
@@ -3131,7 +3176,7 @@ fn RolesTab() -> impl IntoView {
                             <p style="font-size:11px; color:#667; margin:4px 0;">
                                 "A user holding a parent role READS records owned by users in descendant roles (“see records below me”)."
                             </p>
-                            <RoleParents rid=rid.get_untracked() roles=roles.clone() parent_role=parent_role.clone() msg=msg.clone() token=token/>
+                            <RoleParents rid=rid.get_untracked() roles=roles parent_role=parent_role msg=msg token=token/>
                         </div>
                     }.into_view()
                 }
@@ -3153,8 +3198,6 @@ fn RoleParents(
     let parents = create_rw_signal(Vec::<(String, String)>::new());
     {
         let t = token.get().unwrap_or_default();
-        let rid = rid;
-        let parents = parents;
         spawn_local(async move {
             if let Ok(v) = api::sget(
                 &t,
@@ -3269,7 +3312,7 @@ fn OwdTab() -> impl IntoView {
     let ents = entity_options(&state);
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             <p style="font-size:12px; color:#667; margin-top:0;">
                 "The org-wide default is the baseline visibility for every record; sharing rules and manual shares only widen it."
             </p>
@@ -3289,7 +3332,7 @@ fn OwdTab() -> impl IntoView {
                      view! {
                          <div style=row_style()>
                              <strong style="min-width:170px;">{label.clone()}</strong>
-                             <Sel sig=sig.clone() options=opts(OWD_LEVELS)/>
+                             <Sel sig=sig options=opts(OWD_LEVELS)/>
                              <button style=btn(false)
                                  on:click=move |_: leptos::ev::MouseEvent| {
                                      let t = token.get().unwrap_or_default();
@@ -3358,7 +3401,7 @@ fn UsersTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             <For each=move || users.get()
                  key=|u| u["id"].as_str().unwrap_or_default().to_string()
                  children=move |u: Value| {
@@ -3367,8 +3410,8 @@ fn UsersTab() -> impl IntoView {
 
             {h3("New user")}
             <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
-                <Txt sig=n_email.clone() ph="email" w="180px"/>
-                <Txt sig=n_name.clone() ph="name" w="140px"/>
+                <Txt sig=n_email ph="email" w="180px"/>
+                <Txt sig=n_name ph="name" w="140px"/>
                 <input type="password" placeholder="password" prop:value=move || n_pw.get()
                     on:input=move |ev| n_pw.set(event_target_value(&ev))
                     style=fmt_style("140px") />
@@ -3438,9 +3481,6 @@ fn UserRow(
     let new_pw = create_rw_signal(String::new());
 
     let refresh_roles = {
-        let token = token;
-        let uid = uid;
-        let my_roles = my_roles;
         move || {
             let t = token.get().unwrap_or_default();
             let id = uid.get_untracked();
@@ -3675,7 +3715,7 @@ fn ShareTab() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             {h3("Criteria-based sharing rules")}
             <For each=move || rules.get()
                  key=|r| r["id"].as_str().unwrap_or_default().to_string()
@@ -3754,7 +3794,7 @@ fn ShareTab() -> impl IntoView {
                     {move || {
                         let e = n_ent.get();
                         let fields = entity_field_list(&state, &e);
-                        let (m, f, o, v) = (c_mode.clone(), c_field.clone(), c_op.clone(), c_val.clone());
+                        let (m, f, o, v) = (c_mode, c_field, c_op, c_val);
                         view! { <CondBuilder mode=m field=f op=o value=v fields=fields prefix=""/> }.into_view()
                     }}
                 </div>
@@ -3768,7 +3808,7 @@ fn ShareTab() -> impl IntoView {
                             .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                             .collect_view()}
                     </select>
-                    <Sel sig=n_access.clone() options=vec![("read".into(), "read".into()), ("write".into(), "write".into())]/>
+                    <Sel sig=n_access options=vec![("read".into(), "read".into()), ("write".into(), "write".into())]/>
                     <button style=btn(true)
                         on:click=move |_: leptos::ev::MouseEvent| {
                             let t = token.get().unwrap_or_default();
@@ -3824,7 +3864,7 @@ fn StudioData() -> impl IntoView {
 
     view! {
         <div>
-            <MsgLine sig=msg.clone()/>
+            <MsgLine sig=msg/>
             {h3("Export active model")}
             <button style=btn(false)
                 on:click=move |_: leptos::ev::MouseEvent| {
@@ -3839,7 +3879,7 @@ fn StudioData() -> impl IntoView {
                 }>"Fetch model JSON"</button>
             <Show when=move || !model_json.get().is_empty()>
                 <div style="margin-top:8px;">
-                    <Area sig=model_json.clone() rows=14 ph=""/>
+                    <Area sig=model_json rows=14 ph=""/>
                 </div>
             </Show>
 
@@ -3847,7 +3887,7 @@ fn StudioData() -> impl IntoView {
             <p style="font-size:12px; color:#667; margin:4px 0;">
                 "Paste an exported model bundle. Importing stages a draft (never publishes) — open it in the Model tab to validate and publish."
             </p>
-            <Area sig=import_json.clone() rows=10 ph="paste model JSON here"/>
+            <Area sig=import_json rows=10 ph="paste model JSON here"/>
             <button style=btn(true)
                 on:click=move |_: leptos::ev::MouseEvent| {
                     let t = token.get().unwrap_or_default();
