@@ -2,7 +2,7 @@
 
 A critical, self-imposed architectural review. Verdict up front, then strengths, then the gaps that will actually hurt.
 
-> **Status:** All critical gaps (C1–C6) and underspecified items (U1–U4, U6–U8) are resolved in `PLAN.md` (now v0.4); the timeline re-estimate and MVP milestone are addressed in §9. Only **U5 (data i18n)** and **U9 (HA/replication)** remain — deliberately deferred to later phases. Subsequent review passes produced further refinements recorded as **ADRs 0011–0017** (publish execution & atomic cutover, value-constraint composition, sharing materialization, reporting query model, deletion/restore lifecycle, chained workflow transitions, rollup summaries). This review is retained as the reasoning trail; see `adr/` for all recorded decisions.
+> **Status:** All critical gaps (C1–C6) and underspecified items (U1–U4, U6–U8) are resolved in `PLAN.md` (now v0.4); the timeline re-estimate and MVP milestone are addressed in §9. Only **U5 (data i18n)** and **U9 (HA/replication)** remain — deliberately deferred to later phases. Subsequent review passes produced further refinements recorded as **ADRs 0011–0026** (publish execution & atomic cutover, value-constraint composition, sharing materialization, reporting query model, deletion/restore lifecycle, chained workflow transitions, rollup summaries — then surfaced capabilities, scheduled jobs, platform follow-ups, mass actions, API versioning, i18n, GraphQL hot-invalidation, team hierarchy, and criteria sharing rules + live role hierarchy). This review is retained as the reasoning trail; see `adr/` for all recorded decisions.
 
 ---
 

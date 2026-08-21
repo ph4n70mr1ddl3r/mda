@@ -1,5 +1,5 @@
 # Common flows for MDA. Works with Docker OR Podman — set CTN=podman to switch.
-#   make test         # unit + DB-backed suites (single-threaded; needs a Postgres)
+#   make test         # unit + DB-backed suites (fully parallel; needs a Postgres)
 #   make run-dev      # start postgres+redis, run the server from source
 #   make up-staging   # build & run the whole stack (prod-like)
 #   make quadlet-install   # install systemd/Podman units (prod; sudo)

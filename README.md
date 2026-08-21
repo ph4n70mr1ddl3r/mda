@@ -52,7 +52,8 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 ## Quick start
 
 ```bash
-# 1. dependencies (Postgres 16 + Redis) — Docker OR Podman:
+# 1. dependencies — Postgres 16 (required) + Redis (provisioned for later
+# use; not yet a runtime dependency, PLAN §3) — Docker OR Podman:
 docker compose up -d postgres redis
 # podman compose up -d postgres redis   # Podman 4+ works with the same file
 
@@ -67,7 +68,7 @@ Health check:
 
 ```bash
 curl localhost:8080/health
-# {"status":"ok","database":"up","version":"0.1.0"}
+# {"status":"ok","database":"up","version":"0.1.0","audit_failures":0}
 ```
 
 Login is **tenant-scoped** (the client names the tenant; this is what lets the
@@ -102,6 +103,7 @@ curl -X POST localhost:8080/api/data/Customer -H "x-tenant-id: $TENANT" \
      -H "content-type: application/json" -d '{"name":"Acme"}'
 curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TENANT"
 # PATCH /api/data/:entity/:id  (If-Match: <version>)  — OCC update (409 on conflict)
+# POST /api/data/:entity/:id/restore                    — batch restore from archive (ADR-0015)
 # Mass actions (ADR-0021) — bulk update/delete by filter, reusing the write pipeline:
 #   POST /api/data/:entity/mass-update   {"filter":["tier:eq:Bronze"],"set":{"tier":"Silver"},"dry_run":false}
 #   POST /api/data/:entity/mass-delete   {"filter":["tier:eq:Bronze"]}
@@ -311,7 +313,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
   - §5.17 — reporting query model & security (structured metadata, runner-context AuthZ by construction)
   - §5.18–5.22 — platform capabilities: notifications & messaging, templating, secrets management, event/webhook contract, integration architecture (hub model), **scheduled-job management (§14)**
   - §14 — tracked, not yet designed (platform gaps)
-- [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
+- [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements recorded as ADRs 0011–0026; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (26 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities, scheduled jobs, platform follow-ups, mass actions, API versioning, i18n, GraphQL hot-invalidation, **team hierarchy + admin security API**, **criteria sharing rules + live role hierarchy**).
 - [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE10.md`](./docs/PHASE10.md) — phase status & handoffs.

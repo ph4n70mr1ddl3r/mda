@@ -92,7 +92,7 @@ The database holds **two distinct models**:
 | Validation | `validator` + custom expression engine | |
 | Async jobs | **`apalis`** (Postgres-backed) | Cron, retries, delayed, DLQ; drives scheduled reports, workflow timers, two-phase purge, integration flows (§5.22), notification digests (§5.18), sharing reshare jobs (ADR-0013), and the outbox-drain worker (§5.9.4) |
 | Search | PostgreSQL FTS → OpenSearch later | Start simple |
-| Frontend | **Leptos** (CSR/SSR, WASM) *or* React + TypeScript | See §8 |
+| Frontend | **Leptos** (CSR, WASM) — decided by the Phase-0 spike, ADR-0009 (React spike retained in `web/spike-react`) | See §8 |
 | Frontend build | Trunk (WASM) / Vite | |
 | Observability | `tracing` + OpenTelemetry → Grafana/Loki/Tempo | |
 | Config | `config-rs` / figment | Env + files |
@@ -113,7 +113,7 @@ This is the schema that *describes the descriptions*. Everything below is a tabl
 
 > **Note — fixed meta-model (ADR-0008):** the platform's own definitions (`md_entity`, `md_field`, …) are **static Rust structs + SQL**, not first-class runtime entities. This is deliberate (avoids the bootstrapping / infinite-regress of self-hosting meta-metadata); the consequence is "no edit the editor." See §5.12.
 >
-> **As-built deltas (v1).** The sketches below are the *conceptual* model; the shipped schema differs in places. **Implemented as sketched:** `md_module`, `md_entity`, `md_field`, `md_relationship`, the §4.8 lifecycle tables, `md_form`, `md_view`, `md_dashboard`, `md_navigation`, `md_rule`, `md_workflow*`, `md_report` — plus later additions **`md_template`** (§5.19), **`md_notification_type`** (§5.18), **`md_translation`** (ADR-0023), and **`md_sequence`** (the `auto_number` backend). **Carried differently:** constraints/indexes ride as columns on `md_field`/`md_entity` (no separate `md_constraint`/`md_index` tables); workflow states live in `md_workflow_state` (not `md_entity_state`); expressions are inline JSONB AST columns, not an `md_expression` table; `md_script` is deferred; the report model is a structured `dataset` JSONB on `md_report` with scheduling via `sys_schedule` (ADR-0019), not child tables; there is no `sec_group` (teams + `sec_role_assignment` cover it). **Also shipped** beyond the sketches: `sec_session`, `sys_message`, `sys_secret_audit`, `sys_schedule`/`sys_schedule_run`, `sys_integration_run`, `sys_webhook_delivery`, `sys_inbound_webhook`, `sys_webhook_relay_cursor`, `sys_login_throttle`.
+> **As-built deltas (v1).** The sketches below are the *conceptual* model; the shipped schema differs in places. **Implemented as sketched:** `md_module`, `md_entity`, `md_field`, `md_relationship`, the §4.8 lifecycle tables, `md_form`, `md_view`, `md_dashboard`, `md_navigation`, `md_rule`, `md_workflow*`, `md_report` — plus later additions **`md_template`** (§5.19), **`md_notification_type`** (§5.18), **`md_translation`** (ADR-0023), and **`md_sequence`** (the `auto_number` backend). **Carried differently:** constraints/indexes ride as columns on `md_field`/`md_entity` (no separate `md_constraint`/`md_index` tables); workflow states live in `md_workflow_state` (not `md_entity_state`); expressions are inline JSONB AST columns, not an `md_expression` table; `md_script` is deferred; the report model is a structured `dataset` JSONB on `md_report` with scheduling via `sys_schedule` (ADR-0019), not child tables; there is no `sec_group` (teams + `sec_role_assignment` cover it); manual shares are rows in `sec_record_share` with `rule_id NULL` (no separate `sec_share` table); action-level gating rides `sec_permission` (workflow transitions authorize as verb `update`) — dedicated `sec_action_permission` / `sec_field_constraint` tables (grains 5/6, §5.11) are designed but not yet shipped. **Not yet shipped from the sketches:** `sys_lock` (soft checkout — designed §5.9.2, deferred), `sys_setting`, `sys_version` (superseded by the §4.8 lifecycle tables), and `sys_impex_job`/`sys_impex_row` (the async import worker — deferred, see the Phase 10 note in §9). **Also shipped** beyond the sketches: `sec_session`, `sys_message`, `sys_secret_audit`, `sys_schedule`/`sys_schedule_run`, `sys_integration_run`, `sys_webhook_delivery`, `sys_inbound_webhook`, `sys_webhook_relay_cursor`, `sys_login_throttle`.
 
 ### 4.1 Modules & Entities
 ```
@@ -414,7 +414,7 @@ Consequences:
 - List responses include per-row versions so clients can echo them back.
 - Postgres MVCC (READ COMMITTED) means readers never block writers; OCC is the layer that prevents *lost updates* on top of that.
 
-**2. Soft checkout (`sys_lock`) is advisory UX, not hard correctness.**
+**2. Soft checkout (`sys_lock`) is advisory UX, not hard correctness.** *(Designed here; table + endpoints not yet shipped — see §4 as-built note.)*
 - Optional "record is being edited by Alice" lock with TTL + heartbeat — shows a banner, prevents duplicated effort, auto-releases on timeout or explicit release.
 - It does **not** enforce correctness; OCC does. Hard pessimistic `SELECT … FOR UPDATE` is reserved for genuine serialization (workflow/timers, below), never routine edits.
 
@@ -473,6 +473,10 @@ sys_event_log
   type           -- record.created | record.updated | record.deleted
                  -- workflow.transitioned | task.assigned | task.completed
                  -- record.checked_out | record.released | metadata.published | notification.*
+                 -- (as built, the log carries record.created/updated/deleted and
+                 --  workflow.transitioned; task.*, checked_out/released, and
+                 --  metadata.published rows are designed, not yet emitted —
+                 --  publish broadcast rides the meta_changed NOTIFY, §5.3)
   entity, record_id
   payload JSONB  -- changed_fields, from_version, to_version, actor
   -- indexes: (tenant_id, seq), (tenant_id, entity, record_id)
@@ -550,9 +554,9 @@ Ownership / team / manual-share layers are evaluated **live** from the cached ef
 - `write` → fully editable.
 - Enforced in the **serialization layer** (read projection) and the **deserialization/mutate layer** (write rejection).
 
-**5. Action / transition level.** `sec_action_permission(role, action_id)` gates workflow transitions and custom actions — checked at the action invocation boundary. Modeling transitions as explicit actions (not just "update") is what lets you say "only the Approve role can run the Approve transition."
+**5. Action / transition level.** `sec_action_permission(role, action_id)` gates workflow transitions and custom actions — checked at the action invocation boundary. Modeling transitions as explicit actions (not just "update") is what lets you say "only the Approve role can run the Approve transition." *(As built, transitions gate on `sec_permission` verb `update`; a dedicated action-grain table is the designed target — see §4 as-built note.)*
 
-**6. Value constraints (write ABAC).** `sec_field_constraint(entity, field, condition, message)` — per-role conditions evaluated by the expression engine at write time (e.g. "role=sales_rep ⇒ discount ≤ 0.05"). **Distinct from validations** (`md_rule` / field validations): validations are universal data-correctness rules; field constraints are authorization-scoped ("*who* may set *what*"). Both use the same engine. **Composition (ADR-0012):** when a user holds several roles that grant write on a field, the applicable constraints *intersect* — all must hold — so a constraint cannot be bypassed by adding a permissive role. A role granting only `read` imposes no write constraint.
+**6. Value constraints (write ABAC).** `sec_field_constraint(entity, field, condition, message)` — per-role conditions evaluated by the expression engine at write time (e.g. "role=sales_rep ⇒ discount ≤ 0.05"). *(Designed; not yet shipped — see §4 as-built note.)* **Distinct from validations** (`md_rule` / field validations): validations are universal data-correctness rules; field constraints are authorization-scoped ("*who* may set *what*"). Both use the same engine. **Composition (ADR-0012):** when a user holds several roles that grant write on a field, the applicable constraints *intersect* — all must hold — so a constraint cannot be bypassed by adding a permissive role. A role granting only `read` imposes no write constraint.
 
 **Effective-context caching.** At session start, compute the user's effective context — roles (direct + via teams/groups), teams, role-hierarchy ancestors, and compiled sharing-rule predicates — and cache it (Redis, TTL) keyed by `user_id`; invalidate on role/team/hierarchy/sharing-rule change. **Invalidation is a tenant-scoped broadcast** over the `meta_changed`/event channel (§5.3/§5.10), not a local call — a role/team change processed on instance A must invalidate sessions on instance B too. Correctness holds regardless (the next check re-reads from the `sec_*` tables), but the broadcast keeps authorization changes prompt across the cluster, and is load-bearing for sharing-rule/hierarchy *epoch* invalidation (ADR-0013). Every grain consults this cached context rather than re-querying the `sec_*` tables per request.
 
@@ -568,8 +572,8 @@ Ownership / team / manual-share layers are evaluated **live** from the cached ef
 | Record (write) | Before mutate | Check the specific record against the policy |
 | Field (read) | Serialization layer | Project: drop `none`, expose `read`/`write` |
 | Field (write) | Deserialization / mutate | Reject writes to non-`write` fields |
-| Field value | Write validation | Expression engine (ABAC) |
-| Action / transition | Action boundary | `sec_action_permission` |
+| Field value | Write validation | Expression engine (ABAC) — designed, not yet shipped |
+| Action / transition | Action boundary | `sec_action_permission` (designed; rides `sec_permission` verb `update` as built) |
 | Event channel (C5) | SSE relay | Per-client row filter + FLS on `sys_event_log` payloads |
 | Report dataset | Report engine (compile time) | Structured model compiled by the engine — FLS projection + per-entity record predicate by construction (§5.17) |
 | GraphQL | Service layer (shared with REST) | Per-field FLS + record predicate at every relationship level; depth/cost limits (§7, ADR-0010) |
@@ -762,7 +766,7 @@ mda/
 │   ├── mda-rules/             # business rule engine (triggers/conditions/actions)
 │   ├── mda-reports/           # report dataset builder + renderers (pdf/xlsx/csv)
 │   ├── mda-integration/       # connectors, mappings, ETL flows
-│   ├── mda-audit/             # write-path logging: sys_audit_log + sys_event_log + sys_outbox rows (all written together in the write txn, §5.9.3 step 7); the outbox-DRAIN worker itself runs in mda-server via apalis
+│   ├── mda-audit/             # write-path logging: sys_audit_log + sys_event_log + sys_outbox rows (all written together in the write txn, §5.9.3 step 7); the outbox-DRAIN worker itself runs in mda-server via apalis  [NOT A CRATE AS BUILT — see the as-built note below; this logic lives in mda-api::data + mda-server::outbox]
 │   ├── mda-api/               # HTTP handlers (Axum) — the "edge"
 │   └── mda-server/            # binary: wires everything, config, bootstrap
 ├── migrations/                # SQLx migrations for meta schema
@@ -773,6 +777,8 @@ mda/
 ```
 
 > **Crate granularity vs. team size (§13 Q2).** This 12-crate split is the *target* decomposition for a real team; for a solo or small team it is heavy boundary overhead. Start with a smaller core set (e.g. `mda-core`, `mda-meta`, `mda-data`, and `mda-api`/`mda-server`) and split a crate out on demand as a module accrues distinct responsibilities. The boundaries above are logical contracts, not a mandate to pre-create every crate up front.
+>
+> **As-built deltas (§6).** The workspace ships **11 of the 12 sketched crates** — there is no `mda-audit` crate: the write-path logging (`sys_audit_log` + `sys_event_log` + `sys_outbox` inserts, §5.9.3 step 7) lives in `mda-api` (`src/data.rs`), and the outbox-drain worker in `mda-server` (`src/outbox.rs`). Two tree placements also differ as built: the Docker files (`Dockerfile`, `docker-compose.yml`, `compose.staging.yml`) sit at the repo root, not `docker/`; and the end-to-end/integration tests live under `crates/mda-server/tests/`, not a root `tests/` directory.
 
 ### Module responsibilities (detail)
 
@@ -826,7 +832,9 @@ GET    /api/data/:entity/:id                            # read
 POST   /api/data/:entity                                # create
 PATCH  /api/data/:entity/:id                            # update
 DELETE /api/data/:entity/:id                            # hard-delete + archive (ADR-0006)
+POST   /api/data/:entity/:id/restore                    # batch restore from the archive (ADR-0015)
 POST   /api/data/:entity/:id/:transition                # workflow action
+POST   /api/data/:entity/{mass-update,mass-delete}      # bulk by filter, reusing the write pipeline (ADR-0021)
 GET    /api/forms/:entity                               # form definition (for UI)
 GET    /api/views/:entity                               # list-view definition
 GET    /api/reports/:id/run?params=...                  # run report
@@ -870,7 +878,7 @@ The schema is derived from the active model and re-generated on publish (§5.8).
 
 The runtime UI is a **metadata interpreter**: fetch form/view JSON → render inputs/tables → POST back. It is thin; the server is the brain.
 
-> **Decision deferred to a Phase 0 spike (ADR-0009):** the drag-and-drop Studio designers are the highest-risk, highest-effort component. Phase 0 builds a throwaway metadata-driven form renderer in *both* Leptos and React to make the call on evidence rather than committing now. Until then the frontend stack is provisional.
+> **Decision recorded (ADR-0009): Leptos.** The Phase-0 spike built a throwaway metadata-driven form renderer in *both* Leptos and React (`web/spike-leptos`, `web/spike-react`); both built cleanly, and **Leptos (CSR, WASM) was adopted** for both the Runtime UI and the Studio UI — full-stack Rust, shared `serde` types, and a logic-focused renderer offset the thinner component ecosystem. The hedged table above is retained as the original reasoning.
 
 ---
 
@@ -881,7 +889,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 > **MVP milestone (the de-risk target).** The credible MVP is one vertical slice: *define an entity via the Studio API → publish → CRUD via the runtime API → a **basic** rendered form + list UI → login/auth.* Its server-side prerequisites are Phases 1–3 (metadata engine, dynamic data layer, auth); on top of those, a **minimal** form+list UI is built (dashboards, fancy views, and real-time are skipped for the MVP). It lands around **week 26** — aligned with the re-estimate below, when a basic runtime UI exists — **not at week 55**. Everything heavier — full Studio designers, workflows, reporting, integrations, real-time, bulk import, attachments — is **post-MVP**. Ship the MVP to real users early to validate the model-driven core before committing to the long tail.
 
 ### Phase 0 — Foundation (Weeks 1–3)
-- Cargo workspace skeleton, CI, Docker, dev Postgres+Redis
+- Cargo workspace skeleton, CI, Docker, dev Postgres (+ Redis provisioned, unused in v1 — §3)
 - `mda-core`: error types, IDs (`ulid`), traits
 - Config, logging (`tracing`), health endpoint
 - SQLx setup + migration runner; `meta` schema skeleton
