@@ -110,10 +110,20 @@ impl MailSender for SmtpMailSender {
         // EHLO replies are multiline (250-… 250 ); drain to the terminal line.
         drain_multiline(&mut reader, "250", &self.host).await?;
 
-        cmd(&mut write, &format!("MAIL FROM:<{}>\r\n", msg.from)).await?;
+        // Envelope addresses are scrubbed too — a CRLF in an address would
+        // smuggle an extra SMTP command into the session (command injection).
+        cmd(
+            &mut write,
+            &format!("MAIL FROM:<{}>\r\n", header_scrub(&msg.from)),
+        )
+        .await?;
         require_code(&read_reply(&mut reader).await?, "250", &self.host)?;
 
-        cmd(&mut write, &format!("RCPT TO:<{}>\r\n", msg.to)).await?;
+        cmd(
+            &mut write,
+            &format!("RCPT TO:<{}>\r\n", header_scrub(&msg.to)),
+        )
+        .await?;
         require_code(&read_reply(&mut reader).await?, "250", &self.host)?;
 
         cmd(&mut write, "DATA\r\n").await?;
@@ -122,9 +132,17 @@ impl MailSender for SmtpMailSender {
         // RFC 5321 4.5.2: dot-stuff every line beginning with '.', then close
         // the message body with a line containing only '.'.
         let stuffed = dot_stuff(&msg.body);
+        // Header values are scrubbed of CR/LF/NUL: the subject is the
+        // notification-type label and the content-type comes from stored
+        // template metadata — both modeler-authored (§5.16 untrusted
+        // metadata), and a bare CRLF in any of them would split/inject
+        // headers into the DATA payload.
         let headers = format!(
             "From: {}\r\nTo: {}\r\nSubject: {}\r\nContent-Type: {}\r\n\r\n",
-            msg.from, msg.to, msg.subject, msg.content_type
+            header_scrub(&msg.from),
+            header_scrub(&msg.to),
+            header_scrub(&msg.subject),
+            header_scrub(&msg.content_type)
         );
         let payload = format!("{headers}{stuffed}\r\n.\r\n");
         cmd(&mut write, payload.as_bytes()).await?;
@@ -205,6 +223,20 @@ fn is_error_code(line: &str) -> bool {
         .is_some_and(|c| (*c as char).is_ascii_digit() && *c >= b'4')
 }
 
+/// RFC 5322 §2.2 / RFC 5321 §4.5.2: CR, LF, and NUL are forbidden in unfolded
+/// header values and envelope commands. Scrub them (replace with a space) so a
+/// modeler-authored subject / content-type / address can never split a header
+/// or inject an SMTP command — the §5.16 untrusted-metadata rule applied to
+/// the egress path.
+fn header_scrub(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\r' | '\n' | '\0' => ' ',
+            c => c,
+        })
+        .collect()
+}
+
 /// RFC 5322 4.5.2 dot-stuffing: a line beginning with '.' is prefixed with
 /// another '.'. Operates on CRLF-split lines.
 fn dot_stuff(body: &str) -> String {
@@ -239,6 +271,22 @@ mod tests {
         assert_eq!(dot_stuff("end."), "end.");
         // a lone-dot line (the caller adds the terminator separately) is escaped.
         assert_eq!(dot_stuff("."), "..");
+    }
+
+    #[test]
+    fn header_values_never_carry_crlf() {
+        // A modeler-authored subject carrying a CRLF must not be able to split
+        // the Subject header (or inject an extra one) into the DATA payload.
+        let evil = "Invoice\r\nBcc: attacker@evil.example";
+        assert_eq!(header_scrub(evil), "Invoice  Bcc: attacker@evil.example");
+        // LF-only and NUL are scrubbed too.
+        assert_eq!(header_scrub("a\nb"), "a b");
+        assert_eq!(header_scrub("a\0b"), "a b");
+        // Clean values pass through byte-for-byte.
+        assert_eq!(
+            header_scrub("Invoice overdue — act now"),
+            "Invoice overdue — act now"
+        );
     }
 
     #[tokio::test]

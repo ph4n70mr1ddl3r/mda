@@ -232,6 +232,40 @@ predicate; wrong-tenant ids are 404.
   instead), asserts on response `total` (was `unwrap_or(0)` = vacuous), and
   the draft-PUT check says what it means (not-5xx, not success-or-client-error).
 
+## Fourth pass (2026-08-16): correctness/consistency sweep — SSE scoping, SMTP egress, modeling gate
+
+A fresh correctness/completeness/consistency/unambiguity review over docs +
+crates (all suites green before and after). Three findings, fixed with
+regressions:
+
+### SSE `tenant:` channel was not caller-tenant-scoped (medium)
+
+`GET /api/events?channel=tenant:<uuid>:broadcast` matched events for **any**
+tenant id the client named — an authenticated user of tenant A knowing (or
+guessing) tenant B's UUID received B's system events. Cross-tenant isolation
+must not rest on the secrecy of tenant ids. The filter now requires
+`tid == caller.tenant_id`; the `user:*:notifications` channel was already
+self+tenant-scoped and gained regression coverage in the same unit suite
+(`mda-api/src/events.rs`, `ChannelFilter` tests).
+
+### SMTP header/envelope CRLF injection from modeler metadata (medium)
+
+The §5.18 email channel interpolates the **notification-type label** (the
+subject) and the **stored template content-type** — both modeler-authored,
+§5.16-untrusted — directly into the DATA headers, and the envelope addresses
+into `MAIL FROM`/`RCPT TO`. A label containing CRLF could split/inject headers
+(a `Bcc:` exfil) or smuggle SMTP commands. All four values are now scrubbed of
+CR/LF/NUL at the transport boundary (`header_scrub`, `mda-api/src/mail.rs`);
+the body was already dot-stuffed.
+
+### `reference`-typed *field* was publishable but unwritable (low, modeling UX)
+
+`reference` is in the §5.6 type registry, so a modeler could publish a **field**
+of that type — which `coerce()` then rejects on every write (a dead field).
+Per §5.1/§5.7 a reference is modeled as a *relationship* (hoisted FK column);
+the publish gate now rejects a `reference`-typed field with a message pointing
+at relationships (`mda-meta/src/draft.rs`).
+
 ## Verifying a deployment yourself
 
 ```bash

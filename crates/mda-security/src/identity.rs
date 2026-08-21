@@ -64,7 +64,12 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub(crate) fn new(
+    /// Construct an identity directly from already-resolved permission sets.
+    /// Prefer [`load_identity`](crate::load_identity), which resolves these from
+    /// the database; this constructor exists for embedders and tests that
+    /// assemble an [`Identity`] themselves. `object_perms` is (entity, verb)
+    /// pairs — `("*", "*")` yields a superuser.
+    pub fn new(
         user_id: Uuid,
         tenant_id: Uuid,
         team_id: Option<Uuid>,

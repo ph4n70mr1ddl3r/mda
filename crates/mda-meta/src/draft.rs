@@ -333,6 +333,17 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
                     e.name, f.name, f.field_type
                 ));
             }
+            // `reference` is in the §5.6 type registry but is not a legal
+            // *field* type: a reference is modeled as a relationship (which
+            // hoists a real FK column, §5.7). A `reference`-typed field would
+            // publish fine but be unwritable at runtime (`coerce` rejects it) —
+            // catch it at the modeling gate instead.
+            if f.field_type == "reference" {
+                report.errors.push(format!(
+                    "field {}.{}: a reference is modeled as a relationship (hoisted FK column), not a field type",
+                    e.name, f.name
+                ));
+            }
             if f.name.trim().is_empty() {
                 report
                     .errors
@@ -906,6 +917,32 @@ mod tests {
                 "expected rejection of {bad}: {r:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_reference_typed_field_directs_to_relationships() {
+        // `reference` is a known registry type but must be expressed as a
+        // relationship — a field of that type would be unwritable at runtime.
+        let mut draft = DraftModel::empty();
+        let mut e = ent(1, "Customer");
+        e.fields.push(DraftField {
+            id: Uuid::from_u128(21),
+            name: "parent".into(),
+            label: None,
+            field_type: "reference".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({}),
+        });
+        draft.entities.push(e);
+        let r = diff(&DraftModel::empty(), &draft);
+        assert!(!r.valid);
+        assert!(r
+            .errors
+            .iter()
+            .any(|m| m.contains("modeled as a relationship")));
     }
 
     #[test]

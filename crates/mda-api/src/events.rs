@@ -372,7 +372,9 @@ impl ChannelFilter {
         match self {
             ChannelFilter::All => {
                 if system {
-                    // metadata.published / tenant broadcasts only for own tenant
+                    // system events (no entity — e.g. notification fan-out rows;
+                    // `metadata.published` is designed §5.10 but not yet emitted)
+                    // only for own tenant
                     ev.tenant_id == user.tenant_id
                 } else {
                     readable(ev, user)
@@ -391,7 +393,14 @@ impl ChannelFilter {
                     && ev.typ.starts_with("notification.")
                     && uid == &user.user_id
             }
-            ChannelFilter::TenantBroadcast(tid) => ev.tenant_id == *tid && system,
+            // A caller may only ever subscribe to *their own* tenant's
+            // broadcast channel — without the `tid == user.tenant_id` check a
+            // client naming another tenant's UUID would receive that tenant's
+            // system events (cross-tenant isolation must not rest on the
+            // secrecy of tenant ids).
+            ChannelFilter::TenantBroadcast(tid) => {
+                *tid == user.tenant_id && ev.tenant_id == user.tenant_id && system
+            }
         }
     }
 }
@@ -406,4 +415,88 @@ fn readable(ev: &EventRow, user: &Identity) -> bool {
             .as_deref()
             .map(|e| user.can(e, "read") || user.is_superuser)
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A superuser identity in `tenant` (permissions `("*", "*")`).
+    fn user_in(tenant: Uuid) -> Identity {
+        Identity::new(
+            Uuid::new_v4(),
+            tenant,
+            None,
+            [("*".to_string(), "*".to_string())].into_iter().collect(),
+            Default::default(),
+        )
+    }
+
+    fn system_event(tenant: Uuid, typ: &str) -> EventRow {
+        EventRow {
+            seq: 1,
+            tenant_id: tenant,
+            typ: typ.to_string(),
+            entity: None,
+            record_id: None,
+            payload: json!({}),
+        }
+    }
+
+    #[test]
+    fn tenant_broadcast_channel_cannot_cross_tenants() {
+        let own = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let user = user_in(own);
+
+        // Subscribing to another tenant's broadcast channel must not deliver
+        // that tenant's system events (even though the filter names it).
+        let f = ChannelFilter::parse(Some(&format!("tenant:{other}:broadcast")));
+        assert!(!f.matches(&system_event(other, "metadata.published"), &user));
+
+        // Own tenant's broadcast channel receives own-tenant system events …
+        let f = ChannelFilter::parse(Some(&format!("tenant:{own}:broadcast")));
+        assert!(f.matches(&system_event(own, "metadata.published"), &user));
+        // … and never another tenant's.
+        assert!(!f.matches(&system_event(other, "metadata.published"), &user));
+        // Non-system (record) events never ride the broadcast channel.
+        let mut rec = system_event(own, "record.created");
+        rec.entity = Some("Customer".into());
+        assert!(!f.matches(&rec, &user));
+    }
+
+    #[test]
+    fn user_notifications_channel_is_self_and_tenant_scoped() {
+        let own = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let user = user_in(own);
+
+        let f = ChannelFilter::parse(Some(&format!("user:{}:notifications", user.user_id)));
+        assert!(f.matches(&system_event(own, "notification.created"), &user));
+        // another user's channel → nothing, not even own-tenant events
+        let f = ChannelFilter::parse(Some(&format!("user:{}:notifications", Uuid::new_v4())));
+        assert!(!f.matches(&system_event(own, "notification.created"), &user));
+        // cross-tenant notification rows → dropped
+        let f = ChannelFilter::parse(Some(&format!("user:{}:notifications", user.user_id)));
+        assert!(!f.matches(&system_event(other, "notification.created"), &user));
+    }
+
+    #[test]
+    fn malformed_channels_fall_back_to_all() {
+        assert!(matches!(
+            ChannelFilter::parse(Some("tenant:not-a-uuid:broadcast")),
+            ChannelFilter::All
+        ));
+        assert!(matches!(
+            ChannelFilter::parse(Some("user:not-a-uuid:notifications")),
+            ChannelFilter::All
+        ));
+        assert!(matches!(ChannelFilter::parse(None), ChannelFilter::All));
+        // record: without a parseable id degrades to an entity filter
+        assert!(matches!(
+            ChannelFilter::parse(Some("record:Customer:not-a-uuid")),
+            ChannelFilter::Entity(_)
+        ));
+    }
 }

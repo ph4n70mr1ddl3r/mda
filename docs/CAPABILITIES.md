@@ -124,15 +124,15 @@ The earlier follow-ups are now **implemented** (each with a DB-backed test):
   kind pulls an inbound flow from its connector on cadence and materializes the
   fetched records (`fetch_and_run_inbound`; the same path a webhook trigger uses).
 
-Remaining, still-deferred (lower priority / tied to other work):
+Recently closed (formerly listed as deferred here — kept for the trail):
 
-- **GraphQL schema hot-invalidation** is now **closed** (ADR-0024): the schema
+- **GraphQL schema hot-invalidation** — **closed** (ADR-0024): the schema
   cache is hooked to the `meta_changed` NOTIFY (same channel as the metadata
   cache) so stale version entries are evicted on publish, not retained. The
   `(tenant, version)` key remains the correctness guarantee (a publish rebuilds
   by advancing the version).
 - **Team hierarchy** (parent-team / sub-team visibility in record security +
-  recipient resolution) is now **closed** (ADR-0025): `sec_team.parent_id` is the
+  recipient resolution) — **closed** (ADR-0025): `sec_team.parent_id` is the
   visibility tree. Under team-OWD the record-visibility predicate walks the tree
   **downward** from the viewer's team (`WITH RECURSIVE descendant_teams`), so a
   member of an ancestor (manager) team reads records owned by members of any
@@ -145,6 +145,9 @@ Remaining, still-deferred (lower priority / tied to other work):
   object/field permission grant/revoke, OWD per entity, users CRUD +
   activate/deactivate + password reset + role assignment. The hierarchy
   round-trips through tenant config import (id-remapped `parent_id`).
+
+Still deferred (lower priority / tied to other work):
+
 - **Tenant-scoped *data* export/restore + data residency** remain tied to the
   tenant lifecycle (§5.4) and HA (U9). Tenant *configuration* export **and**
   import now ship: `GET /api/tenants/export` + `POST /api/tenants/import`
