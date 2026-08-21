@@ -49,7 +49,7 @@ stored as metadata in PostgreSQL and interpreted at runtime by a Rust engine.
 > (`/api/observability/{events,outbox,migrations,audit}`), and a stable
 > error-code taxonomy (`mda.<kind>`) on every error response.
 
-## Quick start (Phase 0)
+## Quick start
 
 ```bash
 # 1. dependencies (Postgres 16 + Redis) — Docker OR Podman:
@@ -162,8 +162,9 @@ AuthZ-enforced, sharing REST's service layer:
 # object/field/record security enforced per field.
 curl -X POST localhost:8080/api/graphql -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
-     -d '{"query":"{ customer(id:\"…\") { name customer { name } } }"}
-# mutation createCustomer(input: {name: "Acme"}) { id name version } }'
+     -d '{"query":"{ customer(id:\"$ID\") { name version } }"}'
+# Nested traversal rides reference fields, e.g.:
+#   { invoice(id:"…") { amount customer { name } } }
 curl -X POST localhost:8080/api/graphql -H "Authorization: Bearer $JWT" \
      -H 'content-type: application/json' \
      -d '{"query":"mutation { createCustomer(input: {name:\"Acme\"}) { id name version } }"}'
@@ -268,6 +269,11 @@ DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
 # Platform-capability + GraphQL + scheduler + tenant suites (§5.18–5.22, ADR-0010, §14):
 #   cargo test --test secrets --test templates --test notifications \
 #              --test webhooks --test integration_flows --test graphql --test scheduler --test tenants --test admin
+# Later suites — record security, authoring, UI definitions, platform edges:
+#   cargo test --test sharing_rules --test ui_defs --test reports_api \
+#              --test mass_actions --test rules_workflows --test translations \
+#              --test versioning --test events --test sessions --test throttle \
+#              --test security --test observability --test app_role
 ```
 
 The `data`/`studio` suites connect the app as the non-superuser `mda_app` role
@@ -307,7 +313,7 @@ Frontend spike (ADR-0009): see [`web/README.md`](./web/README.md).
   - §14 — tracked, not yet designed (platform gaps)
 - [`docs/REVIEW.md`](./docs/REVIEW.md) — critical review of the plan (C1–C6 resolved; further refinements as ADRs 0011–0017; reasoning trail).
 - [`docs/ri-strategies.md`](./docs/ri-strategies.md) — how major platforms handle referential integrity.
-- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (25 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities, scheduled jobs, platform follow-ups, mass actions, API versioning, i18n, GraphQL hot-invalidation, **team hierarchy + admin security API**).
+- [`docs/adr/`](./docs/adr/) — Architecture Decision Records (26 ADRs: storage/RI, lifecycle + publish/migration execution, concurrency + workflow chaining, real-time, multi-grained authz + sharing materialization + value-constraint composition, reporting query model, deletion & restoration, rollup summaries, job queue, meta-model, frontend, GraphQL, surfaced capabilities, scheduled jobs, platform follow-ups, mass actions, API versioning, i18n, GraphQL hot-invalidation, **team hierarchy + admin security API**, **criteria sharing rules + live role hierarchy**).
 - [`docs/PHASE0.md`](./docs/PHASE0.md) · … · [`docs/PHASE10.md`](./docs/PHASE10.md) — phase status & handoffs.
 - [`docs/CAPABILITIES.md`](./docs/CAPABILITIES.md) — the §5.18–5.22 platform-capability cluster (secrets, templating, notifications, webhook contract, hub-model integration) + GraphQL (ADR-0010) status & handoff.
 - [`docs/HARDENING.md`](./docs/HARDENING.md) — Phase-11 production hardening pass: release-mode E2E as the `mda_app` role, the works-as-owner bug class it exposed (schema misplacement, missing grants, runtime DDL), and the regression suites that now guard it.
@@ -325,8 +331,9 @@ See §9 of `PLAN.md` (MVP milestone lands ~week 26).
 crates/        Rust workspace: mda-core, mda-meta, mda-data, mda-expression,
                mda-security, mda-rules, mda-workflow, mda-reports,
                mda-integration, mda-api, mda-server
-migrations/    SQLx migrations (Phase 0: meta schema skeleton)
-web/           Phase 0 frontend spike (Leptos + React) — throwaway
+migrations/    SQLx migrations (meta/sec/int/sys schemas, RLS + the mda_app role)
+web/           runtime-ui — the shipped Leptos Runtime UI + Studio (WASM/CSR),
+               plus spike-leptos / spike-react (the Phase 0 throwaway spike)
 docker/ (in repo root: docker-compose.yml, Dockerfile)
 .github/       CI
 ```

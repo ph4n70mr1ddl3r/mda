@@ -86,7 +86,7 @@ The database holds **two distinct models**:
 | Database | **PostgreSQL 16** | JSONB, row-level security, LISTEN/NOTIFY, mature |
 | DB access | **SQLx** (compile-time checked) + dynamic SQL for runtime | Static for metadata, dynamic for business data |
 | Migrations | SQLx / Refinery | Versioned, repeatable |
-| Caching | Redis (with `deadpool-redis`) | Metadata cache, sessions, pub/sub |
+| Caching | `moka` in-process (v1) → Redis (`deadpool-redis`) later | Metadata cache keyed `(tenant_id, …)` (§5.3). As built, v1 runs on the in-process cache + Postgres `LISTEN/NOTIFY`; Redis plugs in for cross-instance pub/sub at scale (§5.10.4) and is not a dependency yet |
 | AuthN | `jsonwebtoken`, `argon2`, OAuth2 (`openidconnect`) | JWT + refresh tokens |
 | Serialization | `serde` + `serde_json` | Everywhere |
 | Validation | `validator` + custom expression engine | |
@@ -112,6 +112,8 @@ Enforced at the API edge via Tower middleware — **per-tenant and per-user** qu
 This is the schema that *describes the descriptions*. Everything below is a table in the `meta` schema. **All `md_*`, `sec_*`, `sys_*`, and `biz.*` tables are tenant-scoped** — each carries `tenant_id`, is covered by RLS (§5.4), and is cached keyed by `(tenant_id, …)` (§5.3); a tenant's model (entities, fields, forms, …) is its own, never global. (The sketches below omit `tenant_id` for brevity.)
 
 > **Note — fixed meta-model (ADR-0008):** the platform's own definitions (`md_entity`, `md_field`, …) are **static Rust structs + SQL**, not first-class runtime entities. This is deliberate (avoids the bootstrapping / infinite-regress of self-hosting meta-metadata); the consequence is "no edit the editor." See §5.12.
+>
+> **As-built deltas (v1).** The sketches below are the *conceptual* model; the shipped schema differs in places. **Implemented as sketched:** `md_module`, `md_entity`, `md_field`, `md_relationship`, the §4.8 lifecycle tables, `md_form`, `md_view`, `md_dashboard`, `md_navigation`, `md_rule`, `md_workflow*`, `md_report` — plus later additions **`md_template`** (§5.19), **`md_notification_type`** (§5.18), **`md_translation`** (ADR-0023), and **`md_sequence`** (the `auto_number` backend). **Carried differently:** constraints/indexes ride as columns on `md_field`/`md_entity` (no separate `md_constraint`/`md_index` tables); workflow states live in `md_workflow_state` (not `md_entity_state`); expressions are inline JSONB AST columns, not an `md_expression` table; `md_script` is deferred; the report model is a structured `dataset` JSONB on `md_report` with scheduling via `sys_schedule` (ADR-0019), not child tables; there is no `sec_group` (teams + `sec_role_assignment` cover it). **Also shipped** beyond the sketches: `sec_session`, `sys_message`, `sys_secret_audit`, `sys_schedule`/`sys_schedule_run`, `sys_integration_run`, `sys_webhook_delivery`, `sys_inbound_webhook`, `sys_webhook_relay_cursor`, `sys_login_throttle`.
 
 ### 4.1 Modules & Entities
 ```
@@ -201,7 +203,7 @@ sys_notification - user-facing notifications: (id, tenant_id, user_id, type, ent
                    pushed over the user:<id>:notifications channel (§5.10); read/unread via read_at
 sys_lock         - soft advisory record checkout (owner, ttl, heartbeat) for UX coordination. §5.9
 sys_setting      - key/value config
-sys_translation  - i18n strings (metadata/UI only; data-level i18n deferred — U5)
+md_translation (meta schema, ADR-0023) - i18n strings (metadata/UI only; data-level i18n deferred — U5)
 sys_version      - metadata versioning / migration tracking
 sys_impex_job    - bulk import/export job: (type, entity, format, mode, mapping JSONB,
                    status, stats JSONB, source/result blob refs, created_by, timestamps) §5.13
@@ -353,7 +355,7 @@ Consequences:
 
 ### 5.8 Metadata lifecycle: draft → validate → publish → activate
 
-**Problem being solved (REVIEW.md C2, enables C3):** metadata describes data that already exists and that other metadata depends on. You cannot freely mutate live metadata — it must be validated, may require DDL + data migration, must be previewable before activation, and must be rollbackable. Therefore **all edits go through drafts; publish is the only path to activation.** There is no "edit the active model directly."
+**Problem being solved (REVIEW.md C2, enables C3; recorded as ADR-0002):** metadata describes data that already exists and that other metadata depends on. You cannot freely mutate live metadata — it must be validated, may require DDL + data migration, must be previewable before activation, and must be rollbackable. Therefore **all edits go through drafts; publish is the only path to activation.** There is no "edit the active model directly."
 
 **Three states:**
 - **Active** — the live, published model. The `md_*` tables *are* the active model; runtime reads them directly (fast, simple hot path).
@@ -362,7 +364,7 @@ Consequences:
 
 **Lifecycle:**
 1. **Branch** — create a draft from the current active model (or from a snapshot).
-2. **Edit** — Studio mutates the draft JSONB. v1: one editor per draft (checkout lock + optimistic `version_etag`); multi-editor collaboration is a v2 extension. Multiple drafts per tenant are allowed, but there is **no merge**: if two drafts diverge, each publish is re-validated against the *then-current* active model and applies sequentially (last publish wins on conflicting changes). Collaborative/3-way merge is a v2 concern.
+2. **Edit** — Studio mutates the draft JSONB. v1: single-editor enforced by the optimistic `version_etag` (`PUT /api/studio/drafts/:id/model` + `If-Match` → 409 on conflict); explicit checkout locks and multi-editor collaboration are v2 extensions. Multiple drafts per tenant are allowed, but there is **no merge**: if two drafts diverge, each publish is re-validated against the *then-current* active model and applies sequentially (last publish wins on conflicting changes). Collaborative/3-way merge is a v2 concern.
 3. **Validate** — server runs dependency/integrity checks and produces a **migration plan** (dry-run). Nothing is applied.
 4. **Preview/Test** — Studio renders forms/views/reports against the draft (loaded into an ephemeral cache), optionally against a scratch dataset.
 5. **Publish** — apply the migration plan atomically, promote draft → active, archive previous active → snapshot.
@@ -403,7 +405,7 @@ Consequences:
 
 ### 5.9 Concurrency & transactional semantics
 
-(Resolves REVIEW.md **C4**.) The system must (a) prevent lost updates, (b) keep multi-step writes atomic, and (c) guarantee that external side-effects are delivered exactly without coupling request latency to external systems. The answers below are deliberately standard patterns — do not invent novel concurrency.
+(Resolves REVIEW.md **C4**; recorded as ADR-0003.) The system must (a) prevent lost updates, (b) keep multi-step writes atomic, and (c) guarantee that external side-effects are delivered exactly without coupling request latency to external systems. The answers below are deliberately standard patterns — do not invent novel concurrency.
 
 **1. Record-level concurrency: optimistic by default.**
 - Every `biz.<table>` carries a `version BIGINT` (core column, §5.1) — this is the **per-row OCC counter**, distinct from the model's `md_active_version` (§4.8) and a draft's `version_etag` (§5.8). Updates are conditional:
@@ -458,7 +460,7 @@ This yields a clean, answerable rule for "are rules/workflows trustworthy or eve
 
 ### 5.10 Real-time channel for the runtime UI
 
-(Resolves REVIEW.md **C5**.) A metadata-driven UI where another user edits the same record, or a workflow silently moves it, must push updates — otherwise the UX collapses into stale data and the OCC conflicts from §5.9 surface only as frustrating 409s on save. The channel is built on the canonical event stream already produced by every write (§5.9), so it adds almost no new state.
+(Resolves REVIEW.md **C5**; recorded as ADR-0004.) A metadata-driven UI where another user edits the same record, or a workflow silently moves it, must push updates — otherwise the UX collapses into stale data and the OCC conflicts from §5.9 surface only as frustrating 409s on save. The channel is built on the canonical event stream already produced by every write (§5.9), so it adds almost no new state.
 
 **1. Transport: SSE first.** Server-Sent Events for the server→client push that is ~90% of our traffic (record/task/workflow notifications, list refresh). Client→server (mutations, presence heartbeats) goes through the normal REST API. SSE auto-reconnects, is HTTP-friendly behind load balancers, and is far simpler to scale than WebSocket. Reserve WebSocket for a future collaborative-co-editing feature that needs low-latency bidirectional ops.
 
@@ -506,7 +508,7 @@ sys_event_log
 
 ### 5.11 Authorization — multi-grained, deny-by-default, ABAC-powered
 
-(Resolves REVIEW.md **C6**.) Enterprise authorization operates at six grains; the original `sec_permission` ("verb on entity") covered only one. The model below covers all six, is **deny-by-default** with additive grants (Salesforce-style — no negative permissions, simpler reasoning), and uses the expression engine (§5.2 / Phase 4) as the ABAC evaluator.
+(Resolves REVIEW.md **C6**; recorded as ADR-0005.) Enterprise authorization operates at six grains; the original `sec_permission` ("verb on entity") covered only one. The model below covers all six, is **deny-by-default** with additive grants (Salesforce-style — no negative permissions, simpler reasoning), and uses the expression engine (§5.2 / Phase 4) as the ABAC evaluator.
 
 **The six grains:**
 
@@ -706,7 +708,7 @@ A template engine for rendered output — email bodies, notification text, and d
 - **Template store** `md_template(name, kind[email|document|message], body, content_type, locale?)`: the body is a **sandboxed template DSL** — a restricted subset of the expression engine (§5.2) plus variable interpolation. It is **bounded-evaluated** (§5.2 limits), has **no arbitrary code / no I/O**, and cannot emit raw SQL. Variables are the render context (record fields, actor, params).
 - **Render context is AuthZ-filtered:** a template renders under the *recipient's* (or running user's) field-level visibility (§5.11) — a template can never emit a field the recipient cannot read, same structural rule as reports (§5.17).
 - **Document / mail-merge:** render a record (or a list) through a document template to PDF/DOCX/HTML, reusing the report renderer path (`mda-reports`, §6). Triggered by a rule/action/workflow and delivered async via the outbox if external.
-- **Localization:** a template carries a locale; the resolver picks the best match for the recipient/tenant from `sys_translation`. (Template *labels* are translatable; record *data* i18n remains deferred — U5.)
+- **Localization:** a template carries a locale; the resolver picks the best match for the recipient/tenant from `md_translation` (ADR-0023). (Template *labels* are translatable; record *data* i18n remains deferred — U5.)
 
 ### 5.20 Secrets management
 
@@ -794,21 +796,25 @@ mda/
 ### Studio API (build-time, admin only)
 All edits target a **draft**, never the active model directly (§5.8). Publishing is the only path to activation.
 ```
-# Draft lifecycle
-POST   /api/studio/drafts                      # branch from active (or a snapshot)
-GET    /api/studio/drafts/:id                  # read draft model (JSONB)
-PATCH  /api/studio/drafts/:id                  # edit (If-Match etag → optimistic concurrency)
-POST   /api/studio/drafts/:id/checkout         # lock for single-editor editing (v1)
+# Draft lifecycle (as built)
+POST   /api/studio/drafts                      # branch from active
+GET    /api/studio/drafts                      # list drafts (reopen / discard prior work)
+GET    /api/studio/drafts/:id                  # read draft (status + model)
+PUT    /api/studio/drafts/:id/model            # edit the draft model (If-Match etag → 409 on conflict)
+DELETE /api/studio/drafts/:id                  # discard an unpublished draft
 POST   /api/studio/drafts/:id/validate         # dry-run → migration plan + validation report
-POST   /api/studio/drafts/:id/preview          # load draft into ephemeral cache for Studio preview
 POST   /api/studio/drafts/:id/publish          # apply migration + activate atomically
+# (explicit checkout locks and draft preview via an ephemeral cache are v2; §5.8 steps 2/4)
 # Within a draft: define entities, fields, forms, views, workflows, reports, rules…
-#   e.g. POST /api/studio/drafts/:id/entities, PATCH …/fields   (all draft-scoped)
+#   As built, edits are whole-model (PUT …/model); fine-grained draft-scoped resource
+#   endpoints (POST …/entities, PATCH …/fields) are a v2 convenience over the same diff.
 # History & rollback
-GET    /api/studio/snapshots                   # list published versions
-POST   /api/studio/snapshots/:id/rollback      # restore a prior version (re-publish)
+GET    /api/studio/snapshots                   # list published versions (id, version, created_at)
+# Rollback as built = re-publish: read a snapshot's model → import as a new draft
+#   (POST /api/studio/import) → validate → publish (§5.8 step 6). Snapshot-model reads
+#   and a one-shot POST /api/studio/snapshots/:id/rollback are v2 conveniences over that path.
 # Bundle transport (dev → staging → prod)
-GET    /api/studio/export?snapshot=:id         # export model bundle (JSON)
+GET    /api/studio/export                      # export the ACTIVE model bundle (JSON)
 POST   /api/studio/import                      # import bundle as a new draft
 ```
 
@@ -977,7 +983,19 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - This is large; consider parallelizing across designers
 - **Deliverable:** A business analyst can build a small CRM app entirely through the browser.
 
-### Phase 9 — Integration Layer (Weeks 43–46)
+### Phase 9 — Integration Layer (Weeks 43–46) — ✅ complete
+> Closed out per `docs/PHASE9.md` / `docs/CAPABILITIES.md` (§5.22, ADR-0020): the
+> `mda-integration` crate with `int.connector` / `int.flow` / `int.flow_step` /
+> `int.value_map`, the `int_external_id` registry, and `sys_integration_run`
+> history; the `Connector` trait + the universal **HTTP** transport (auth
+> resolved server-side from the SecretStore); inbound flows materialize into
+> `biz.*` via `mda-data` with bounded transform steps, **debatching**, upsert-by-
+> external-key under a declared conflict policy (`last_write_wins` with OCC
+> retry, `field_level_sor`, `manual` → quarantine), and a per-flow
+> `running_user`; outbound flows push mapped records; cron pulls ride the
+> ADR-0019 scheduler; signed outbound webhooks (§5.21) + a verified inbound
+> receiver. The remaining transports (DB/file/MQ/GraphQL/SOAP) and
+> `source_priority` are follow-ups on the same trait/policy boundaries.
 - **Hub-model integration (§5.22):** `Connector` trait with universal transports (HTTP/DB/file/MQ/GraphQL/SOAP) + a pluggable **Format + Auth** boundary; niche formats / vendor protocols are *extension* connectors (§5.6), not core
 - `int_*` metadata: flows/steps, field mapping with **expression-engine transforms** (value maps, conditionals, debatching), scheduling (cron + event triggers)
 - **External-ID registry** (`int_external_id`) for upsert-by-external-key, idempotent re-delivery, and cross-path dedup
@@ -986,7 +1004,15 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 - Reliable delivery via the transactional outbox (§5.9.4); flows run as resumable apalis jobs
 - **Deliverable:** Bidirectionally sync a platform entity with an external REST API on a schedule, keyed by external ID, with a declared conflict policy — no duplicates, no silent drops.
 
-### Phase 10 — Bulk Data Import/Export & Attachments (Weeks 46–49)
+### Phase 10 — Bulk Data Import/Export & Attachments (Weeks 46–49) — ✅ complete
+> Closed out per `docs/PHASE10.md`: the §5.13 **synchronous** surface ships —
+> CSV+JSON import (`create`/`update`/`upsert` by key, `dry_run`, `on_error`
+> abort/continue) and CSV export respecting field-read security, all reusing
+> the runtime write pipeline; attachments ship sha256 checksum + content dedup
+> + refcount-aware delete over the `BlobStore` trait (`LocalBlobStore`). Still
+> deferred on this boundary: the async `sys_impex_job` worker for very large
+> files (streaming, resumable per-row results), XLSX, the S3 store, presigned
+> URLs, virus-scan, thumbnails, and the record→blob lifecycle hook.
 - **Bulk import/export (§5.13):** CSV/XLSX/JSON; field mapping; create/update/upsert by key; **dry-run** with validation report; all-or-nothing or best-effort; batched transactions for large files; runs as an `apalis` job with progress + resumable per-row results
 - **Security:** reuses the full write pipeline (object + field + record authz, §5.11) — can't import into fields/rows you can't write; export respects field-level read
 - **Attachments (§5.14):** `attachment` field type; `BlobStore` trait (local + S3); `sys_blob` metadata; presigned upload/download URLs; async virus-scan hook; checksum dedup; thumbnails; cleanup on record delete (ADR-0006)
@@ -995,7 +1021,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 ### Phase 11 — Hardening, Scale, Polish (Weeks 49–55)
 - Observability (tracing/OpenTelemetry dashboards), load testing
 - Metadata cache tuning, query optimization, materialized views for reports
-- i18n (`sys_translation`), theming
+- i18n (`md_translation`, ADR-0023), theming
 - Backup/restore runbook, blue-green deploys
 - Security review, pen-test, OWASP hardening
 - Documentation, SDK generation, sample apps
@@ -1023,7 +1049,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 > Timelines are rough planning anchors for a small team; **Phases 6 and 8 were re-estimated honestly** (REVIEW.md Timeline Reality Check): Phase 6 ≈ 9 weeks for a from-scratch metadata-driven UI renderer + real-time; Phase 8 ≈ 14 weeks for the full drag-and-drop Studio (parallelizable only with a real team). The full sequence is now ~55 weeks; a solo developer should ~double it — which is why the **MVP milestone above exists** (ship value around week 26, not week 55).
 
 > **Deferred (explicitly, not omitted — closes REVIEW.md U5 / U9).** Deliberately out of v1 scope:
-> - **U5 — data-level i18n** (translatable enum/reference data; record-level multi-language fields). `sys_translation` covers **metadata/UI strings only** for v1; data i18n is a later, opt-in feature once a real multi-locale tenant needs it.
+> - **U5 — data-level i18n** (translatable enum/reference data; record-level multi-language fields). `md_translation` covers **metadata/UI strings only** for v1; data i18n is a later, opt-in feature once a real multi-locale tenant needs it.
 > - **U9 — high availability & replication** (Postgres HA, read replicas for reporting, logical replication / warm standby, connection-pool tuning). Single-node Postgres for v1; HA is a Phase 11 hardening activity when production scale demands it.
 > - **Search** — §3 lists "PostgreSQL FTS → OpenSearch later" but it is not yet designed: which fields are searchable, how results respect record/field security and tenancy, and the FTS→OpenSearch migration path. Scoped into a later phase once a concrete search need arrives; until then, list filters cover structured queries.
 > All are tracked here so they remain *visible*, not lost.
@@ -1034,7 +1060,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 > - **SSO / SAML / SCIM** — enterprise identity is larger than the OAuth2/OIDC in §3: SAML SSO, SCIM user provisioning/deprovisioning, and directory sync. Currently only an open question (§13 Q3); **elevate to a scoped phase** before enterprise adoption — it gates most enterprise sales.
 > - **Mass actions** — bulk update / delete / assign / transfer *by filter* (distinct from file import/export, §5.13); interacts with sharing recompute (ADR-0013) and cascade (ADR-0006), so it needs its own design rather than a retrofit. **✅ closed (ADR-0021):** `POST /api/data/:entity/{mass-update,mass-delete}` reuse the single-record write pipeline per affected record (RBAC + FLS + rules + OCC + audit + events), resolve targets under the **write** predicate, support a `dry_run` + hard cap. Assign/transfer are a `set` of owner/team fields.
 > - **API versioning** — REST + GraphQL versioning/deprecation strategy for generated SDK clients (§7): breaking-change management via path/header versioning, sunset headers, and parallel schema generations across publishes. **✅ closed (ADR-0022):** a versioning middleware negotiates the major (`X-API-Version` / `Accept: application/vnd.mda+json; version=N`), stamps `MDA-API-Version` on every response, emits RFC-8594 `Deprecation`/`Sunset`/`Link` for deprecated majors, and 400s with `mda.unsupported_version` below the floor — all env-driven so a v2 cutover is operational. Parallel-major schema generation slots in behind the same boundary when a v2 diverges.
-> - **i18n (`sys_translation`)** — metadata/UI string translation (Phase 11 hardening). **✅ closed (ADR-0023):** `meta.md_translation` (best-match locale: exact → prefix → default) + `POST/GET/DELETE /api/translations[/:locale]` + `GET /api/i18n/:locale`, injected into the §5.19 template render context (`{{ i18n.ns.key }}`), and included in the tenant-config export/import. U5 record-data i18n remains deferred.
+> - **i18n (metadata/UI strings)** — translation of metadata & UI strings (Phase 11 hardening). **✅ closed (ADR-0023):** `meta.md_translation` (best-match locale: exact → prefix → default) + `POST/GET/DELETE /api/translations[/:locale]` + `GET /api/i18n/:locale`, injected into the §5.19 template render context (`{{ i18n.ns.key }}`), and included in the tenant-config export/import. U5 record-data i18n remains deferred.
 
 ---
 
@@ -1075,7 +1101,7 @@ Each phase is independently valuable and demoable. Aim for vertical slices.
 
 ## 12. Immediate Next Steps (Week 1)
 
-Architectural decisions are settled (§5, recorded as ADRs 0001–0017); the focus is now execution:
+Architectural decisions are settled (§5, recorded as ADRs 0001–0026 — see `docs/adr/`); the focus is now execution. *(Historical: these Week-1 steps shipped with Phase 0, and Phases 0–10 have since completed — see §9 for per-phase status.)*
 
 1. **Run the Phase 0 frontend spike** (ADR-0009) — a throwaway metadata-driven form renderer in both Leptos and React, to pick the Studio/Runtime UI stack on evidence.
 2. **Scaffold the Cargo workspace** (`crates/` layout in §6).
@@ -1094,7 +1120,7 @@ The architecture no longer blocks on these, but they shape later phases and ops:
 3. **Must-have integrations on day one** (specific ERP, email provider, SSO/IdP) — shape Phase 9 (integration layer).
 4. **Licensing / commercial model** — open core vs proprietary; affects dependency choices.
 
-> Resolved during planning: storage/RI, metadata lifecycle & publish/migration execution, concurrency & workflow chaining, real-time, authorization (incl. sharing materialization & value-constraint composition), expression language, reporting query model, deletion/restoration lifecycle, and rollup-summary semantics are all decided (§5, ADRs 0001–0017). A platform-capability review added notifications, templating, secrets, the webhook contract (§5.18–5.21), and the integration architecture (§5.22).
+> Resolved during planning: storage/RI, metadata lifecycle & publish/migration execution, concurrency & workflow chaining, real-time, authorization (incl. sharing materialization & value-constraint composition), expression language, reporting query model, deletion/restoration lifecycle, and rollup-summary semantics are all decided (§5, ADRs 0001–0026). A platform-capability review added notifications, templating, secrets, the webhook contract (§5.18–5.21), and the integration architecture (§5.22).
 
 ---
 
@@ -1124,6 +1150,7 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 - **Scheduled-job management** for modeler-defined schedules (next-run / last-run / failure state) — scheduled rules and integration schedules exist conceptually but aren't managed as a user surface.
   - **✅ closed (ADR-0019):** `POST/GET/PATCH/DELETE /api/schedules` + `/runs` expose next-run / last-run / last-status / failure state + a per-run history, driven by a multi-instance-safe `FOR UPDATE SKIP LOCKED` worker. Dispatch is by `kind`: `report` runs a saved report under the running user, `integration` pulls an inbound `int.flow` from its connector on cadence (scheduled sync, §5.22), `custom` is an extensibility hook. The outbox console still surfaces delivery failure state (ADR-0018).
 - **Inbound webhook verification** — shared-secret / signature / replay protection for the Phase 9 inbound receiver (parallels the outbound contract in §5.21).
+  - **✅ closed** (with the §5.18–5.22 cluster, see `docs/CAPABILITIES.md`): `/api/integrations/webhooks/:id` verifies the same HMAC signature (constant-time, replay-windowed), resolves the tenant via a SECURITY DEFINER lookup, dedupes on `event_id`, and enqueues the inbound flow for the runner.
 - **Record / field history as a surfaced capability** — `sys_audit_log` stores before/after for compliance, but "timeline of this record" and "as-of" queries are not yet framed as a platform API.
   - **✅ closed (ADR-0018):** `GET /api/data/:entity/:id/history` (per-field diffs, FLS-projected) and `GET /api/data/:entity/:id/as-of?version=|at=` reconstruct from audit snapshots, gated like a live read.
 - **Error code taxonomy + localized error messages** — the platform emits 409s, validation errors, and publish failures with no coherent, i18n-able error model.
@@ -1133,4 +1160,4 @@ Acknowledged platform gaps that are real but lower-priority — visible here so 
 
 ---
 
-*This plan is v0.4 — decisions are recorded as ADRs 0001–0025 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Successive review passes refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17), then rollup-summary semantics and canonical write-path consistency — audit/event-log split and the per-record share-recompute step (ADR-0017); a platform-capability review then added notifications, templating, secrets, the webhook contract (§5.18–5.21), the formula-dependency DAG check (§5.8), and the hub-model integration architecture (§5.22). The §5.18–5.22 cluster and GraphQL (ADR-0010) are now implemented (`docs/CAPABILITIES.md`). Team hierarchy (ancestor-team visibility) + a superuser admin security API ship as ADR-0025. Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
+*This plan is v0.4 — decisions are recorded as ADRs 0001–0026 (`docs/adr/`); the roadmap was re-estimated in §9 with an explicit MVP milestone. Successive review passes refined publish/migration execution, authorization, sharing, reporting, deletion/restore, and workflow chaining (ADRs 0011–0016, §5.17), then rollup-summary semantics and canonical write-path consistency — audit/event-log split and the per-record share-recompute step (ADR-0017); a platform-capability review then added notifications, templating, secrets, the webhook contract (§5.18–5.21), the formula-dependency DAG check (§5.8), and the hub-model integration architecture (§5.22). The §5.18–5.22 cluster and GraphQL (ADR-0010) are now implemented (`docs/CAPABILITIES.md`). Team hierarchy (ancestor-team visibility) + a superuser admin security API ship as ADR-0025; criteria sharing rules + the live role hierarchy close the ADR-0013/ADR-0026 arc. Treat it as a living document: amend via new ADRs rather than silently editing settled decisions.*
