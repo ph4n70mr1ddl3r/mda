@@ -3294,3 +3294,101 @@ async fn team_hierarchy_let_ancestor_read_descendant_record() {
         "hierarchy grants read only: manager write blocked: {body}"
     );
 }
+
+#[tokio::test]
+async fn schema_endpoint_reflects_model_and_fls() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, active) = call(&ctx.app, "GET", "/api/studio/model", &ctx.token, None, None).await;
+    let customer_id = active["entities"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let mut model = active.clone();
+    model["entities"].as_array_mut().unwrap().push(json!({
+        "id": Uuid::new_v4(), "module_id": null, "name": "Order",
+        "table_name": format!("order_{}", Uuid::new_v4().simple()), "label": "Order", "description": null,
+        "fields": [{"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}}],
+        "relationships": [{"id": Uuid::new_v4(), "source_field_name":"ref_customer_id","target_entity_id": customer_id,"cardinality":"many_to_one","strength":"lookup","on_delete":"set_null","required":false,"reference_qualifier":null,"rollup_summary":null}]
+    }));
+    publish(&ctx, model).await;
+
+    // admin: full schema derived from the active model (PLAN §7 discovery)
+    let (st, s) = call(&ctx.app, "GET", "/api/schema/Order", &ctx.token, None, None).await;
+    assert_eq!(st, StatusCode::OK, "schema: {s}");
+    assert_eq!(s["title"], "Order");
+    assert_eq!(s["properties"]["amount"]["type"], "number");
+    assert_eq!(
+        s["properties"]["ref_customer_id"]["x-mda-target-entity"],
+        "Customer"
+    );
+    assert_eq!(s["properties"]["ref_customer_id"]["format"], "uuid");
+    assert_eq!(s["properties"]["id"]["readOnly"], true);
+    assert_eq!(s["properties"]["version"]["type"], "integer");
+    assert_eq!(s["required"], json!(["amount"]));
+    let (st, s) = call(
+        &ctx.app,
+        "GET",
+        "/api/schema/Customer",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        s["properties"]["tier"]["enum"],
+        json!(["Bronze", "Silver", "Gold"])
+    );
+
+    // limited user: object read, but `amount` FLS-none (dropped) and the
+    // Customer `tier` FLS-read (readOnly) — a definition can't widen access.
+    let role_id = common::seed_role(
+        &ctx.pool,
+        ctx.tenant,
+        "schema-reader",
+        &[("Order", "read"), ("Customer", "read")],
+    )
+    .await;
+    common::seed_field_permission(&ctx.pool, ctx.tenant, role_id, "Order", "amount", "none").await;
+    common::seed_field_permission(&ctx.pool, ctx.tenant, role_id, "Customer", "tier", "read").await;
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(&ctx.pool, ctx.tenant, &email, "reader", &hash).await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, uid, role_id).await;
+    let tok = ctx.jwt.issue_access(uid, ctx.tenant, None).unwrap();
+
+    let (st, s) = call(&ctx.app, "GET", "/api/schema/Order", &tok, None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        s["properties"].get("amount").is_none(),
+        "FLS-none field must be dropped: {s}"
+    );
+    let (st, s) = call(&ctx.app, "GET", "/api/schema/Customer", &tok, None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(s["properties"]["tier"]["readOnly"], true);
+    assert_eq!(s["properties"]["name"].get("readOnly"), None);
+
+    // no object read → 403; unknown entity → 404
+    let none_role = common::seed_role(&ctx.pool, ctx.tenant, "no-read", &[]).await;
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let uid2 = common::seed_user(&ctx.pool, ctx.tenant, &email, "blind", &hash).await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, uid2, none_role).await;
+    let tok2 = ctx.jwt.issue_access(uid2, ctx.tenant, None).unwrap();
+    let (st, _) = call(&ctx.app, "GET", "/api/schema/Order", &tok2, None, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/schema/Nosuch",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}

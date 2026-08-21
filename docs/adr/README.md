@@ -17,7 +17,7 @@ decision and links back.
 | [0004](0004-real-time-channel.md) | Real-time channel (SSE over the event log) | Accepted |
 | [0005](0005-multi-grained-authorization.md) | Multi-grained authorization | Accepted |
 | [0006](0006-deletion-hard-delete-and-archive.md) | Deletion: hard-delete + archive (not soft-delete) | Accepted |
-| [0007](0007-job-queue-apalis.md) | Job queue: apalis (Postgres-backed) | Accepted |
+| [0007](0007-job-queue-apalis.md) | Job queue: apalis (Postgres-backed) | Accepted — as built, superseded in part by ADR-0019 |
 | [0008](0008-meta-model-fixed.md) | Meta-model: fixed, not self-hosting | Accepted |
 | [0009](0009-frontend-strategy-leptos.md) | Frontend strategy: Leptos (WASM) | Accepted |
 | [0010](0010-graphql-first-class-runtime-api.md) | GraphQL as a first-class runtime data API | Accepted |

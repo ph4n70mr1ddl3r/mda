@@ -31,6 +31,7 @@ pub mod observability;
 pub mod reports;
 pub mod rules;
 pub mod schedules;
+pub mod schema;
 pub mod secrets;
 pub mod studio;
 pub mod templates;
@@ -94,6 +95,7 @@ pub fn router_with(state: AppState, cfg: edge::EdgeConfig) -> Router {
         .merge(integrations::routes())
         .merge(observability::routes())
         .merge(schedules::routes())
+        .merge(schema::routes())
         .merge(tenants::routes())
         .merge(ui::routes())
         .merge(rules::routes())

@@ -1,6 +1,6 @@
 # ADR-0007: Job queue — apalis (Postgres-backed)
 
-- **Status:** Accepted
+- **Status:** Accepted — **as built, superseded in part**: no job framework is wired; the shipped workers (outbox drain, scheduler, digest sweep, webhook relay) are hand-rolled Postgres workers. See ADR-0019 for the recorded divergence and reasoning.
 - **Date:** 2025-07-16
 - **Resolves:** REVIEW.md U7 (job-queue choice)
 - **Detail:** PLAN.md §3, §5.9.4

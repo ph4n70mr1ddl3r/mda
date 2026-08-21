@@ -69,6 +69,9 @@ Health check:
 ```bash
 curl localhost:8080/health
 # {"status":"ok","database":"up","version":"0.1.0","audit_failures":0}
+# Operational edge (unauthenticated, for probes/scrapers behind network policy):
+#   /livez   liveness (no DB round-trip)   /readyz  readiness (DB ping)
+#   /metrics Prometheus exposition (request counters, audit-failure gauge, pool gauges)
 ```
 
 Login is **tenant-scoped** (the client names the tenant; this is what lets the
@@ -93,6 +96,10 @@ curl -s -X POST localhost:8080/api/studio/drafts -H "x-tenant-id: $TENANT" \
 # POST /api/studio/drafts/:id/validate                          — dry-run diff
 # POST /api/studio/drafts/:id/publish                           — additive + retire
 # GET  /api/studio/model                                        — active model
+# GET  /api/studio/snapshots/:id/model                          — archived model of a
+#      published snapshot (the rollback input: import as a draft → validate → publish)
+# GET  /api/schema/:entity  — JSON Schema (draft 2020-12) of the record payload,
+#      derived from the active model, FLS-projected per caller (SDK/discovery)
 ```
 
 Runtime data API (Phase 2) — CRUD over generated `biz.<table>`:
@@ -278,7 +285,8 @@ DATABASE_URL=postgres://mda:mda@127.0.0.1:5433/mda?sslmode=disable \
 #              --test security --test observability --test app_role
 ```
 
-The `data`/`studio` suites connect the app as the non-superuser `mda_app` role
+The `data`, `studio`, `events`, `sessions`, and `throttle` suites connect the
+app as the non-superuser `mda_app` role
 (created by the RLS migration) so `biz.*` row-level security actually engages;
 superusers bypass RLS, so the owner role can't be the one under test.
 

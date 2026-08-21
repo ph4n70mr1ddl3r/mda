@@ -87,10 +87,10 @@ The database holds **two distinct models**:
 | DB access | **SQLx** (compile-time checked) + dynamic SQL for runtime | Static for metadata, dynamic for business data |
 | Migrations | SQLx / Refinery | Versioned, repeatable |
 | Caching | `moka` in-process (v1) → Redis (`deadpool-redis`) later | Metadata cache keyed `(tenant_id, …)` (§5.3). As built, v1 runs on the in-process cache + Postgres `LISTEN/NOTIFY`; Redis plugs in for cross-instance pub/sub at scale (§5.10.4) and is not a dependency yet |
-| AuthN | `jsonwebtoken`, `argon2`, OAuth2 (`openidconnect`) | JWT + refresh tokens |
+| AuthN | `jsonwebtoken`, `argon2`, OAuth2 (`openidconnect`) | JWT + refresh tokens (**OAuth2/OIDC not yet shipped** — SSO is the §13 Q3 open question) |
 | Serialization | `serde` + `serde_json` | Everywhere |
 | Validation | `validator` + custom expression engine | |
-| Async jobs | **`apalis`** (Postgres-backed) | Cron, retries, delayed, DLQ; drives scheduled reports, workflow timers, two-phase purge, integration flows (§5.22), notification digests (§5.18), sharing reshare jobs (ADR-0013), and the outbox-drain worker (§5.9.4) |
+| Async jobs | **`apalis`** (Postgres-backed) — *the designed framework (ADR-0007; not wired as built — see the as-built note below)* | Cron, retries, delayed, DLQ; drives scheduled reports, workflow timers, two-phase purge, integration flows (§5.22), notification digests (§5.18), sharing reshare jobs (ADR-0013), and the outbox-drain worker (§5.9.4) |
 | Search | PostgreSQL FTS → OpenSearch later | Start simple |
 | Frontend | **Leptos** (CSR, WASM) — decided by the Phase-0 spike, ADR-0009 (React spike retained in `web/spike-react`) | See §8 |
 | Frontend build | Trunk (WASM) / Vite | |
@@ -101,6 +101,8 @@ The database holds **two distinct models**:
 
 ### Alternative considered: SeaORM
 SeaORM offers nicer ergonomics but obscures the dynamic SQL we need for runtime data access. **SQLx with hand-written queries for metadata + a query-builder module for dynamic data** is the recommendation.
+
+> **As-built (background work).** No job framework is wired: every background worker shipped in v1 — the outbox drain (§5.9.4), the cron scheduler (§14/ADR-0019), the notification-digest sweep (§5.18), and the webhook relay (§5.21) — is a **hand-rolled Postgres worker** (`FOR UPDATE SKIP LOCKED` / high-water cursor). ADR-0019 records the divergence and the reasoning (smaller, fully tested, no framework surface for the current scope); ADR-0007's apalis nomination remains the design target if/when job needs outgrow it. The `(apalis)` mentions across §5 therefore describe the designed mechanism; as built, those jobs run on the hand-rolled workers with the same durability semantics (Postgres is the system of record).
 
 ### Rate limiting
 Enforced at the API edge via Tower middleware — **per-tenant and per-user** quotas, returning `429 Too Many Requests` + `Retry-After`. It composes with the per-query **cost budgets** for list and report queries (§5.16/§5.17): a request that would blow the budget is rejected (or routed async) rather than throttled blindly, so expensive metadata-driven queries can't be used to DoS the cluster.
@@ -468,14 +470,18 @@ This yields a clean, answerable rule for "are rules/workflows trustworthy or eve
 
 ```
 sys_event_log
-  seq BIGINT PK  -- per-tenant monotonic; doubles as the SSE Last-Event-ID
+  seq BIGINT PK  -- monotonic; doubles as the SSE Last-Event-ID
   tenant_id, ts
   type           -- record.created | record.updated | record.deleted
                  -- workflow.transitioned | task.assigned | task.completed
                  -- record.checked_out | record.released | metadata.published | notification.*
-                 -- (as built, the log carries record.created/updated/deleted and
-                 --  workflow.transitioned; task.*, checked_out/released, and
-                 --  metadata.published rows are designed, not yet emitted —
+                 -- (as built: `seq` is a GLOBAL BIGSERIAL — monotonic across
+                 --  tenants, not per-tenant — and every read (replay + live) is
+                 --  filtered `WHERE tenant_id = $caller`, so per-client
+                 --  Last-Event-ID semantics are unchanged; the log carries
+                 --  record.created/updated/deleted, workflow.transitioned, and
+                 --  notification.created (§5.18); task.*, checked_out/released,
+                 --  and metadata.published rows are designed, not yet emitted —
                  --  publish broadcast rides the meta_changed NOTIFY, §5.3)
   entity, record_id
   payload JSONB  -- changed_fields, from_version, to_version, actor
@@ -486,9 +492,11 @@ sys_event_log
 **3. Subscription model (channels).** Clients subscribe to topics; the relay keeps an in-memory `channel → client set` map:
 - `entity:<name>` — all changes to an entity (live lists / kanban / counts)
 - `record:<entity>:<id>` — a specific record (detail views, conflict detection)
-- `user:<id>:tasks` — task assignments/completions (inbox badge)
+- `user:<id>:tasks` — task assignments/completions (inbox badge) *(designed; not yet emitted — `task.*` events don't exist yet, §5.10.2)*
 - `user:<id>:notifications` — personal notifications (persisted in `sys_notification`, §4.7; read/unread state)
 - `tenant:<id>:broadcast` — system-wide (incl. `metadata.published` → UI reloads model, tying into cache invalidation §5.3)
+
+*(As built, the relay parses `entity:` / `record:` / `user:<id>:notifications` / `tenant:<id>:broadcast`; subscribing with no channel receives all readable events. A client may only subscribe to its OWN `user:`/`tenant:` channels — cross-tenant ids are rejected, not just filtered.)*
 
 **4. Relay & fan-out.** Each app instance runs a relay holding its locally-connected SSE clients. On a new `sys_event_log` row:
 - A trigger fires `NOTIFY mda_event` (payload = seq); each instance's background `LISTEN` reads the row and fans out to local clients by channel.
@@ -501,6 +509,8 @@ sys_event_log
 - Authenticate the SSE connection (JWT).
 - Authorize each subscription (can this user see this entity/record/view?).
 - The relay filters events per client using the same RBAC+ABAC+data filters as the REST API (§5.11) — including **field-level visibility** (never leak a change to a masked field). Access decisions are cached to keep this cheap.
+
+> **As-built (v1 grain).** The relay authenticates the connection (bearer or one-shot ticket), enforces tenant isolation + **object-level** `read` on the event's entity, and restricts `user:`/`tenant:` channels to the caller's own ids. Record-grain filtering and FLS projection of the payload are the designed target above — v1 payloads carry changed-field *names* + versions only (never values), so the residual exposure is "a record you cannot read changed, touching these field names," not field values.
 
 **7. Client merge strategy (ties to OCC §5.9).** On receiving `record.updated` for the record the client is viewing:
 - Not editing → refresh the view.
@@ -790,7 +800,7 @@ mda/
 - **mda-rules** — Triggers: before/after CRUD, on-event, on-schedule. Sequence: match → condition → action. Actions: set field, call function, fire event, send webhook, enqueue.
 - **mda-reports** — Build dataset (run parameterized query against data layer), apply grouping/aggregation, render to table/chart/pdf/xlsx.
 - **mda-integration** — `Connector` trait (pluggable Format + Auth boundary, §5.6); hub-model inbound/outbound flows with expression-engine transform steps, the external-ID registry, and per-flow conflict policy (§5.22); scheduled via apalis; idempotent via external key + at-least-once outbox delivery.
-- **mda-api** — **REST** (OpenAPI via `utoipa`) for Studio, auth, and simple CRUD; **GraphQL** (`async-graphql`) as a first-class runtime data API (ADR-0010) for relationship traversal. Routes map to the service layer; same engine, different authz per surface.
+- **mda-api** — **REST** (OpenAPI via `utoipa` — *designed; not yet wired as built*) for Studio, auth, and simple CRUD; **GraphQL** (`async-graphql`) as a first-class runtime data API (ADR-0010) for relationship traversal. Routes map to the service layer; same engine, different authz per surface.
 - **mda-server** — `main.rs`: load config, init DB pool, warm metadata cache, mount routers, start workers, graceful shutdown.
 
 > **The §5.18–5.22 subsystems are logical modules, crated on demand** (per the granularity note above), not new crates on day one: templating (§5.19) lives alongside the renderers in `mda-reports`; secrets (§5.20) are a `SecretStore` trait in `mda-core` with impls wired in `mda-server`; notification fan-out/digest workers (§5.18) and integration/webhook delivery workers (§5.21/§5.22) run in `mda-server`, with the in-app push path through `mda-api`'s SSE relay (§5.10).
@@ -816,9 +826,11 @@ POST   /api/studio/drafts/:id/publish          # apply migration + activate atom
 #   endpoints (POST …/entities, PATCH …/fields) are a v2 convenience over the same diff.
 # History & rollback
 GET    /api/studio/snapshots                   # list published versions (id, version, created_at)
-# Rollback as built = re-publish: read a snapshot's model → import as a new draft
-#   (POST /api/studio/import) → validate → publish (§5.8 step 6). Snapshot-model reads
-#   and a one-shot POST /api/studio/snapshots/:id/rollback are v2 conveniences over that path.
+GET    /api/studio/snapshots/:id/model          # the archived model of a snapshot — the
+#                                                 input the rollback recipe needs
+# Rollback as built = re-publish: read a snapshot's model (above) → import as a new draft
+#   (POST /api/studio/import) → validate → publish (§5.8 step 6; the removals retire).
+#   A one-shot POST /api/studio/snapshots/:id/rollback is a v2 convenience over that path.
 # Bundle transport (dev → staging → prod)
 GET    /api/studio/export                      # export the ACTIVE model bundle (JSON)
 POST   /api/studio/import                      # import bundle as a new draft
@@ -837,6 +849,8 @@ POST   /api/data/:entity/:id/:transition                # workflow action
 POST   /api/data/:entity/{mass-update,mass-delete}      # bulk by filter, reusing the write pipeline (ADR-0021)
 GET    /api/forms/:entity                               # form definition (for UI)
 GET    /api/views/:entity                               # list-view definition
+GET    /api/schema/:entity                              # JSON Schema (draft 2020-12) of the
+                                                       # record payload, FLS-projected (SDKs)
 GET    /api/reports/:id/run?params=...                  # run report
 GET    /api/dashboards/:id                              # dashboard widgets + data
 ```
@@ -844,7 +858,10 @@ GET    /api/dashboards/:id                              # dashboard widgets + da
 ### Auth
 ```
 POST   /api/auth/login      POST /api/auth/refresh
+POST   /api/auth/logout     (revokes the access token's session)
 GET    /api/auth/me
+POST   /api/auth/event-ticket   (one-shot short-TTL ticket for SSE EventSource,
+                                 which cannot set headers — §5.10)
 ```
 
 ### GraphQL (first-class runtime API, ADR-0010)
@@ -856,7 +873,7 @@ The schema is derived from the active model and re-generated on publish (§5.8).
 
 > **MVP scope (ADR-0010).** "First-class" means a supported, security-enforced runtime surface — not that every verb ships on day one. At MVP GraphQL is **query/traversal-first** (reads + nested fetches over relationships); **mutations** (create/update/delete, workflow actions) reach REST parity progressively in later phases. Until then, clients mutate via the REST data API (`/api/data/:entity/*`) and read/traverse via GraphQL — which is also why §5.10.1 routes SSE-client mutations through REST. Both surfaces share one service layer, so mutations land on GraphQL with no new authz path when added.
 
-> OpenAPI spec auto-generated; an external SDK (TypeScript/Rust/Python) can be derived from it. The dynamic data API is discoverable via `/api/schema/:entity` (JSON Schema derived from metadata).
+> OpenAPI spec generation is designed but **not yet wired** (`utoipa` in §6); until it ships, an external SDK (TypeScript/Rust/Python) derives from the route tables above. The dynamic data API is discoverable via `/api/schema/:entity` (JSON Schema draft 2020-12 derived from the active model at request time, FLS-projected per caller: unreadable fields are dropped, read-only fields carry `readOnly`).
 
 ---
 

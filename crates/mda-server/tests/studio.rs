@@ -473,3 +473,155 @@ async fn drafts_list_and_discard() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn snapshot_model_read_enables_the_rollback_recipe() {
+    let (app, token) = match setup().await {
+        Some(x) => x,
+        None => return,
+    };
+
+    // publish v1 (Customer), then v2 (Customer + Order)
+    publish_helper(&app, &token, customer_model()).await;
+    let (st, v1) = call(&app, "GET", "/api/studio/model", &token, None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let customer_id = v1["entities"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let mut v2 = v1.clone();
+    v2["entities"].as_array_mut().unwrap().push(json!({
+        "id": Uuid::new_v4(), "module_id": null, "name": "Order",
+        "table_name": format!("order_{}", Uuid::new_v4().simple()), "label": "Order", "description": null,
+        "fields": [{"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}}],
+        "relationships": [{"id": Uuid::new_v4(), "source_field_name":"ref_customer_id","target_entity_id": customer_id,"cardinality":"many_to_one","strength":"lookup","on_delete":"set_null","required":false,"reference_qualifier":null,"rollup_summary":null}]
+    }));
+    publish_helper(&app, &token, v2).await;
+
+    // the v1 archive (version 1) is listed and readable
+    let (st, snaps) = call(&app, "GET", "/api/studio/snapshots", &token, None, None).await;
+    assert_eq!(st, StatusCode::OK, "snapshots: {snaps}");
+    let v1_snap = snaps
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["version"] == 1)
+        .expect("version-1 snapshot exists")
+        .clone();
+    let snap_id = v1_snap["id"].as_str().unwrap();
+
+    let (st, model) = call(
+        &app,
+        "GET",
+        &format!("/api/studio/snapshots/{snap_id}/model"),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "snapshot model: {model}");
+    let names: Vec<&str> = model["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Customer"], "the archived v1 model (pre-Order)");
+
+    // unknown snapshot id → 404
+    let (st, _) = call(
+        &app,
+        "GET",
+        &format!("/api/studio/snapshots/{}/model", Uuid::new_v4()),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // the §5.8 rollback recipe: import the snapshot model as a draft, validate,
+    // publish (the Order removal retires) — the active model returns to v1.
+    let (st, draft) = call(
+        &app,
+        "POST",
+        "/api/studio/import",
+        &token,
+        Some(model.to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "import: {draft}");
+    let draft_id = draft["id"].as_str().unwrap();
+
+    let (st, report) = call(
+        &app,
+        "POST",
+        &format!("/api/studio/drafts/{draft_id}/validate"),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "validate: {report}");
+    assert_eq!(report["valid"], true, "report: {report}");
+    assert_eq!(report["retirements"]["entities"], 1);
+
+    let (st, res) = call(
+        &app,
+        "POST",
+        &format!("/api/studio/drafts/{draft_id}/publish"),
+        &token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "rollback publish: {res}");
+
+    let (st, active) = call(&app, "GET", "/api/studio/model", &token, None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let names: Vec<&str> = active["entities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Customer"], "rolled back to the v1 model");
+}
+
+/// Publish a model through the draft lifecycle (branch → PUT model → publish).
+async fn publish_helper(app: &axum::Router, token: &str, model: Value) {
+    let (st, d) = call(
+        app,
+        "POST",
+        "/api/studio/drafts",
+        token,
+        Some(json!({"name":"p"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "branch: {d}");
+    let id = d["id"].as_str().unwrap();
+    let etag = d["version_etag"].as_str().unwrap();
+    let (st, _) = call(
+        app,
+        "PUT",
+        &format!("/api/studio/drafts/{id}/model"),
+        token,
+        Some(model.to_string()),
+        Some(etag.to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "put model");
+    let (st, res) = call(
+        app,
+        "POST",
+        &format!("/api/studio/drafts/{id}/publish"),
+        token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "publish: {res}");
+}

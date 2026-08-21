@@ -47,6 +47,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/studio/export", get(get_active_model))
         .route("/api/studio/import", post(import_model))
         .route("/api/studio/snapshots", get(list_snapshots))
+        .route("/api/studio/snapshots/:id/model", get(get_snapshot_model))
         .route("/api/studio/entities/:id", get(get_entity_definition))
 }
 
@@ -363,6 +364,31 @@ async fn list_snapshots(
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
     Ok(Json(rows))
+}
+
+/// `GET /api/studio/snapshots/:id/model` — the archived model of a published
+/// snapshot: the input the §5.8 rollback recipe needs (import as a new draft →
+/// validate → publish). Studio-gated, tenant-scoped; 404 for another tenant's
+/// (or an unknown) snapshot id.
+async fn get_snapshot_model(
+    State(st): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let tenant = user.tenant_id;
+    require_studio(&user)?;
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    let row: Option<(serde_json::Value,)> =
+        sqlx::query_as("SELECT model FROM meta.md_snapshot WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    let (model,) = row.ok_or_else(|| Error::NotFound(format!("snapshot {id}")))?;
+    Ok(Json(model))
 }
 
 /// Read an entity definition **through the cache** (exercises the loader +
