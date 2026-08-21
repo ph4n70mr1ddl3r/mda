@@ -432,6 +432,24 @@ async fn role_hierarchy_reads_but_never_writes_subordinate_records() {
     .await;
     assert_eq!(st, StatusCode::CREATED, "parent rep under manager");
 
+    // the parents listing is key-addressable JSON ({id, name} objects),
+    // which is what the Studio's role-hierarchy panel parses
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/admin/roles/{rep_role}/parents"),
+        &ctx.admin_token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["parents"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["parents"][0]["id"].as_str().unwrap(),
+        manager_role.to_string()
+    );
+    assert_eq!(v["parents"][0]["name"].as_str().unwrap(), "manager");
+
     // rep owns a private record
     let (st, v) = call(
         &ctx.app,

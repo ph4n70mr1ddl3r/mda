@@ -1213,7 +1213,13 @@ fn seed_picks(fields: &[(String, String)], stored: Option<&Value>) -> Vec<FieldP
         })
         .unwrap_or(empty);
     for f in stored_fields.iter() {
-        let name = f["name"].as_str().unwrap_or_default().to_string();
+        // Form fields key by "name"; view columns key by "field" — read both
+        // or a stored view definition resolves to nothing on load.
+        let name = f["name"]
+            .as_str()
+            .or_else(|| f["field"].as_str())
+            .unwrap_or_default()
+            .to_string();
         if let Some((_, model_label)) = fields.iter().find(|(n, _)| *n == name) {
             used.push(name.clone());
             rows.push(FieldPick {
@@ -1428,11 +1434,17 @@ fn ViewsTab() -> impl IntoView {
     let entity = create_rw_signal(String::new());
     let rows = create_rw_signal(Vec::<FieldPick>::new());
     let page_size = create_rw_signal(String::new());
+    // Filters/sort aren't designer-editable (yet), but they ARE part of the
+    // stored definition — capture them on load and round-trip them on save so
+    // saving columns never silently wipes filters authored through the API.
+    let stored_filters = create_rw_signal(json!([]));
+    let stored_sort = create_rw_signal(json!([]));
     let msg = create_rw_signal(None::<(bool, String)>);
 
     let load = move |ent: String| {
         let t = token.get().unwrap_or_default();
         let (rows, page_size) = (rows, page_size);
+        let (stored_filters, stored_sort) = (stored_filters, stored_sort);
         spawn_local(async move {
             let fields = entity_field_list(&state, &ent);
             match api::sget(&t, &format!("/api/views/{ent}")).await {
@@ -1443,10 +1455,14 @@ fn ViewsTab() -> impl IntoView {
                             .map(|v| v.to_string())
                             .unwrap_or_default(),
                     );
+                    stored_filters.set(stored["filters"].clone());
+                    stored_sort.set(stored["sort"].clone());
                     rows.set(seed_picks(&fields, Some(&stored)));
                 }
                 Err(_) => {
                     page_size.set(String::new());
+                    stored_filters.set(json!([]));
+                    stored_sort.set(json!([]));
                     rows.set(seed_picks(&fields, None));
                 }
             }
@@ -1519,6 +1535,13 @@ fn ViewsTab() -> impl IntoView {
                                     let mut body = json!({"name": "default", "columns": picks});
                                     if let Ok(n) = page_size.get().parse::<i64>() {
                                         body["page_size"] = json!(n);
+                                    }
+                                    // preserve what the designer can't edit
+                                    if stored_filters.get().as_array().is_some_and(|a| !a.is_empty()) {
+                                        body["filters"] = stored_filters.get();
+                                    }
+                                    if stored_sort.get().as_array().is_some_and(|a| !a.is_empty()) {
+                                        body["sort"] = stored_sort.get();
                                     }
                                     let msg = msg;
                                     spawn_local(async move {
@@ -1694,7 +1717,18 @@ fn DashboardsTab() -> impl IntoView {
                         let t = token.get().unwrap_or_default();
                         let name = name.get();
                         let label = label.get();
-                        let items = tiles.get().iter()
+                        // A tile without a report picked would pass an empty
+                        // report_id (server now rejects "" too) and otherwise
+                        // store a tile that can never resolve — fail with a
+                        // specific message instead.
+                        let tiles_now = tiles.get();
+                        if let Some(tile) = tiles_now.iter().find(|tile| tile.report_id.is_empty()) {
+                            set_msg(&msg, false, format!(
+                                "tile “{}” has no report picked",
+                                if tile.title.is_empty() { "(untitled)" } else { tile.title.as_str() }));
+                            return;
+                        }
+                        let items = tiles_now.iter()
                             .map(|tile| json!({"report_id": tile.report_id, "title": if tile.title.is_empty() { tile.report_id.clone() } else { tile.title.clone() }}))
                             .collect::<Vec<_>>();
                         let msg = msg;
@@ -1856,7 +1890,23 @@ fn NavigationTab() -> impl IntoView {
                 <button style=btn(true)
                     on:click=move |_: leptos::ev::MouseEvent| {
                         let t = token.get().unwrap_or_default();
-                        let items = rows.get().iter().map(|r| {
+                        // Completeness check before the round-trip: an entity
+                        // row without an entity is now rejected by the server
+                        // too, and a link without an http(s) url gets a generic
+                        // server error — name the offending row instead.
+                        let shown = |r: &NavRow| {
+                            if r.label.trim().is_empty() { "(unlabeled)".to_string() } else { r.label.clone() }
+                        };
+                        let rows_now = rows.get();
+                        if let Some(r) = rows_now.iter().find(|r| r.kind != "link" && r.entity.trim().is_empty()) {
+                            set_msg(&msg, false, format!("nav item “{}” has no entity picked", shown(r)));
+                            return;
+                        }
+                        if let Some(r) = rows_now.iter().find(|r| r.kind == "link" && !r.url.trim().starts_with("http://") && !r.url.trim().starts_with("https://")) {
+                            set_msg(&msg, false, format!("link “{}” needs an http(s) url", shown(r)));
+                            return;
+                        }
+                        let items = rows_now.iter().map(|r| {
                             if r.kind == "link" {
                                 json!({"type": "link", "url": r.url, "label": r.label})
                             } else {
@@ -2625,6 +2675,41 @@ fn WorkflowsTab() -> impl IntoView {
                              let v = name_sig2.get();
                              t2.update(|ts| { if let Some(r) = ts.iter_mut().find(|r| r.id == rid_name) { r.name = v.clone(); } });
                          });
+                         // Same mirror for the guard + action widgets (and
+                         // creates_task): the save handler serializes the ROW,
+                         // so an edit that never reaches the row is silently
+                         // dropped — guards/actions would always save their
+                         // initial defaults.
+                         {
+                             let (g_m2, g_f2, g_o2, g_v2) = (g_m, g_f, g_o, g_v);
+                             let rid_guard = rid.clone();
+                             create_effect(move |_| {
+                                 let (m, fl, o, v) = (g_m2.get(), g_f2.get(), g_o2.get(), g_v2.get());
+                                 t2.update(|ts| {
+                                     if let Some(r) = ts.iter_mut().find(|r| r.id == rid_guard) {
+                                         r.g_mode = m.clone();
+                                         r.g_field = fl.clone();
+                                         r.g_op = o.clone();
+                                         r.g_val = v.clone();
+                                     }
+                                 });
+                             });
+                         }
+                         {
+                             let (af2, ak2, av2, ct2) = (af, ak, av, ct);
+                             let rid_act = rid.clone();
+                             create_effect(move |_| {
+                                 let (fl, k, v, c) = (af2.get(), ak2.get(), av2.get(), ct2.get());
+                                 t2.update(|ts| {
+                                     if let Some(r) = ts.iter_mut().find(|r| r.id == rid_act) {
+                                         r.action_field = fl.clone();
+                                         r.a_kind = k.clone();
+                                         r.a_val = v.clone();
+                                         r.creates_task = c;
+                                     }
+                                 });
+                             });
+                         }
                          let rid_from_sel = rid.clone();
                          let rid_from_inp = rid.clone();
                          let rid_to_sel = rid.clone();
@@ -3334,7 +3419,9 @@ fn RoleParents(
                     on:input=move |ev| parent_role.set(event_target_value(&ev))
                     style=fmt_style("auto")>
                     <option value="">"— parent role —"</option>
-                    {role_opts().into_iter()
+                    {/* Reactive: roles reload after create/delete — a list
+                        captured at mount would miss newly created roles. */}
+                    {move || role_opts().into_iter()
                         .map(|(v, l)| view! { <option value=v.clone()>{l}</option> })
                         .collect_view()}
                 </select>
@@ -3716,7 +3803,10 @@ fn UserRow(
                             on:input=move |ev| assign_role.set(event_target_value(&ev))
                             style=fmt_style("auto")>
                             <option value="">"— assign role —"</option>
-                            {roles_sig.get().iter()
+                            {/* Reactive: roles load async (and reload after
+                                creation) — options built once at expand stay
+                                empty if the list lands late. */}
+                            {move || roles_sig.get().iter()
                                 .map(|r| view! { <option value=r["id"].as_str().unwrap_or_default().to_string()>{r["name"].as_str().unwrap_or_default().to_string()}</option> })
                                 .collect_view()}
                         </select>

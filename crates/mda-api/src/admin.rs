@@ -1441,7 +1441,14 @@ async fn list_role_parents(
     .await
     .map_err(Error::internal)?;
     tx.commit().await.map_err(Error::internal)?;
-    Ok(Json(serde_json::json!({"role_id": id, "parents": rows})))
+    // Emit objects, not tuples: a Vec<(Uuid, String)> serializes as nested
+    // arrays ([id, name]), which no JSON consumer can address by key (the
+    // Studio reads parent["id"] / parent["name"]).
+    let parents: Vec<Value> = rows
+        .into_iter()
+        .map(|(pid, name)| serde_json::json!({"id": pid, "name": name}))
+        .collect();
+    Ok(Json(serde_json::json!({"role_id": id, "parents": parents})))
 }
 
 /// `POST /api/admin/roles/:id/parents/:parent_id` — parent a role (a role may

@@ -393,7 +393,15 @@ async fn upsert_dashboard(
         return Err(Error::Invalid("items must be an array".into()).into());
     }
     for item in items.as_array().unwrap() {
-        if item.get("report_id").and_then(|r| r.as_str()).is_none() {
+        // trim + empty check: an empty-string report_id passes a bare
+        // `is_none()` check, gets stored, and the tile can never resolve.
+        if item
+            .get("report_id")
+            .and_then(|r| r.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
             return Err(Error::Invalid("every dashboard item needs a report_id".into()).into());
         }
     }
@@ -507,7 +515,16 @@ async fn upsert_navigation(
     for it in items.as_array().unwrap() {
         match it.get("type").and_then(|t| t.as_str()) {
             Some("entity") => {
-                if it.get("entity").and_then(|e| e.as_str()).is_none() {
+                // trim + empty check: an empty-string entity passes a bare
+                // `is_none()` check, gets stored, then silently vanishes from
+                // every menu (it is never readable).
+                if it
+                    .get("entity")
+                    .and_then(|e| e.as_str())
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
                     return Err(Error::Invalid("entity nav item needs an entity".into()).into());
                 }
             }

@@ -95,9 +95,6 @@ pub fn App() -> impl IntoView {
     create_effect(move |_| {
         if let Some(t) = token_for_effect.get() {
             spawn_local(async move {
-                if let Ok(m) = api::get_model(&t).await {
-                    model_for_effect.set(Some(m));
-                }
                 if let Ok(items) = api::get_navigation(&t).await {
                     nav_for_effect.set(items);
                 }
@@ -106,6 +103,15 @@ pub fn App() -> impl IntoView {
                 }
                 if let Ok(admin) = api::is_admin(&t).await {
                     admin_for_effect.set(admin);
+                    // `/api/studio/model` is admin-gated: fetching it for
+                    // every user would 403 for regular users on every login.
+                    // The Studio needs it; the runtime renders everything else
+                    // from per-user resolved metadata (forms/views/navigation).
+                    if admin {
+                        if let Ok(m) = api::get_model(&t).await {
+                            model_for_effect.set(Some(m));
+                        }
+                    }
                 }
             });
         }
@@ -257,14 +263,15 @@ fn Home() -> impl IntoView {
 
             <h3>"Navigation"</h3>
             <For each=move || s.nav.get()
-                 // Key by kind + target (entity name or URL): two items that
-                 // share a label (e.g. two entities with the same display
-                 // label) would collide under a label-based key and break the
-                 // For diff.
+                 // Key by kind + target + label: two items that share a target
+                 // (e.g. the same entity listed twice under different labels)
+                 // would collide under a target-only key and break the For
+                 // diff.
                  key=|i| format!(
-                     "{}::{}",
+                     "{}::{}::{}",
                      i.kind,
-                     i.entity.clone().unwrap_or_else(|| i.url.clone().unwrap_or_default())
+                     i.entity.clone().unwrap_or_else(|| i.url.clone().unwrap_or_default()),
+                     i.label
                  )
                  children=move |item: NavItem| {
                      let s2 = s;
@@ -466,6 +473,9 @@ fn EntityList(entity: String) -> impl IntoView {
             let token = token.get().unwrap_or_default();
             let entity = entity_fetch.clone();
             async move {
+                // A view-fetch failure (5xx/auth) deliberately degrades to
+                // fallback columns rather than blocking the record list — the
+                // data fetch below still surfaces its own errors.
                 let view = api::get_view(&token, &entity).await.ok().flatten();
                 let data = api::list_records(&token, &entity).await;
                 (view, data)
@@ -808,8 +818,11 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
         let ent = entity_save.clone();
         let ver = version.get();
         // Field name → declared type, so typed fields are sent as JSON scalars
-        // (bool/integer/decimal) rather than always as strings.
-        let field_types: HashMap<String, String> = s
+        // (bool/integer/decimal) rather than always as strings. Prefer the
+        // cached model (admins only — /api/studio/model is gated); fall back
+        // to the resolved form definition, which carries each field's type
+        // for every user.
+        let mut field_types: HashMap<String, String> = s
             .model
             .get()
             .and_then(|m| {
@@ -820,6 +833,13 @@ fn RecordForm(entity: String, id: Option<String>) -> impl IntoView {
             })
             .map(|fs| fs.into_iter().map(|f| (f.name, f.field_type)).collect())
             .unwrap_or_default();
+        if field_types.is_empty() {
+            for sec in form.get().unwrap_or_default() {
+                for f in sec.fields {
+                    field_types.entry(f.name).or_insert(f.field_type);
+                }
+            }
+        }
         let body = serde_json::Value::Object(
             values
                 .get()
@@ -1130,7 +1150,14 @@ fn model_fields(
                 label: f.label.clone().unwrap_or_else(|| f.name.clone()),
                 field_type: f.field_type.clone(),
                 required: f.required,
-                widget: infer_widget(&f.field_type).to_string(),
+                // A reference can't be resolved client-side here (the fallback
+                // has no target-entity list), so render a plain id input
+                // instead of an empty, un-typable select.
+                widget: match infer_widget(&f.field_type) {
+                    "reference" => "text",
+                    w => w,
+                }
+                .to_string(),
                 options: f
                     .config
                     .get("options")

@@ -517,6 +517,18 @@ async fn dashboards_run_reports_under_the_caller() {
     )
     .await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // an empty-string report_id is rejected too — it would store a tile that
+    // can never resolve (a bare `is_none()` check lets "" through)
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/dashboards",
+        &ctx.admin_token,
+        Some(json!({"name":"empty-tile","items":[{"report_id":"","title":"x"}]}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
 }
 
 #[tokio::test]
@@ -598,6 +610,18 @@ async fn navigation_is_permission_filtered() {
     )
     .await;
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "only http(s) links");
+
+    // an entity item with an empty entity is rejected — it would be stored
+    // and then silently vanish from every menu (never readable)
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/navigation",
+        &ctx.admin_token,
+        Some(json!({"items": [{"type":"entity","entity":"","label":"ghost"}]}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
 
     let (st, _) = call(
         &ctx.app,
