@@ -19,6 +19,9 @@ struct Ctx {
     app: axum::Router,
     token: String,
     pool: PgPool,
+    /// Admin URL of the test database (owner role) — lets a test open a second
+    /// pool as another role (e.g. `mda_app`) against the same database.
+    db_url: String,
     tenant: Uuid,
     user_id: Uuid,
     email: String,
@@ -26,7 +29,7 @@ struct Ctx {
 
 async fn setup() -> Option<Ctx> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    let (pool, _db_url) = common::spawn_db(&url).await;
+    let (pool, db_url) = common::spawn_db(&url).await;
     let tenant = Uuid::new_v4();
     let role_id = common::seed_role(&pool, tenant, "admin", &[("*", "*")]).await;
     let hash = mda_security::hash_password("x").unwrap();
@@ -53,6 +56,7 @@ async fn setup() -> Option<Ctx> {
         app,
         token,
         pool,
+        db_url,
         tenant,
         user_id,
         email,
@@ -311,6 +315,29 @@ async fn digest_rolls_up_digestible_notifications() {
         .await
         .unwrap();
     }
+    // A SECOND user with a single stale unread notification of the same
+    // digestible type: a lone notification must never be rolled up
+    // (`HAVING count(*) > 1`) — no `.digest` summary of one, and the
+    // original stays in the timeline.
+    let solo_email = format!("solo{}@test", Uuid::new_v4().simple());
+    let solo = common::seed_user(
+        &ctx.pool,
+        ctx.tenant,
+        &solo_email,
+        "admin",
+        &mda_security::hash_password("x").unwrap(),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO sys_notification (tenant_id, user_id, type, payload, created_at)
+         VALUES ($1, $2, 'job.failed', $3, now() - interval '600 seconds')",
+    )
+    .bind(ctx.tenant)
+    .bind(solo)
+    .bind(json!({"lone": true}))
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
     // md_notification_type is RLS-gated; the insert above ran without the GUC →
     // would be blocked. Re-insert under the GUC if the count is zero.
     let n: i64 = sqlx::query_scalar(
@@ -358,6 +385,29 @@ async fn digest_rolls_up_digestible_notifications() {
     .await
     .unwrap();
     assert_eq!(summary, 1);
+
+    // the lone notification was left exactly as it was: still unread and
+    // undigested, with no summary beside it.
+    let lone_untouched: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_notification
+          WHERE tenant_id=$1 AND user_id=$2 AND read_at IS NULL AND digested_at IS NULL",
+    )
+    .bind(ctx.tenant)
+    .bind(solo)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(lone_untouched, 1, "a lone notification is never rolled up");
+    let lone_summary: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_notification
+          WHERE tenant_id=$1 AND user_id=$2 AND type='job.failed.digest'",
+    )
+    .bind(ctx.tenant)
+    .bind(solo)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(lone_summary, 0, "no digest-of-one was created");
 }
 
 /// A Customer model with a `name` (readable) + `secret` (FLS-restrictable) field.
@@ -792,5 +842,387 @@ async fn record_readers_notifies_ancestor_team_members() {
         count_notif(&ctx, outsider).await,
         0,
         "sibling-team member NOT notified"
+    );
+}
+
+/// Swap the userinfo of a postgres URL (owner → `mda_app`, whose password the
+/// migration chain sets to `mda` when it creates the role).
+fn as_app_role(db_url: &str) -> String {
+    let (scheme, rest) = db_url.split_once("://").expect("url scheme");
+    let (_, host) = rest.split_once('@').expect("url userinfo");
+    format!("{scheme}://mda_app:mda@{host}")
+}
+
+/// The digest sweep must work under the NON-SUPERUSER app role. The
+/// digestible-type join hits `meta.md_notification_type` (ENABLE+FORCE RLS):
+/// the pre-fix sweep joined it on a tenant-less pool, saw zero rows as
+/// `mda_app`, and silently never fired in any production deployment — while
+/// staying green in tests, which run as the table owner (HARDENING pass 3's
+/// `int.flow_step` bug class).
+#[tokio::test]
+async fn digest_sweep_works_as_the_app_role() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    // restricted environments without role-creation rights: nothing to prove.
+    let has_role: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'mda_app')")
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    if !has_role {
+        return;
+    }
+
+    // seed (as the owner, under the GUC): one digestible type + 3 stale unread
+    // notifications.
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO meta.md_notification_type (tenant_id, key, label, digestible)
+         VALUES ($1, 'job.failed', 'Job Failed', TRUE)",
+    )
+    .bind(ctx.tenant)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    for i in 0..3 {
+        sqlx::query(
+            "INSERT INTO sys_notification (tenant_id, user_id, type, payload, created_at)
+             VALUES ($1, $2, 'job.failed', $3, now() - interval '600 seconds')",
+        )
+        .bind(ctx.tenant)
+        .bind(ctx.user_id)
+        .bind(json!({ "i": i }))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // run the sweep connected AS mda_app (production configuration).
+    let app_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&as_app_role(&ctx.db_url))
+        .await
+        .unwrap();
+    let rolled = mda_api::notifications::digest_once(&app_pool)
+        .await
+        .unwrap();
+    assert_eq!(rolled, 3, "digest rolls up under mda_app too");
+
+    let digested: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sys_notification WHERE tenant_id=$1 AND digested_at IS NOT NULL",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(digested, 3);
+}
+
+/// `resolve_record_readers` walks `sec_team.parent_id` UP from the owner's
+/// team. A cycle in that graph (historically creatable via import) must not
+/// hang the walk: the recursive term deduplicates (`UNION`), like every other
+/// hierarchy walk since HARDENING pass 3.
+#[tokio::test]
+async fn record_reader_resolution_terminates_on_team_parent_cycle() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    // team-OWD on some entity so the ancestor-team branch runs at all.
+    sqlx::query(
+        "INSERT INTO sec.sec_owd (tenant_id, entity, default_access) VALUES ($1,'Customer','team')",
+    )
+    .bind(ctx.tenant)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    // two teams whose parent links form a cycle (direct SQL = import-era data).
+    let (t1,): (Uuid,) =
+        sqlx::query_as("INSERT INTO sec.sec_team (tenant_id, name) VALUES ($1,'A') RETURNING id")
+            .bind(ctx.tenant)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    let (t2,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sec.sec_team (tenant_id, name, parent_id) VALUES ($1,'B',$2) RETURNING id",
+    )
+    .bind(ctx.tenant)
+    .bind(t1)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE sec.sec_team SET parent_id = $2 WHERE id = $1")
+        .bind(t1)
+        .bind(t2)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sec.sec_user SET team_id = $2 WHERE id = $1")
+        .bind(ctx.user_id)
+        .bind(t1)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // must terminate and resolve the owner (an object-level reader via */*)
+    // through the cyclic ancestor walk.
+    let readers = mda_api::notifications::resolve_record_readers(
+        &ctx.pool,
+        ctx.tenant,
+        "Customer",
+        ctx.user_id,
+        Uuid::new_v4(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        readers.contains(&ctx.user_id),
+        "owner resolved despite the cycle: {readers:?}"
+    );
+}
+
+/// A failed outbox row must be retried after its backoff and dead-lettered
+/// after [`mda_server::outbox::MAX_RETRIES`] failures — not stranded forever
+/// (the pre-fix drain claimed only `status='pending'`; a single transient
+/// failure permanently parked the side-effect and §5.9.4's DLQ was
+/// unreachable).
+#[tokio::test]
+async fn failed_outbox_rows_are_retried_then_dead_lettered() {
+    use std::sync::Arc;
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    // poison row: a fanout payload with no tenant_id fails deterministically.
+    let (row_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sys_outbox (tenant_id, kind, payload) VALUES ($1,'notification.fanout','{}')
+         RETURNING id",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+
+    let channels = mda_api::notifications::default_channels();
+    let secrets: Arc<dyn mda_core::SecretStore> =
+        Arc::new(mda_api::secrets::LocalSecretStore::from_env());
+    let http = reqwest::Client::new();
+    async fn status_of(pool: &PgPool, row_id: Uuid) -> (String, i32) {
+        let (status, attempts): (String, i32) =
+            sqlx::query_as("SELECT status, attempts FROM sys_outbox WHERE id = $1")
+                .bind(row_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (status, attempts)
+    }
+
+    // pass 1: fails → 'failed', attempts 1, backoff stamped.
+    mda_server::outbox::drain_once(&ctx.pool, &channels, secrets.as_ref(), &http)
+        .await
+        .unwrap();
+    let (st, n) = status_of(&ctx.pool, row_id).await;
+    assert_eq!((st.as_str(), n), ("failed", 1));
+
+    // immediate second pass: the backoff holds the row (no hot retry loop).
+    mda_server::outbox::drain_once(&ctx.pool, &channels, secrets.as_ref(), &http)
+        .await
+        .unwrap();
+    let (st, n) = status_of(&ctx.pool, row_id).await;
+    assert_eq!((st.as_str(), n), ("failed", 1), "backoff defers the retry");
+
+    // age out the backoff → the row is claimed again and fails again.
+    for expected_attempts in 2..=mda_server::outbox::MAX_RETRIES {
+        sqlx::query("UPDATE sys_outbox SET processed_at = now() - interval '1 hour' WHERE id=$1")
+            .bind(row_id)
+            .execute(&ctx.pool)
+            .await
+            .unwrap();
+        mda_server::outbox::drain_once(&ctx.pool, &channels, secrets.as_ref(), &http)
+            .await
+            .unwrap();
+        let (st, n) = status_of(&ctx.pool, row_id).await;
+        assert_eq!(n, expected_attempts, "attempt {expected_attempts} ran");
+        if st == "dead" {
+            break;
+        }
+        assert_eq!(st, "failed");
+    }
+    let (st, n) = status_of(&ctx.pool, row_id).await;
+    assert_eq!(st, "dead", "dead-letter reached after exhausting retries");
+    assert_eq!(n, mda_server::outbox::MAX_RETRIES);
+
+    // dead is terminal: even with the backoff fully elapsed, a dead-lettered
+    // row is never claimed again (no zombie deliveries from the DLQ).
+    sqlx::query("UPDATE sys_outbox SET processed_at = now() - interval '1 hour' WHERE id=$1")
+        .bind(row_id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    mda_server::outbox::drain_once(&ctx.pool, &channels, secrets.as_ref(), &http)
+        .await
+        .unwrap();
+    let (st, n) = status_of(&ctx.pool, row_id).await;
+    assert_eq!(
+        (st.as_str(), n),
+        ("dead", mda_server::outbox::MAX_RETRIES),
+        "dead rows are never re-claimed"
+    );
+}
+
+/// Rows parked at `status='failed'` by the PRE-retry drain (which never
+/// stamped `processed_at` on failure) must be rescued by the new code, not
+/// stranded forever: a failed row with a NULL last-attempt timestamp counts
+/// as backoff-elapsed and is retried once immediately (the attempt then
+/// stamps the timestamp, so normal backoff takes over). Without the
+/// NULL-tolerant claim arm, every failed row in an upgraded database would
+/// be unclaimable for eternity.
+#[tokio::test]
+async fn legacy_failed_rows_without_a_processed_at_are_rescued() {
+    use std::sync::Arc;
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    // the exact shape the pre-retry drain left behind: failed, attempts
+    // counted, processed_at never stamped.
+    let (row_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sys_outbox (tenant_id, kind, payload, status, attempts)
+         VALUES ($1,'notification.fanout','{}','failed',3)
+         RETURNING id",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+
+    let channels = mda_api::notifications::default_channels();
+    let secrets: Arc<dyn mda_core::SecretStore> =
+        Arc::new(mda_api::secrets::LocalSecretStore::from_env());
+    let http = reqwest::Client::new();
+
+    mda_server::outbox::drain_once(&ctx.pool, &channels, secrets.as_ref(), &http)
+        .await
+        .unwrap();
+    let (st, n, stamped): (String, i32, bool) = sqlx::query_as(
+        "SELECT status, attempts, processed_at IS NOT NULL FROM sys_outbox WHERE id=$1",
+    )
+    .bind(row_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (st.as_str(), n, stamped),
+        ("failed", 4, true),
+        "legacy row retried immediately and stamped for backoff"
+    );
+}
+
+/// At-least-once delivery means the drain may run the SAME row twice — a
+/// worker crash between delivering and stamping the row leaves it claimable
+/// again (simulated here by resetting a done row to pending). Every durable
+/// row a channel writes derives its id from the outbox row id, so the replay
+/// must be a NO-OP: no duplicate in-app notification, no duplicate email
+/// record, no duplicate `notification.created` event.
+#[tokio::test]
+async fn replayed_outbox_rows_do_not_duplicate_deliveries() {
+    use std::sync::Arc;
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    // a registered type delivering on both channels.
+    call(
+        &ctx.app,
+        "POST",
+        "/api/notification-types",
+        &ctx.token,
+        Some(
+            json!({"key":"invoice.overdue","label":"Overdue",
+                   "default_channels":["in_app","email"]})
+            .to_string(),
+        ),
+    )
+    .await;
+    let (row_id,): (Uuid,) = sqlx::query_as(
+        "INSERT INTO sys_outbox (tenant_id, kind, payload)
+         VALUES ($1,'notification.fanout',$2)
+         RETURNING id",
+    )
+    .bind(ctx.tenant)
+    .bind(
+        json!({"tenant_id": ctx.tenant, "type_key": "invoice.overdue",
+                 "recipients": [ctx.user_id], "context": {"record": {"name": "Acme"}}}),
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+
+    let channels = mda_api::notifications::default_channels();
+    let secrets: Arc<dyn mda_core::SecretStore> =
+        Arc::new(mda_api::secrets::LocalSecretStore::from_env());
+    let http = reqwest::Client::new();
+    async fn counts(pool: &PgPool, tenant: Uuid, user: Uuid) -> (i64, i64, i64) {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sys_notification WHERE tenant_id=$1 AND user_id=$2",
+        )
+        .bind(tenant)
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let m: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sys_message WHERE tenant_id=$1 AND user_id=$2",
+        )
+        .bind(tenant)
+        .bind(user)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let e: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sys_event_log WHERE tenant_id=$1 AND type='notification.created'",
+        )
+        .bind(tenant)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (n, m, e)
+    }
+
+    // first pass: delivers on both channels, marks the row done.
+    mda_server::outbox::drain_once(&ctx.pool, &channels, secrets.as_ref(), &http)
+        .await
+        .unwrap();
+    let (st, att): (String, i32) =
+        sqlx::query_as("SELECT status, attempts FROM sys_outbox WHERE id = $1")
+            .bind(row_id)
+            .fetch_one(&ctx.pool)
+            .await
+            .unwrap();
+    assert_eq!((st.as_str(), att), ("done", 0), "row delivered and done");
+    let after_first = counts(&ctx.pool, ctx.tenant, ctx.user_id).await;
+    assert_eq!(
+        after_first,
+        (1, 1, 1),
+        "one notification, one message, one event"
+    );
+
+    // crash-before-stamp: the row goes back to claimable and is replayed.
+    sqlx::query(
+        "UPDATE sys_outbox SET status='pending', attempts=0, processed_at=NULL WHERE id=$1",
+    )
+    .bind(row_id)
+    .execute(&ctx.pool)
+    .await
+    .unwrap();
+    mda_server::outbox::drain_once(&ctx.pool, &channels, secrets.as_ref(), &http)
+        .await
+        .unwrap();
+    let after_replay = counts(&ctx.pool, ctx.tenant, ctx.user_id).await;
+    assert_eq!(
+        after_first, after_replay,
+        "replay of the same outbox row delivered nothing new"
     );
 }

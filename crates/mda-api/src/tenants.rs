@@ -231,13 +231,18 @@ async fn import_tenant(
         .into());
     }
 
-    // --- model → a reviewable Studio draft (publish to materialize biz.*) ---
+    // --- one transaction for the WHOLE import: the model draft and every
+    // config table commit together, so a rejected bundle (bad model, cyclic
+    // hierarchy, missing FK target, …) leaves nothing behind — not even a
+    // 'restored' draft the caller would have to clean up by hand. ---
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+
+    // model → a reviewable Studio draft (publish to materialize biz.*)
     let draft_id: Option<Uuid> = if let Some(model_val) = bundle.get("model") {
         let model: DraftModel = serde_json::from_value(model_val.clone())
             .map_err(|e| Error::Invalid(format!("bundle `model` is not a valid model: {e}")))?;
         let model_json = serde_json::to_value(&model).map_err(Error::internal)?;
-        let mut tx = st.pool.begin().await.map_err(Error::internal)?;
-        set_tenant(&mut tx, tenant).await?;
         let (id,): (Uuid,) = sqlx::query_as(
             "INSERT INTO meta.md_draft (tenant_id, name, model, status)
              VALUES ($1, 'restored', $2, 'draft') RETURNING id",
@@ -247,15 +252,10 @@ async fn import_tenant(
         .fetch_one(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        tx.commit().await.map_err(Error::internal)?;
         Some(id)
     } else {
         None
     };
-
-    // --- config tables: merge by natural key under the tenant GUC ---
-    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
-    set_tenant(&mut tx, tenant).await?;
 
     let security = bundle.get("security").cloned().unwrap_or(Value::Null);
     let integrations = bundle.get("integrations").cloned().unwrap_or(Value::Null);
@@ -415,6 +415,10 @@ async fn restore_teams(
     // Pass 2: re-link the hierarchy. parent_id is remapped through the map (a
     // parent that already existed under a different id resolves correctly), and
     // is dropped if the bundle references a parent that wasn't in the bundle.
+    // A link that would CLOSE A CYCLE is rejected: the admin API refuses
+    // cyclic hierarchies (`would_cycle`), and every consumer of `parent_id`
+    // walks the graph — the import path must not smuggle one in behind that
+    // guard (a cyclic graph also makes several of those walks spin).
     for r in rows {
         let id = j_uuid(r, "id")?;
         let Some(actual) = map.get(&id).copied() else {
@@ -425,6 +429,32 @@ async fn restore_teams(
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok());
         let parent_actual = parent.and_then(|p| map.get(&p).copied());
+        if let Some(p) = parent_actual {
+            if p == actual {
+                return Err(Error::Invalid(format!(
+                    "team hierarchy cycle: team {} cannot be its own parent",
+                    r.get("name").and_then(|v| v.as_str()).unwrap_or("?")
+                )));
+            }
+            // Walking UP from the proposed parent must never reach the child.
+            let hit: Option<(i32,)> = sqlx::query_as(
+                "WITH RECURSIVE up(tid) AS (
+                        SELECT $2::uuid
+                        UNION
+                        SELECT t.parent_id FROM sec.sec_team t JOIN up ON t.id = up.tid)
+                 SELECT 1 WHERE $1::uuid IN (SELECT tid FROM up)",
+            )
+            .bind(actual)
+            .bind(p)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(Error::internal)?;
+            if hit.is_some() {
+                return Err(Error::Invalid(
+                    "import would create a team-hierarchy cycle (a team is already an ancestor of its proposed parent)".into(),
+                ));
+            }
+        }
         sqlx::query("UPDATE sec.sec_team SET parent_id = $2 WHERE id = $1")
             .bind(actual)
             .bind(parent_actual)
@@ -1116,7 +1146,10 @@ async fn restore_share_rules(
 }
 
 /// Restore the role hierarchy, remapping both role ids through the role map
-/// (pairs naming a role absent from the bundle+target are skipped).
+/// (pairs naming a role absent from the bundle+target are skipped). A pair that
+/// would close a cycle is rejected — same rule as the admin API's
+/// role-hierarchy endpoint (the self-loop skip alone admits longer cycles,
+/// which then hang the hierarchy walks).
 async fn restore_role_hierarchy(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
@@ -1133,6 +1166,27 @@ async fn restore_role_hierarchy(
         };
         if role == parent {
             continue;
+        }
+        // Walking UP from the proposed parent must never reach the child.
+        let hit: Option<(i32,)> = sqlx::query_as(
+            "WITH RECURSIVE up(rid) AS (
+                    SELECT $3::uuid
+                    UNION
+                    SELECT h.parent_id FROM sec.sec_role_hierarchy h JOIN up ON h.role_id = up.rid
+                     WHERE h.tenant_id = $1)
+             SELECT 1 WHERE $2::uuid IN (SELECT rid FROM up)",
+        )
+        .bind(tenant)
+        .bind(role)
+        .bind(parent)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+        if hit.is_some() {
+            return Err(Error::Invalid(
+                "import would create a role-hierarchy cycle (a role is already an ancestor of its proposed parent)"
+                    .into(),
+            ));
         }
         let res = sqlx::query(
             "INSERT INTO sec.sec_role_hierarchy (tenant_id, role_id, parent_id)

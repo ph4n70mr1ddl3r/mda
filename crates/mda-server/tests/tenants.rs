@@ -479,3 +479,134 @@ async fn tenant_import_rejects_unsupported_schema() {
     assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(body["code"], "mda.invalid");
 }
+
+/// A bundle whose team hierarchy contains a cycle must be REJECTED, not
+/// imported: the admin API refuses cyclic hierarchies (`would_cycle`), and the
+/// import path historically linked parents unchecked — smuggling a cycle in
+/// behind that guard (several consumers walk `parent_id`; HARDENING pass 3 had
+/// to harden those walks against exactly this shape of data).
+#[tokio::test]
+async fn tenant_import_rejects_a_cyclic_team_hierarchy() {
+    let Some(a) = setup().await else {
+        return;
+    };
+    // two flat teams in A (no parents).
+    let mut tx = a.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, a.tenant).await.unwrap();
+    for name in ["T1", "T2"] {
+        sqlx::query("INSERT INTO sec.sec_team (tenant_id, name) VALUES ($1,$2)")
+            .bind(a.tenant)
+            .bind(name)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let (_, mut bundle) = call(&a.app, "GET", "/api/tenants/export", &a.token, None).await;
+    // forge T1 → T2 → T1 in the exported rows (bundle ids; import remaps them),
+    // and carry a model so the import would also create a 'restored' draft —
+    // the rejection must roll the WHOLE import back, draft included.
+    {
+        let teams = bundle["security"]["teams"].as_array_mut().unwrap();
+        assert_eq!(teams.len(), 2);
+        let id1 = teams[0]["id"].as_str().unwrap().to_string();
+        let id2 = teams[1]["id"].as_str().unwrap().to_string();
+        teams[0]["parent_id"] = json!(id2);
+        teams[1]["parent_id"] = json!(id1);
+    }
+    bundle["model"] = json!({ "entities": [] });
+
+    // fresh tenant B: the import must fail loudly (422), not create the cycle.
+    let Some(b) = setup().await else {
+        return;
+    };
+    let (st, resp) = call(
+        &b.app,
+        "POST",
+        "/api/tenants/import",
+        &b.token,
+        Some(bundle.to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
+    assert_eq!(resp["code"], "mda.invalid");
+    assert!(
+        resp["message"].as_str().unwrap_or("").contains("cycle"),
+        "message names the cycle: {resp}"
+    );
+    // and nothing may remain on B: no cyclic edge, and (the import is one
+    // transaction) no 'restored' draft either — a rejected bundle must leave
+    // the tenant exactly as it was.
+    let mut tx = b.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, b.tenant).await.unwrap();
+    let cyclic: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sec.sec_team t
+          WHERE t.parent_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM sec.sec_team p WHERE p.id = t.parent_id AND p.parent_id = t.id)",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let drafts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM meta.md_draft WHERE tenant_id = $1 AND name = 'restored'",
+    )
+    .bind(b.tenant)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(cyclic, 0, "no two-team cycle imported");
+    assert_eq!(
+        drafts, 0,
+        "rejected import leaves no 'restored' draft behind"
+    );
+}
+
+/// Same rule for the role hierarchy: a longer cycle (r1→r2→r1 — not a
+/// self-loop, which was already skipped) must be rejected at import.
+#[tokio::test]
+async fn tenant_import_rejects_a_cyclic_role_hierarchy() {
+    let Some(a) = setup().await else {
+        return;
+    };
+    common::seed_role(&a.pool, a.tenant, "r1", &[("*", "read")]).await;
+    common::seed_role(&a.pool, a.tenant, "r2", &[("*", "write")]).await;
+
+    let (_, mut bundle) = call(&a.app, "GET", "/api/tenants/export", &a.token, None).await;
+    // inject r1→r2 and r2→r1 edges (bundle role ids; remap resolves them).
+    {
+        let roles = bundle["security"]["roles"].as_array().unwrap();
+        let id_of = |name: &str| {
+            roles
+                .iter()
+                .find(|r| r["name"].as_str() == Some(name))
+                .unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let (rid1, rid2) = (id_of("r1"), id_of("r2"));
+        bundle["security"]["role_hierarchy"] = json!([
+            {"role_id": rid1, "parent_id": rid2},
+            {"role_id": rid2, "parent_id": rid1},
+        ]);
+    }
+
+    let Some(b) = setup().await else {
+        return;
+    };
+    let (st, resp) = call(
+        &b.app,
+        "POST",
+        "/api/tenants/import",
+        &b.token,
+        Some(bundle.to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
+    assert!(
+        resp["message"].as_str().unwrap_or("").contains("cycle"),
+        "message names the cycle: {resp}"
+    );
+}

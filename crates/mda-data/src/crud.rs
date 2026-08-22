@@ -1005,26 +1005,3 @@ pub fn reconstruct(def: &EntityDefinition, doc: Value) -> Value {
 fn is_expr_marker(v: &Value) -> bool {
     matches!(v, Value::Object(m) if m.contains_key("$expr"))
 }
-
-/// Next value for an `auto_number` field (gapless within the txn via row lock).
-pub async fn next_sequence(
-    pool: &PgPool,
-    tenant: Uuid,
-    entity_id: Uuid,
-    field: &str,
-) -> Result<i64> {
-    let row: (i64,) = sqlx::query_as(
-        "INSERT INTO meta.md_sequence (tenant_id, entity_id, field_name, next)
-         VALUES ($1, $2, $3, 1)
-         ON CONFLICT (tenant_id, entity_id, field_name)
-         DO UPDATE SET next = meta.md_sequence.next + 1
-         RETURNING next",
-    )
-    .bind(tenant)
-    .bind(entity_id)
-    .bind(field)
-    .fetch_one(pool)
-    .await
-    .map_err(Error::internal)?;
-    Ok(row.0)
-}

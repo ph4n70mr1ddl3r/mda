@@ -5,8 +5,9 @@
 //!   per-user preferences, in-app + email (+ webhook, added by §5.21) delivery.
 //! - `webhook.deliver` → outbound signed delivery (§5.21, wired in that slice).
 //!
-//! At-least-once; idempotent on the outbox row id. Poison messages move to
-//! `status = 'dead'` after [`MAX_RETRIES`] failures.
+//! At-least-once; idempotent on the outbox row id. A failed row is retried with
+//! exponential backoff (measured from its last attempt); after [`MAX_RETRIES`]
+//! failures it moves to `status = 'dead'` — the dead-letter queue (§5.9.4).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +18,18 @@ use mda_core::SecretStore;
 use sqlx::PgPool;
 
 /// Maximum retry attempts before moving a failing item to the dead-letter queue.
-const MAX_RETRIES: i32 = 10;
+pub const MAX_RETRIES: i32 = 10;
+
+/// Delay before the FIRST retry of a failed item; doubles per subsequent
+/// attempt (15s → 30s → 60s …), capped at [`RETRY_CAP_SECS`], with ±50 %
+/// jitter (§5.9.4: "exponential backoff + jitter") so a fleet of rows that
+/// failed together — an SMTP blip failing a whole batch — doesn't retry in
+/// lockstep. Measured from `processed_at` (the last-attempt timestamp) — the
+/// attempt itself stamps it, so every retry reschedules from its own failure.
+pub const RETRY_BASE_SECS: i64 = 15;
+
+/// Upper bound on the retry backoff.
+pub const RETRY_CAP_SECS: i64 = 900;
 
 /// Spawn the background drain loop with the default channel set (in-app + email)
 /// and a default secret store + HTTP client.
@@ -54,12 +66,28 @@ pub fn spawn_drain_with(
     });
 }
 
-async fn drain_once(
+/// Claim and process one batch. Claimable rows are `pending`, plus `failed`
+/// rows whose backoff has elapsed and that have retries left — a failure must
+/// never strand a side-effect (at-least-once, §5.9.4). `pub` as the ops/test
+/// entry point (the spawned loop is just this + sleep).
+///
+/// A `failed` row with NULL `processed_at` (the shape every row parked by the
+/// pre-retry code has — it only stamped `done`/`dead`) counts as backoff-
+/// elapsed: it is retried once immediately and stamped, then normal backoff
+/// applies. The NULL-tolerant arm also means no future writer can strand a
+/// row by leaving the timestamp unset.
+pub async fn drain_once(
     pool: &PgPool,
     channels: &[Box<dyn Channel>],
     secrets: &dyn SecretStore,
     http: &reqwest::Client,
 ) -> Result<(), sqlx::Error> {
+    let dc = DeliveryCtx {
+        pool,
+        channels,
+        secrets,
+        http,
+    };
     let mut tx = pool.begin().await?;
     // Claim a batch and snapshot `attempts` in the same locked read. The rows
     // are held FOR UPDATE within this transaction, so the pre-increment count
@@ -68,24 +96,33 @@ async fn drain_once(
     let rows: Vec<(uuid::Uuid, uuid::Uuid, String, serde_json::Value, i32)> = sqlx::query_as(
         "SELECT id, tenant_id, kind, payload, attempts FROM sys_outbox
           WHERE status = 'pending'
+             OR (status = 'failed'
+                 AND attempts < $1
+                 AND (processed_at IS NULL OR processed_at < now()
+                        - make_interval(secs => LEAST($2 * POWER(2, GREATEST(attempts - 1, 0))
+                                                     * (0.5 + random()), $3)::int)))
           ORDER BY created_at
           LIMIT 50
           FOR UPDATE SKIP LOCKED",
     )
+    .bind(MAX_RETRIES)
+    .bind(RETRY_BASE_SECS as f64)
+    .bind(RETRY_CAP_SECS)
     .fetch_all(&mut *tx)
     .await?;
 
     for (id, tenant, kind, payload, current_attempts) in rows {
         // Handlers run against the pool (their own transactions); the row lock
-        // in `tx` simply reserves the row for this pass.
-        let res = process(pool, channels, secrets, http, tenant, &kind, &payload).await;
+        // in `tx` simply reserves the row for this pass. `id` rides along so
+        // every durable row a handler writes can key off it (replay-safe).
+        let res = process(&dc, id, tenant, &kind, &payload).await;
         let (status, attempts_incr): (&str, i32) = match res {
             Ok(()) => ("done", 0),
             Err(e) => {
                 tracing::warn!(?e, %kind, attempts = current_attempts, "outbox item failed");
                 if current_attempts + 1 >= MAX_RETRIES {
-                    tracing::error!(%kind, id = %id, attempts = current_attempts, "outbox item moved to dead-letter queue");
-                    ("dead", 0)
+                    tracing::error!(%kind, id = %id, attempts = current_attempts + 1, "outbox item moved to dead-letter queue");
+                    ("dead", 1)
                 } else {
                     ("failed", 1)
                 }
@@ -93,7 +130,7 @@ async fn drain_once(
         };
         sqlx::query(
             "UPDATE sys_outbox SET status = $2, attempts = attempts + $3,
-                processed_at = CASE WHEN $2 IN ('done', 'dead') THEN now() ELSE processed_at END
+                processed_at = now()
               WHERE id = $1",
         )
         .bind(id)
@@ -106,21 +143,37 @@ async fn drain_once(
     Ok(())
 }
 
-/// Turn one outbox row into side-effect(s).
+/// The fixed delivery context a drain pass carries (pool + channel set +
+/// secrets + egress client); the per-row bits stay separate arguments.
+struct DeliveryCtx<'a> {
+    pool: &'a PgPool,
+    channels: &'a [Box<dyn Channel>],
+    secrets: &'a dyn SecretStore,
+    http: &'a reqwest::Client,
+}
+
+/// Turn one outbox row into side-effect(s). `id` is the outbox row's id —
+/// handlers derive their durable rows' ids from it so an at-least-once replay
+/// is a no-op, not a duplicate.
 async fn process(
-    pool: &PgPool,
-    channels: &[Box<dyn Channel>],
-    secrets: &dyn SecretStore,
-    http: &reqwest::Client,
+    dc: &DeliveryCtx<'_>,
+    id: uuid::Uuid,
     tenant: uuid::Uuid,
     kind: &str,
     payload: &serde_json::Value,
 ) -> Result<(), sqlx::Error> {
+    let DeliveryCtx {
+        pool,
+        channels,
+        secrets,
+        http,
+    } = *dc;
     match kind {
         "notification.fanout" => {
             // full multi-channel fan-out (§5.18). Errors are logged inside
-            // fanout per-channel; a row-level error propagates to retry.
-            notifications::fanout(pool, channels, payload)
+            // fanout per-channel; a row-level error propagates to retry. The
+            // row id makes every channel row idempotent (see `fanout`).
+            notifications::fanout(pool, channels, payload, id)
                 .await
                 .map_err(|e| {
                     tracing::warn!(?e, "notification fanout failed");
@@ -211,7 +264,9 @@ async fn process(
             Ok(())
         }
         "workflow.transitioned" => {
-            // legacy: an in-app notification addressed to the actor.
+            // legacy: an in-app notification addressed to the actor. The id is
+            // derived from (outbox row, actor) so a replay of the row is a
+            // no-op — the ON CONFLICT below actually has a key to land on.
             let user = payload
                 .get("actor")
                 .and_then(|v| v.as_str())
@@ -222,11 +277,13 @@ async fn process(
                 .and_then(|v| v.as_str())
                 .and_then(|s| uuid::Uuid::parse_str(s).ok());
             if let Some(user) = user {
+                let nid = notifications::delivery_row_id(id, user, b"transitioned");
                 sqlx::query(
-                    "INSERT INTO sys_notification (tenant_id, user_id, type, entity, record_id, payload)
-                     VALUES ($1, $2, $3, $4, $5, $6)
-                     ON CONFLICT DO NOTHING",
+                    "INSERT INTO sys_notification (id, tenant_id, user_id, type, entity, record_id, payload)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)
+                     ON CONFLICT (id) DO NOTHING",
                 )
+                .bind(nid)
                 .bind(tenant)
                 .bind(user)
                 .bind(kind)

@@ -299,9 +299,13 @@ async fn would_cycle(pool: &sqlx::PgPool, tenant: Uuid, id: Uuid, parent: Uuid) 
     let mut tx = pool.begin().await.map_err(Error::internal)?;
     set_tenant(&mut tx, tenant).await?;
     let (hits,): (i64,) = sqlx::query_as(
+        // `UNION` (deduplicating), not `UNION ALL`: the walk must terminate
+        // even when the existing graph ALREADY contains a cycle elsewhere on
+        // the ancestor chain (historically possible via the import path) — an
+        // undeduplicated walk would spin forever instead of reporting.
         "WITH RECURSIVE up(tid) AS (
                 SELECT $2
-                UNION ALL
+                UNION
                 SELECT t.parent_id FROM sec.sec_team t JOIN up ON t.id = up.tid
                 WHERE t.parent_id IS NOT NULL)
          SELECT count(*) FROM up WHERE tid = $1",
@@ -1475,11 +1479,13 @@ async fn add_role_parent(
             return Err(Error::NotFound(format!("role {role}")).into());
         }
     }
-    // cycle check: walking UP from parent_id must never reach `id`
+    // cycle check: walking UP from parent_id must never reach `id`. `UNION`
+    // (deduplicating) so the walk terminates even if the existing hierarchy
+    // already contains a cycle elsewhere on the path (import-era data).
     let hits: Option<(i32,)> = sqlx::query_as(
         "WITH RECURSIVE up(rid) AS ( \
             SELECT $2::uuid \
-            UNION ALL \
+            UNION \
             SELECT h.parent_id FROM sec.sec_role_hierarchy h JOIN up ON h.role_id = up.rid) \
          SELECT 1 WHERE $1::uuid IN (SELECT rid FROM up)",
     )

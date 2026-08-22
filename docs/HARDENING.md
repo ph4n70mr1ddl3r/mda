@@ -323,6 +323,100 @@ deployments require the role anyway (`MDA_APP_DATABASE_URL`), so this only
 bites debug-mode boots against managed Postgres, and it fails loudly with
 `role "mda_app" does not exist` rather than silently.
 
+## Seventh pass (2026-08-22): review — digest sweep, cyclic hierarchies, outbox retries
+
+### The digest sweep silently never fired on `mda_app` deployments (high)
+
+Same class as pass 3's `int.flow_step` loader, in the notification subsystem:
+`digest_once` (§5.18) enumerated its roll-up candidates with one tenant-less
+join `sys_notification ⋈ meta.md_notification_type` — and `md_notification_type`
+is ENABLE **and FORCE** RLS, so under the non-superuser app role the join sees
+zero rows and the sweep returns `Ok(0)` forever, no error logged. Tests stayed
+green because they run as the table owner (bypassing even FORCE). Rewritten to
+enumerate candidate tenants from `sys_notification` (no RLS) first, then run
+each tenant's whole roll-up — grouping, summary insert, `digested_at` stamp —
+in one transaction under the tenant GUC, so a group can never be half-rolled.
+The batch is *claimed* by stamping `digested_at` (`… AND digested_at IS NULL`)
+before the summary is inserted, and only a sweep that flips every row rolls
+the group up — two concurrent sweeps (two replicas, or an ops-invoked
+`digest_once` racing the 60 s loop) produce one summary, not two.
+Regression tests: `digest_sweep_works_as_the_app_role` (opens a second pool
+as `mda_app` and asserts the roll-up fires) and
+`digest_rolls_up_digestible_notifications`, which also pins that a LONE
+stale notification is never rolled up (`HAVING count(*) > 1`).
+
+### Hierarchy walks spun forever on cyclic imported data (high)
+
+Four recursive walks (`would_cycle` for teams, the role-hierarchy cycle check,
+`resolve_record_readers`' ancestor-team walk) used `UNION ALL` recursive
+terms: terminating on well-formed data, but looping without end if
+`sec_team.parent_id` / `sec_role_hierarchy` already held a cycle — which the
+import path historically admitted unchecked (see next item). All now use
+deduplicating `UNION`, matching `read_predicate`'s descendant walk (hardened
+in pass 3). Membership answers are unaffected — only termination changes.
+Regression test: `record_reader_resolution_terminates_on_team_parent_cycle`
+seeds a two-team cycle by direct SQL and asserts resolution completes.
+
+### Import smuggled cyclic hierarchies past the admin-API guard (medium)
+
+`POST /api/tenants/import` relinked `parent_id` from bundle rows with no
+cycle check — while the admin API refuses cycles (`would_cycle`), so an
+import was the one path that could create exactly the data that hangs the
+walks above. `restore_teams` and `restore_role_hierarchy` now reject a
+link that would close a cycle (422 `mda.invalid`, naming the cycle), checked
+against the in-transaction graph so multi-edge bundles are caught in any
+order (the last edge of any cycle is always checked against the rest of the
+cycle already in place). While here, the import was made properly atomic:
+the 'restored' Studio draft used to commit in its own transaction *before*
+the config merge, so any rejected bundle left a half-applied import behind
+(the draft). The draft insert now rides the same transaction as every
+config table — a rejected bundle leaves the tenant exactly as it was.
+Regression tests: `tenant_import_rejects_a_cyclic_team_hierarchy` (2-cycle,
+and asserts no leftover draft) and
+`tenant_import_rejects_a_cyclic_role_hierarchy` (2-cycle, not a self-loop).
+
+### A failed outbox row was parked forever; the DLQ was unreachable (high)
+
+`drain_once` claimed only `status='pending'`, so one transient failure (SMTP
+hiccup, webhook 502) permanently stranded the side-effect — and because a
+failed row was never re-attempted, the `MAX_RETRIES` dead-letter transition
+(§5.9.4) could never trigger either. Failed rows are now re-claimed once
+their backoff has elapsed: exponential from 15 s (doubling, capped at 15 min,
+±50 % jitter per §5.9.4 so a batch that failed together doesn't retry in
+lockstep), measured from `processed_at`, which every attempt stamps; after
+`MAX_RETRIES` attempts the row moves to `status='dead'`. A `failed` row with NULL
+`processed_at` — the exact shape every row parked by the pre-fix code has,
+since it only stamped `done` — counts as backoff-elapsed, so upgraded
+databases rescue their stranded rows on the next sweep without a migration.
+Regression tests: `failed_outbox_rows_are_retried_then_dead_lettered` (full
+arithmetic: backoff defers, retries run, dead-letter at exactly
+`MAX_RETRIES`, and dead is terminal — never re-claimed) and
+`legacy_failed_rows_without_a_processed_at_are_rescued`.
+
+### At-least-once replays duplicated every delivery (high)
+
+Making rows replayable exposed the lie in the drain's header claim
+("idempotent on the outbox row id"): nothing derived anything from that id.
+`InAppChannel` and `EmailChannel` did bare INSERTs, so a replayed row —
+worker crash between delivering and stamping, or any retry after partial
+progress — duplicated the in-app notification, the `notification.created`
+event, the `sys_message` email record, and the SMTP send itself; the legacy
+`workflow.transitioned` handler's `ON CONFLICT DO NOTHING` was vacuous
+(random id, no key). Now `sys_notification` rows written by the drain carry
+a UUID derived deterministically from (outbox row, recipient, channel) —
+`uuid` v5 — so a replay lands on the same row and is a no-op (the companion
+event and the SMTP send are gated on the insert actually happening);
+`sys_message` (BIGSERIAL pk) carries a nullable `outbox_id` with a partial
+unique index on `(outbox_id, user_id)` (`20260138000001`). The email
+channel's comment also no longer claims a nonexistent "retry worker
+re-sends from sys_message". Regression test:
+`replayed_outbox_rows_do_not_duplicate_deliveries` (delivers, resets the row
+to pending — the crash-before-stamp shape — re-drains, and asserts nothing
+was delivered twice).
+
+Also removed in this pass: `mda_data::crud::next_sequence`, a dead duplicate
+of the inline `md_sequence` upsert the create path actually uses.
+
 ## Verifying a deployment yourself
 
 ```bash

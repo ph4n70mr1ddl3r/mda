@@ -372,6 +372,24 @@ pub struct Delivery {
     pub record_id: Option<Uuid>,
     pub context: Value,
     pub template_name: Option<String>,
+    /// The driving `sys_outbox` row id, when the delivery runs from the outbox
+    /// drain. Channels derive their durable rows' ids from it, so an at-least-
+    /// once replay of the row (worker crash before the status update) lands on
+    /// the same rows and is a no-op instead of a duplicate.
+    pub dedupe: Option<Uuid>,
+}
+
+/// Deterministic row id for one (outbox row, recipient, channel-tag) delivery:
+/// the same replayed outbox row recomputes the same id, so `ON CONFLICT … DO
+/// NOTHING` turns the replay into a no-op. `pub` for the drain's legacy
+/// `workflow.transitioned` handler, which needs the same replay safety.
+pub fn delivery_row_id(outbox: Uuid, recipient: Uuid, channel: &[u8]) -> Uuid {
+    let mut name = [0u8; 32];
+    name[..16].copy_from_slice(outbox.as_bytes());
+    name[16..].copy_from_slice(recipient.as_bytes());
+    let mut name = name.to_vec();
+    name.extend_from_slice(channel);
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, &name)
 }
 
 /// A delivery channel. Implementations are pluggable (§5.18: "a `Channel` trait,
@@ -393,10 +411,18 @@ impl Channel for InAppChannel {
         "in_app"
     }
     async fn deliver(&self, pool: &PgPool, d: &Delivery) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO sys_notification (tenant_id, user_id, type, entity, record_id, payload)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+        // Deterministic id when driven by the outbox: a replayed row lands on
+        // the same notification instead of duplicating it.
+        let id = d
+            .dedupe
+            .map(|k| delivery_row_id(k, d.recipient, b"in_app"))
+            .unwrap_or_else(Uuid::new_v4);
+        let res = sqlx::query(
+            "INSERT INTO sys_notification (id, tenant_id, user_id, type, entity, record_id, payload)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (id) DO NOTHING",
         )
+        .bind(id)
         .bind(d.tenant)
         .bind(d.recipient)
         .bind(&d.type_key)
@@ -406,6 +432,11 @@ impl Channel for InAppChannel {
         .execute(pool)
         .await
         .map_err(Error::internal)?;
+        if res.rows_affected() == 0 {
+            // already delivered by an earlier attempt at this outbox row —
+            // the notification exists, so the companion event was emitted too.
+            return Ok(());
+        }
         sqlx::query(
             "INSERT INTO sys_event_log (tenant_id, type, entity, record_id, actor_id, payload)
              VALUES ($1, 'notification.created', $2, $3, $4, $5)",
@@ -527,9 +558,14 @@ impl Channel for EmailChannel {
             (to, body, content_type)
         };
 
-        sqlx::query(
-            "INSERT INTO sys_message (tenant_id, user_id, to_addr, type_key, subject, body, content_type, record_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        // Outbox-driven deliveries dedupe on (outbox_id, user_id) (partial
+        // unique index): a replayed row finds the message already recorded and
+        // neither re-inserts nor re-sends.
+        let res = sqlx::query(
+            "INSERT INTO sys_message
+                (tenant_id, user_id, to_addr, type_key, subject, body, content_type, record_id, outbox_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (outbox_id, user_id) WHERE outbox_id IS NOT NULL DO NOTHING",
         )
         .bind(d.tenant)
         .bind(d.recipient)
@@ -539,13 +575,19 @@ impl Channel for EmailChannel {
         .bind(&body)
         .bind(&content_type)
         .bind(d.record_id)
+        .bind(d.dedupe)
         .execute(pool)
         .await
         .map_err(Error::internal)?;
+        if res.rows_affected() == 0 {
+            return Ok(()); // message already recorded by an earlier attempt
+        }
 
-        // Hand the rendered message to the transport (record-then-send: a send
-        // failure is logged but does not fail the delivery — `sys_message` is
-        // the durable record a retry worker re-sends from).
+        // Hand the rendered message to the transport (record-then-send: the
+        // durable `sys_message` row is written first; a send failure is logged
+        // but does not fail the delivery, so one flaky SMTP hop can't wedge
+        // the whole fan-out — the record remains the audit of what should be
+        // in the recipient's mailbox).
         if let Some(to) = to_addr {
             let from =
                 std::env::var("MDA_SMTP_FROM").unwrap_or_else(|_| "no-reply@mda.local".into());
@@ -579,10 +621,17 @@ pub fn default_channels() -> Vec<Box<dyn Channel>> {
 /// Run fan-out for a `notification.fanout` outbox payload. Resolves the type,
 /// honors per-user preferences, and delivers to each effective channel.
 /// Best-effort per channel: a failing channel is logged but does not abort the
-/// whole fan-out (the outbox row still succeeds; partial delivery is acceptable
-/// for at-least-once — the failing channel will retry on the next outbox row
-/// that targets it).
-pub async fn fanout(pool: &PgPool, channels: &[Box<dyn Channel>], payload: &Value) -> Result<()> {
+/// whole fan-out (the outbox row still succeeds — §5.18 accepts partial
+/// delivery rather than wedging the fan-out on one flaky sink).
+/// `outbox` is the driving `sys_outbox` row id: every durable row a channel
+/// writes derives from it, so an at-least-once replay of the row (crash before
+/// the status update, or a row-level retry) is a no-op, not a duplicate.
+pub async fn fanout(
+    pool: &PgPool,
+    channels: &[Box<dyn Channel>],
+    payload: &Value,
+    outbox: Uuid,
+) -> Result<()> {
     let tenant: Uuid = payload
         .get("tenant_id")
         .and_then(|v| v.as_str())
@@ -634,6 +683,7 @@ pub async fn fanout(pool: &PgPool, channels: &[Box<dyn Channel>], payload: &Valu
             record_id,
             context: context.clone(),
             template_name: template_name.clone(),
+            dedupe: Some(outbox),
         };
         for ch_name in eff {
             if let Some(ch) = channels.iter().find(|c| c.name() == ch_name) {
@@ -724,6 +774,10 @@ pub async fn resolve_record_readers(
     // Team-OWD: anyone in the owner's team or an ANCESTOR team (who also
     // clears the object-level read gate) can read — the manager-visibility
     // side of the ADR-0013 hierarchy. A team-less owner admits no one extra.
+    // (`UNION`, not `UNION ALL`: the import path historically linked parents
+    // unchecked, so `sec_team.parent_id` may hold a cycle — a deduplicating
+    // recursive term terminates on one, an `UNION ALL` term spins forever;
+    // same remedy as read_predicate's descendant walk.)
     if owd == mda_security::Owd::Team {
         let teammates: Vec<Uuid> = sqlx::query_scalar(
             "SELECT u.id FROM sec.sec_user u
@@ -731,7 +785,7 @@ pub async fn resolve_record_readers(
                AND u.team_id IN (
                  WITH RECURSIVE ancestor_teams(tid) AS (
                       SELECT o.team_id FROM sec.sec_user o WHERE o.id = $1
-                      UNION ALL
+                      UNION
                       SELECT parent.parent_id FROM sec.sec_team parent
                         JOIN ancestor_teams a ON parent.id = a.tid
                        WHERE parent.parent_id IS NOT NULL)
@@ -864,27 +918,60 @@ async fn dispatch_endpoint(
 /// One digest pass: for each (tenant, user, type) whose type is digestible, roll
 /// unread notifications older than the window into a single summary and mark the
 /// originals digested. Prevents notification storms from a bulk event (§5.18).
+///
+/// The per-tenant work runs under the tenant GUC: `sys_notification` carries no
+/// RLS (the sweep enumerates candidate tenants from it directly), but the
+/// digestible-type join hits `meta.md_notification_type`, which is ENABLE+FORCE
+/// RLS — under the non-superuser app role (every production deployment) a
+/// tenant-less join sees ZERO rows and the sweep would silently never fire
+/// (tests passed only because they run as the table owner; same class as the
+/// `int.flow_step` loader bug fixed in HARDENING pass 3).
 pub async fn digest_once(pool: &PgPool) -> Result<u64> {
-    // Find digestible groups with more than one undelivered (unread, not yet
-    // digested) notification older than the window.
-    let groups: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT n.tenant_id, n.user_id, n.type
-           FROM sys_notification n
-           JOIN meta.md_notification_type t
-             ON t.tenant_id = n.tenant_id AND t.key = n.type
-          WHERE n.read_at IS NULL AND n.digested_at IS NULL
-            AND t.digestible = TRUE
-            AND n.created_at < now() - ($1 || '')::interval
-          GROUP BY n.tenant_id, n.user_id, n.type
-         HAVING count(*) > 1",
+    // Tenants that have any undigested, unread notification at all.
+    let tenants: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT DISTINCT tenant_id FROM sys_notification
+          WHERE read_at IS NULL AND digested_at IS NULL",
     )
-    .bind(format!("{} seconds", DIGEST_WINDOW_SECS))
     .fetch_all(pool)
     .await
     .map_err(Error::internal)?;
 
     let mut rolled = 0u64;
-    for (tenant, user, type_key) in groups {
+    for (tenant,) in tenants {
+        rolled += digest_tenant(pool, tenant).await?;
+    }
+    Ok(rolled)
+}
+
+/// Digest one tenant's roll-up-able groups. Everything (grouping, summary
+/// insert, digested_at stamp) happens in ONE transaction under the tenant GUC,
+/// so a group is never half-rolled (summary without stamp or vice versa).
+async fn digest_tenant(pool: &PgPool, tenant: Uuid) -> Result<u64> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+
+    // Digestible groups with more than one undelivered (unread, not yet
+    // digested) notification older than the window.
+    let groups: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT n.user_id, n.type
+           FROM sys_notification n
+           JOIN meta.md_notification_type t
+             ON t.tenant_id = n.tenant_id AND t.key = n.type
+          WHERE n.tenant_id = $1
+            AND n.read_at IS NULL AND n.digested_at IS NULL
+            AND t.digestible = TRUE
+            AND n.created_at < now() - ($2 || '')::interval
+          GROUP BY n.user_id, n.type
+         HAVING count(*) > 1",
+    )
+    .bind(tenant)
+    .bind(format!("{} seconds", DIGEST_WINDOW_SECS))
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+
+    let mut rolled = 0u64;
+    for (user, type_key) in groups {
         // collect the ids + a summary of the batch.
         let ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM sys_notification
@@ -895,11 +982,28 @@ pub async fn digest_once(pool: &PgPool) -> Result<u64> {
         .bind(tenant)
         .bind(user)
         .bind(&type_key)
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(Error::internal)?;
         if ids.len() < 2 {
             continue;
+        }
+        // CLAIM the batch by stamping first, and only roll it up if we flipped
+        // every row: the stamp carries `AND digested_at IS NULL`, so a
+        // concurrent sweep that committed first leaves rows_affected < len and
+        // the loser skips — one summary per batch even with two sweepers
+        // racing (two replicas, or an ops-invoked digest_once against the
+        // background loop).
+        let claimed = sqlx::query(
+            "UPDATE sys_notification SET digested_at = now()
+              WHERE id = ANY($1) AND digested_at IS NULL",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+        if claimed.rows_affected() != ids.len() as u64 {
+            continue; // lost the race — the other sweeper owns this batch
         }
         let summary = json!({ "type": type_key, "count": ids.len(), "rolled_up": ids });
         sqlx::query(
@@ -910,16 +1014,12 @@ pub async fn digest_once(pool: &PgPool) -> Result<u64> {
         .bind(user)
         .bind(format!("{type_key}.digest"))
         .bind(&summary)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        sqlx::query("UPDATE sys_notification SET digested_at = now() WHERE id = ANY($1)")
-            .bind(&ids)
-            .execute(pool)
-            .await
-            .map_err(Error::internal)?;
         rolled += ids.len() as u64;
     }
+    tx.commit().await.map_err(Error::internal)?;
     Ok(rolled)
 }
 
