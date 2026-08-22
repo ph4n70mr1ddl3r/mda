@@ -344,6 +344,32 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
                     e.name, f.name
                 ));
             }
+            // `decimal` precision/scale must be integers inside Postgres's
+            // NUMERIC bounds (1..=1000, scale ≤ precision) — the DDL layer
+            // would otherwise emit NUMERIC(p,s) that Postgres rejects with a
+            // confusing publish-time error, wrap (exactly 2^32) through the
+            // cast into a different precision than the modeler wrote, or (a
+            // non-integer like "12") silently fall back to the default.
+            if f.field_type == "decimal" {
+                let raw_p = f.config.get("precision");
+                let raw_s = f.config.get("scale");
+                let p = raw_p.and_then(|v| v.as_u64());
+                let s = raw_s.and_then(|v| v.as_u64());
+                let non_integer = raw_p.is_some_and(|v| v.as_u64().is_none())
+                    || raw_s.is_some_and(|v| v.as_u64().is_none());
+                let out_of_range = p.is_some_and(|p| !(1..=1000).contains(&p))
+                    || s.is_some_and(|s| s > 1000)
+                    || matches!((p, s), (Some(p), Some(s)) if s > p);
+                if non_integer || out_of_range {
+                    report.errors.push(format!(
+                        "field {}.{}: decimal precision/scale must be integers satisfying 1 ≤ precision ≤ 1000 and scale ≤ precision (got precision {}, scale {})",
+                        e.name,
+                        f.name,
+                        raw_p.unwrap_or(&serde_json::json!(null)),
+                        raw_s.unwrap_or(&serde_json::json!(null)),
+                    ));
+                }
+            }
             if f.name.trim().is_empty() {
                 report
                     .errors
@@ -728,6 +754,65 @@ mod tests {
         assert!(!r.valid);
         assert!(r.errors.iter().any(|e| e.contains("unknown type blob")));
         assert!(r.errors.iter().any(|e| e.contains("invalid table_name")));
+    }
+
+    #[test]
+    fn rejects_out_of_range_decimal_precision_and_scale() {
+        // Postgres bounds NUMERIC to precision 1..=1000 with scale ≤ precision.
+        // A precision of exactly 2^32 also used to wrap through the DDL layer's
+        // `as u32` cast into NUMERIC(0,s); the gate now rejects all of these
+        // with a message naming the modeler's actual numbers.
+        for (p, s) in [
+            (serde_json::json!(0u64), serde_json::json!(0u64)),
+            (serde_json::json!(1001), serde_json::json!(0)),
+            (serde_json::json!(4294967296u64), serde_json::json!(0)),
+            (serde_json::json!(10), serde_json::json!(11)),
+            (serde_json::json!(10), serde_json::json!(1001)),
+            // non-integer forms previously fell back to the default silently
+            (serde_json::json!("12"), serde_json::json!(2)),
+            (serde_json::json!(12.5), serde_json::json!(2)),
+        ] {
+            let mut draft = DraftModel::empty();
+            let mut e = ent(1, "X");
+            e.fields.push(DraftField {
+                id: Uuid::from_u128(9),
+                name: "amount".into(),
+                label: None,
+                field_type: "decimal".into(),
+                required: false,
+                is_unique: false,
+                is_indexed: false,
+                default_expr: None,
+                config: serde_json::json!({"precision": p, "scale": s}),
+            });
+            draft.entities.push(e);
+            let r = diff(&DraftModel::empty(), &draft);
+            assert!(!r.valid, "precision {p} scale {s} must be rejected");
+            assert!(
+                r.errors
+                    .iter()
+                    .any(|e| e.contains("decimal precision/scale")),
+                "missing gate error for precision {p} scale {s}: {:?}",
+                r.errors
+            );
+        }
+        // In-range values still validate.
+        let mut draft = DraftModel::empty();
+        let mut e = ent(1, "X");
+        e.fields.push(DraftField {
+            id: Uuid::from_u128(9),
+            name: "amount".into(),
+            label: None,
+            field_type: "decimal".into(),
+            required: false,
+            is_unique: false,
+            is_indexed: false,
+            default_expr: None,
+            config: serde_json::json!({"precision": 20, "scale": 4}),
+        });
+        draft.entities.push(e);
+        let r = diff(&DraftModel::empty(), &draft);
+        assert!(r.valid, "{:?}", r.errors);
     }
 
     #[test]

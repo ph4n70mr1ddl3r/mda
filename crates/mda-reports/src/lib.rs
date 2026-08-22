@@ -153,6 +153,21 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
     if pairs.is_empty() {
         return Err(Error::Invalid("report selects no fields".into()));
     }
+    // Duplicate aliases silently shadow each other: jsonb_build_object keeps
+    // the *last* pair for a repeated key, so the first field's values vanish —
+    // and the CSV renderer would emit a duplicate header that from_csv (the
+    // impex import parser) rejects, breaking an export→import round-trip.
+    // Catch it at run time with a message naming the alias.
+    {
+        let mut seen = std::collections::HashSet::with_capacity(columns.len());
+        for c in &columns {
+            if !seen.insert(c.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "duplicate select alias '{c}': give each selected field a distinct alias"
+                )));
+            }
+        }
+    }
 
     // ---- group_by (semantic: unreadable => error) ----
     let mut group_exprs: Vec<String> = Vec::new();
@@ -542,8 +557,15 @@ fn quote(s: &str) -> String {
 /// path lets the runtime write pipeline coerce per field type). Quoted fields
 /// may contain commas, newlines (CR/LF/CRLF), and `""` for a literal quote.
 /// Mirrors [`to_csv`] so an export round-trips back through `from_csv`. Returns
-/// `mda.invalid` for an empty input (no header).
+/// `mda.invalid` for an empty input (no header), for a header with duplicate
+/// column names (ambiguous — a later duplicate would silently shadow the
+/// earlier column's values), or for a record with more cells than the header
+/// (extra cells would be silently dropped). A leading UTF-8 BOM — what every
+/// Excel "CSV UTF-8" export starts with — is stripped so the first column maps.
 pub fn from_csv(input: &str) -> Result<ReportResult> {
+    // Excel writes a BOM before the header; without this the first column name
+    // carries '\u{feff}' and the import fails mapping with a confusing name.
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut records: Vec<Vec<String>> = Vec::new();
     let mut field = String::new();
     let mut record: Vec<String> = Vec::new();
@@ -607,8 +629,27 @@ pub fn from_csv(input: &str) -> Result<ReportResult> {
         .next()
         .ok_or_else(|| Error::Invalid("empty CSV: no header row".to_string()))?;
     let columns = header.clone();
+    {
+        let mut seen = std::collections::HashSet::with_capacity(columns.len());
+        for (i, c) in columns.iter().enumerate() {
+            if !seen.insert(c.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "duplicate CSV column '{c}' (column {}): column names must be unique",
+                    i + 1
+                )));
+            }
+        }
+    }
     let mut rows = Vec::with_capacity(iter.len());
-    for rec in iter {
+    for (n, rec) in iter.enumerate() {
+        if rec.len() > columns.len() {
+            return Err(Error::Invalid(format!(
+                "CSV row {} has {} cells but the header has {} columns",
+                n + 1,
+                rec.len(),
+                columns.len()
+            )));
+        }
         let mut m = Map::with_capacity(columns.len());
         for (i, col) in columns.iter().enumerate() {
             let v = rec.get(i).cloned().unwrap_or_default();
@@ -689,5 +730,31 @@ mod csv_tests {
     fn csv_short_row_pads_missing_columns() {
         let back = from_csv("a,b,c\n1,2\n").expect("parse");
         assert_eq!(back.rows[0]["c"].as_str(), Some(""));
+    }
+
+    #[test]
+    fn csv_leading_bom_is_stripped() {
+        // Every Excel "CSV UTF-8" export starts with a BOM; without stripping,
+        // the first column name carries '\u{feff}' and the impex import fails
+        // column mapping with a confusing "unmapped source columns" error.
+        let back = from_csv("\u{feff}id,name\n1,Acme\n").expect("parse");
+        assert_eq!(back.columns, vec!["id", "name"]);
+        assert_eq!(back.rows[0]["id"].as_str(), Some("1"));
+    }
+
+    #[test]
+    fn csv_duplicate_columns_are_rejected() {
+        // A duplicate header is ambiguous: the row map would silently keep the
+        // *last* column's value for the shared name (quiet data loss).
+        let err = from_csv("id,name,id\n1,Acme,2\n").expect_err("duplicate column");
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn csv_overlong_row_is_rejected() {
+        // More cells than the header means malformed CSV; pre-fix the extra
+        // cells were silently dropped.
+        let err = from_csv("a,b\n1,2,3\n").expect_err("overlong row");
+        assert!(err.to_string().contains("row 1"), "{err}");
     }
 }

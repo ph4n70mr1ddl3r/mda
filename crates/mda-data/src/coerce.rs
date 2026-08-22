@@ -49,15 +49,25 @@ fn as_i64(v: &Value) -> Result<i64> {
 }
 
 fn as_f64(v: &Value) -> Result<f64> {
-    match v {
+    let n = match v {
         Value::Number(n) => n
             .as_f64()
-            .ok_or_else(|| Error::Invalid("not a number".into())),
+            .ok_or_else(|| Error::Invalid("not a number".into()))?,
         Value::String(s) => s
             .parse::<f64>()
-            .map_err(|_| Error::Invalid(format!("not a number: {s}"))),
-        _ => Err(Error::Invalid("expected a number".into())),
+            .map_err(|_| Error::Invalid(format!("not a number: {s}")))?,
+        _ => return Err(Error::Invalid("expected a number".into())),
+    };
+    // Reject non-finite values: JSON numbers can never be NaN/inf, but the
+    // *string* forms parse ("NaN", "inf", "-infinity", "1e999" …) — and a
+    // non-finite f64 converts to `Value::Null` (serde_json cannot represent
+    // it), so the field would be silently stored as NULL instead of being
+    // rejected… and a required field would sail past the required-check,
+    // which only fires on the None branch.
+    if !n.is_finite() {
+        return Err(Error::Invalid(format!("not a finite number: {v}")));
     }
+    Ok(n)
 }
 
 fn as_bool(v: &Value) -> Result<bool> {
@@ -101,4 +111,44 @@ fn as_datetime(v: &Value) -> Result<Value> {
         })
         .map_err(|e| Error::Invalid(format!("invalid datetime '{s}': {e}")))?;
     Ok(Value::String(s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_finite_decimal_strings_are_rejected_not_null() {
+        // "NaN"/"inf"/… parse as f64, but serde_json turns a non-finite f64
+        // into Value::Null — pre-fix these were silently stored as NULL (and a
+        // *required* decimal sailed past the required-check, which only fires
+        // on the None branch).
+        for bad in [
+            "NaN",
+            "nan",
+            "inf",
+            "-inf",
+            "Infinity",
+            "-infinity",
+            "1e999",
+        ] {
+            let err = coerce("decimal", Some(Value::String(bad.into())))
+                .expect_err("non-finite decimal must be rejected");
+            assert!(
+                err.to_string().contains("finite"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+        // …while finite values (number or numeric string) still coerce.
+        assert_eq!(
+            coerce("decimal", Some(Value::from(3.5))).unwrap(),
+            Some(Value::from(3.5))
+        );
+        assert_eq!(
+            coerce("decimal", Some(Value::String("3.5".into()))).unwrap(),
+            Some(Value::from(3.5))
+        );
+        // money shares the as_f64 path.
+        assert!(coerce("money", Some(Value::String("NaN".into()))).is_err());
+    }
 }

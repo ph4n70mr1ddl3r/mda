@@ -187,11 +187,17 @@ fn j_bool(v: &Value, key: &str, default: bool) -> bool {
     v.get(key).and_then(|x| x.as_bool()).unwrap_or(default)
 }
 
-fn j_int(v: &Value, key: &str, default: i32) -> i32 {
+fn j_int(v: &Value, key: &str, default: i32) -> Result<i32> {
+    // Checked, not `as i32` — an out-of-range value in a (tampered) bundle
+    // would wrap and silently reorder rule firing priority.
     v.get(key)
         .and_then(|x| x.as_i64())
-        .map(|n| n as i32)
-        .unwrap_or(default)
+        .map(|n| {
+            i32::try_from(n)
+                .map_err(|_| Error::Invalid(format!("import: field `{key}` out of range: {n}")))
+        })
+        .transpose()
+        .map(|n| n.unwrap_or(default))
 }
 
 fn j_opt_uuid(v: &Value, key: &str) -> Option<Uuid> {
@@ -811,7 +817,7 @@ async fn restore_rules(
         let action_field: Option<String> = j_opt_str(r, "action_field");
         let action_value = j_value(r, "action_value");
         let active = j_bool(r, "active", true);
-        let priority = j_int(r, "priority", 100);
+        let priority = j_int(r, "priority", 100)?;
         sqlx::query(
             "INSERT INTO meta.md_rule
                 (id, tenant_id, entity, event, condition, action_type, action_field,

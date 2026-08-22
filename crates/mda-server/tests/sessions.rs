@@ -8,6 +8,7 @@ use mda_meta::MetadataCache;
 use mda_security::jwt::JwtConfig;
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -19,6 +20,8 @@ struct Ctx {
     app: axum::Router,
     tenant: Uuid,
     email: String,
+    #[allow(dead_code)] // kept for tests that need direct (owner) DB access
+    pool: PgPool,
 }
 
 fn app_role_url(url: &str) -> String {
@@ -70,7 +73,12 @@ async fn setup() -> Option<Ctx> {
         login_throttle: mda_security::LoginThrottle::default(),
         gql: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
     });
-    Some(Ctx { app, tenant, email })
+    Some(Ctx {
+        app,
+        tenant,
+        email,
+        pool,
+    })
 }
 
 /// POST a JSON body; return (status, parsed JSON body).
@@ -212,4 +220,57 @@ async fn token_types_cannot_be_swapped() {
     // And an access token must NOT be usable as a refresh token.
     let (st, _) = refresh(&ctx.app, &access).await;
     assert!(!st.is_success(), "access token must not refresh");
+}
+
+/// Login by tenant **slug** must work through the non-superuser app role:
+/// `sec_tenant` is deliberately RLS-free (the public slug registry login
+/// resolves pre-auth), but nothing else pinned that the app role can actually
+/// read it — a future migration gating the table (or dropping its grant)
+/// would break every slug login while UUID-login and token-minting tests
+/// stayed green (the pass-1 works-as-owner class).
+#[tokio::test]
+async fn login_by_slug_works_as_the_app_role() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    // Give this test's tenant a slug (owner pool; sec_tenant carries no RLS,
+    // so no tenant GUC is needed — exactly why login can resolve it pre-auth).
+    let slug = format!("t_{}", Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO sec.sec_tenant (id, slug, name) VALUES ($1,$2,$3)")
+        .bind(ctx.tenant)
+        .bind(&slug)
+        .bind("Slug Tenant")
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+    // slug login (the app router serves through the mda_app pool)
+    let (st, body) = post(
+        &ctx.app,
+        "/api/auth/login",
+        serde_json::json!({"tenant": slug, "email": ctx.email, "password": PWD}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "slug login: {body}");
+    assert!(body["access_token"].is_string(), "{body}");
+    // the JWT carries the slug's tenant and authenticates
+    assert_eq!(me(&ctx.app, &access_of(&body)).await, StatusCode::OK);
+
+    // unknown slug fails closed with the same "invalid credentials" shape a
+    // bad password produces (no tenant enumeration by status or message).
+    let (st, body) = post(
+        &ctx.app,
+        "/api/auth/login",
+        serde_json::json!({"tenant": "no-such-slug", "email": ctx.email, "password": PWD}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // contains, not ==: the API prefixes Display with "invalid input: "
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid credentials"),
+        "{body}"
+    );
 }

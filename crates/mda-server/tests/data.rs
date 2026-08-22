@@ -3392,3 +3392,149 @@ async fn schema_endpoint_reflects_model_and_fls() {
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 }
+
+/// Non-finite decimal strings ("NaN", "inf", …) must be a 422, never a silent
+/// NULL: pre-fix, serde_json turned the non-finite f64 into `Value::Null`, so
+/// the field stored NULL — and a *required* decimal sailed past the
+/// required-check (which only fires on the absent-field branch).
+#[tokio::test]
+async fn non_finite_decimal_is_rejected_not_silently_nulled() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    let table = format!("pay_{}", Uuid::new_v4().simple());
+    let model = json!({
+        "modules": [],
+        "entities": [{
+            "id": Uuid::new_v4(),
+            "module_id": null,
+            "name": "Payment",
+            "table_name": table,
+            "label": "Payment",
+            "description": null,
+            "fields": [
+                {"id": Uuid::new_v4(), "name":"label","label":"Label","field_type":"string","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}},
+                {"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}}
+            ],
+            "relationships": []
+        }]
+    });
+    publish(&ctx, model).await;
+
+    // Optional-shaped reject: a *required* decimal given "NaN" must 422 —
+    // pre-fix it returned 201 with amount silently NULL.
+    for bad in ["NaN", "inf", "-infinity", "1e999"] {
+        let (st, body) = call(
+            &ctx.app,
+            "POST",
+            "/api/data/Payment",
+            &ctx.token,
+            Some(json!({"label": "x", "amount": bad}).to_string()),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{bad}: {body}");
+        // the per-field detail carries the "not a finite number" reason
+        let detail = body["details"][0]["message"].as_str().unwrap_or("");
+        assert!(detail.contains("finite"), "{bad}: {body}");
+    }
+
+    // Sanity: a finite decimal still writes, and absence of a required one
+    // still fails required (the two paths the fix must not disturb).
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Payment",
+        &ctx.token,
+        Some(json!({"label": "x", "amount": "12.34"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, _) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Payment",
+        &ctx.token,
+        Some(json!({"label": "x"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Nothing was stored behind the 422s (only the finite write landed). The
+    // table name is test-generated (uuid-simple) — safe to interpolate.
+    let n: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM biz.{table} WHERE attributes->>'label' = 'x'"
+    ))
+    .fetch_one(&ctx.pool)
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "only the finite write landed");
+}
+
+/// Excel's "CSV UTF-8" export prepends a BOM to the header — the import must
+/// strip it (pre-fix the first column failed mapping as "\u{feff}name") — and
+/// malformed CSV (duplicate header, over-long row) must 422, not silently
+/// shadow/truncate data.
+#[tokio::test]
+async fn import_csv_strips_bom_and_rejects_malformed() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // BOM'd CSV imports cleanly
+    let csv = "\u{feff}name,email,city\nAda,ada@x.com,Cambridge\n".to_string();
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import",
+        &ctx.token,
+        "text/csv",
+        csv,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "bom import: {res}");
+    assert_eq!(res["imported"], 1, "bom import: {res}");
+
+    // duplicate header column → 422 (never last-one-wins)
+    let dup = "name,email,name\nZoe,zoe@x.com,Zed\n".to_string();
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import",
+        &ctx.token,
+        "text/csv",
+        dup,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "dup header: {res}");
+    assert!(
+        res["message"].as_str().unwrap_or("").contains("duplicate"),
+        "{res}"
+    );
+
+    // row with more cells than the header → 422 (never silently truncated)
+    let long = "name,email,city\nA,a@x.com,C,extra\n".to_string();
+    let (st, res) = call_with_type(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import",
+        &ctx.token,
+        "text/csv",
+        long,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "overlong row: {res}");
+    assert!(
+        res["message"].as_str().unwrap_or("").contains("row 1"),
+        "{res}"
+    );
+}

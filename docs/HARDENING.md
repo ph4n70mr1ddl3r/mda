@@ -417,6 +417,87 @@ was delivered twice).
 Also removed in this pass: `mda_data::crud::next_sequence`, a dead duplicate
 of the inline `md_sequence` upsert the create path actually uses.
 
+## Eighth pass (2026-08-22): review — input fidelity (coercion, CSV, NUMERIC bounds)
+
+An eighth sweep re-audited the recurring classes from earlier passes (RLS-as-
+`mda_app`, cyclic walks, outbox retries) — all clean, including verifying live
+RLS flags on a migrated database — and then turned to *input fidelity*: places
+where untrusted input becomes data without an error it should have raised.
+
+### Non-finite decimal strings silently stored NULL (high)
+
+`coerce()`'s `as_f64` accepted the string forms `"NaN"`, `"inf"`,
+`"-infinity"`, `"1e999"` (they all `parse::<f64>()`), and `Value::from(f64)`
+turns a non-finite float into `Value::Null` — serde_json cannot represent it.
+So a decimal/money field set to `"NaN"` was **silently stored as NULL**, and a
+*required* decimal sailed past the required-check (which only fires on the
+absent-field branch, not the null-valued branch). `as_f64` now rejects
+non-finite values (`mda.invalid` / 422 "not a finite number"). Regression:
+`non_finite_decimal_strings_are_rejected_not_null` (unit, pins every string
+form + the finite paths) and
+`non_finite_decimal_is_rejected_not_silently_nulled` (API: 422 on each form,
+required/absent semantics undisturbed, nothing stored behind the 422s).
+
+### CSV ingest: BOM, duplicate columns, over-long rows (medium)
+
+`from_csv` (the §5.13 import parser) had three quiet-loss edges: a leading
+UTF-8 BOM — what every Excel "CSV UTF-8" export starts with — glued itself to
+the first column name, failing import mapping with a confusing "unmapped
+source columns" error; a duplicate header column was collapsed by the row map
+with **last-one-wins** (quiet data loss — the first column's values vanished);
+and a row with more cells than the header had its extras silently dropped.
+Now: the BOM is stripped, duplicate columns are a 422 naming the column, and
+over-long rows are a 422 naming the row. Short rows still pad (existing,
+tested behavior — trailing empty cells are normal CSV). Regression:
+`csv_leading_bom_is_stripped`, `csv_duplicate_columns_are_rejected`,
+`csv_overlong_row_is_rejected` (unit) and
+`import_csv_strips_bom_and_rejects_malformed` (API).
+
+### NUMERIC precision/scale unbounded at the modeling gate (low)
+
+`sql_type()` cast the modeler's `precision`/`scale` with `as u32` — a
+precision of exactly 2^32 wrapped to 0 (emitting `NUMERIC(0,s)`), and any
+out-of-Postgres-range pair (precision > 1000, scale > precision) reached
+Postgres as a confusing publish-time DDL error naming numbers the modeler
+never wrote. The draft gate (`diff()`) now rejects `decimal` fields whose
+precision/scale fall outside `1 ≤ precision ≤ 1000, scale ≤ precision` with a
+message quoting the modeler's actual values, and `sql_type()` bounds-checks
+as defense in depth instead of wrapping. Regression:
+`rejects_out_of_range_decimal_precision_and_scale` (draft gate, includes the
+2^32 wrap case) and `sql_type_bounds_decimal_precision_without_wrapping`
+(DDL backstop).
+
+### Tenant import wrapped out-of-range rule priority (low)
+
+The §14 tenant-config import read rule `priority` with `n as i32`: a tampered
+bundle carrying 2^31 imported as −2147483648, silently reordering rule firing
+(U6: priority-then-id ordering). `j_int` is now checked — an out-of-range
+integer rejects the whole (atomic) bundle with 422 `mda.invalid`. Regression:
+`tenant_import_rejects_out_of_range_rule_priority` (also pins that nothing
+lands on the target tenant).
+
+### Report runs shadowed duplicate select aliases (low)
+
+Nothing rejected a dataset selecting the same alias twice: `jsonb_build_object`
+keeps the *last* pair for a repeated key, so the first field's values silently
+vanished from every row — and `to_csv` would emit a duplicate header that the
+new `from_csv` gate rejects, breaking an export→import round-trip. `run()` now
+422s with a message naming the alias. Regression:
+`duplicate_select_aliases_are_rejected_not_shadowed` (API).
+
+### Coverage gap closed: login-by-slug was never pinned as `mda_app` (test-only)
+
+Every login test posted the tenant as a **UUID** (most suites mint JWTs
+directly). The slug path resolves through `sec_tenant` — deliberately
+RLS-free so login can resolve it pre-auth — which means nothing would notice
+a future migration gating that table or dropping its grant: slug logins die
+in production while UUID-login and token-minting tests stay green (the exact
+pass-1 works-as-owner shape). No code change — the behavior is correct
+today; `login_by_slug_works_as_the_app_role` (sessions suite, which serves
+the app through the `mda_app` pool) now pins slug login end-to-end plus the
+unknown-slug fail-closed 422 (same `invalid credentials` shape a bad password
+produces — no tenant enumeration by status or message).
+
 ## Verifying a deployment yourself
 
 ```bash

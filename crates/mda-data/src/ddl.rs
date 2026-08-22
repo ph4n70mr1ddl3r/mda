@@ -14,11 +14,19 @@ pub fn sql_type(field_type: &str, config: &Value) -> Result<String> {
         "string" | "text" | "enum" | "attachment" => "TEXT".to_string(),
         "integer" | "auto_number" => "BIGINT".to_string(),
         "decimal" => {
+            // Bounded, not `as u32` — a precision of exactly 2^32 would wrap
+            // to 0 (NUMERIC(0,s)) instead of erroring. The draft gate rejects
+            // out-of-range values; this is the defense-in-depth backstop.
             let p = config
                 .get("precision")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(20) as u32;
-            let s = config.get("scale").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                .unwrap_or(20);
+            let s = config.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
+            if !(1..=1000).contains(&p) || s > p || s > 1000 {
+                return Err(Error::Invalid(format!(
+                    "decimal precision/scale out of range (precision {p}, scale {s}): 1 ≤ precision ≤ 1000, scale ≤ precision"
+                )));
+            }
             format!("NUMERIC({p},{s})")
         }
         "money" => "NUMERIC(20,4)".to_string(),
@@ -265,5 +273,27 @@ mod tests {
         assert!(create.contains("attributes JSONB NOT NULL"));
         assert!(create.contains("email TEXT GENERATED ALWAYS AS"));
         assert!(create.contains("UNIQUE"));
+    }
+
+    #[test]
+    fn sql_type_bounds_decimal_precision_without_wrapping() {
+        // 2^32 wraps through `as u32` to 0 — the backstop must reject it (and
+        // every other out-of-Postgres-range pair) instead of emitting
+        // NUMERIC(0,s).
+        for (p, s) in [(0u64, 0u64), (1001, 0), (4294967296, 0), (10, 11)] {
+            assert!(
+                sql_type("decimal", &serde_json::json!({"precision": p, "scale": s})).is_err(),
+                "precision {p} scale {s} must be rejected"
+            );
+        }
+        assert_eq!(
+            sql_type("decimal", &serde_json::json!({"precision": 20, "scale": 4})).unwrap(),
+            "NUMERIC(20,4)"
+        );
+        // defaults when config omits them
+        assert_eq!(
+            sql_type("decimal", &serde_json::json!({})).unwrap(),
+            "NUMERIC(20,0)"
+        );
     }
 }

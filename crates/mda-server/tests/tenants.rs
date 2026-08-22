@@ -610,3 +610,64 @@ async fn tenant_import_rejects_a_cyclic_role_hierarchy() {
         "message names the cycle: {resp}"
     );
 }
+
+/// A rule `priority` outside i32 in a (tampered) bundle must be rejected, not
+/// silently wrapped: pre-fix, `n as i32` turned 2^31 into -2147483648 and the
+/// imported rule would quietly reorder rule firing.
+#[tokio::test]
+async fn tenant_import_rejects_out_of_range_rule_priority() {
+    let Some(a) = setup().await else {
+        return;
+    };
+    // one rule on A so the export carries a rules section
+    let mut tx = a.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, a.tenant).await.unwrap();
+    sqlx::query(
+        "INSERT INTO meta.md_rule
+            (id, tenant_id, entity, event, condition, action_type, action_field,
+             action_value, active, priority)
+         VALUES ($1,$2,'Customer','create','{}','set_field','tier','\"Gold\"',TRUE,100)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(a.tenant)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let (_, mut bundle) = call(&a.app, "GET", "/api/tenants/export", &a.token, None).await;
+    {
+        let rules = bundle["rules"].as_array_mut().unwrap();
+        assert_eq!(rules.len(), 1);
+        rules[0]["priority"] = json!(2147483648i64); // 2^31: wraps negative pre-fix
+    }
+
+    let Some(b) = setup().await else {
+        return;
+    };
+    let (st, resp) = call(
+        &b.app,
+        "POST",
+        "/api/tenants/import",
+        &b.token,
+        Some(bundle.to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{resp}");
+    assert!(
+        resp["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("out of range"),
+        "message names the range problem: {resp}"
+    );
+    // atomic import: nothing landed on B
+    let mut tx = b.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, b.tenant).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM meta.md_rule")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(n, 0, "rejected bundle must not leave rules behind");
+}

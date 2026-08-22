@@ -378,6 +378,60 @@ async fn identity(ctx: &Ctx) -> mda_security::Identity {
         .expect("load identity")
 }
 
+/// A dataset selecting the same alias twice must 422, not silently shadow:
+/// jsonb_build_object keeps the *last* pair for a repeated key, so the first
+/// field's values would vanish from every row (and the CSV export would carry
+/// a duplicate header that the impex import parser rejects).
+#[tokio::test]
+async fn duplicate_select_aliases_are_rejected_not_shadowed() {
+    let Some(ctx) = setup().await else { return };
+    publish(
+        &ctx,
+        order_model(
+            &format!("order_{}", Uuid::new_v4().simple()),
+            &format!("customer_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/reports",
+        &ctx.admin_token,
+        Some(
+            json!({
+                "name": "dup-alias",
+                "dataset": {
+                    "base_entity":"Order",
+                    "fields":[{"field":"ref","alias":"a"},{"field":"total","alias":"a"}]
+                }
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    let id = v["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    let (st, run) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/reports/{id}/run"),
+        &ctx.admin_token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{run}");
+    assert!(
+        run["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("duplicate select alias"),
+        "{run}"
+    );
+}
+
 #[tokio::test]
 async fn export_renders_csv_html_xlsx_and_pdf() {
     let Some(ctx) = setup().await else { return };
