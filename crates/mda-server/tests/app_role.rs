@@ -15,7 +15,11 @@ mod common;
 /// app-written tables; the whitelist is only read paths like biz_archive).
 #[tokio::test]
 async fn app_role_can_read_every_app_schema_table() {
-    let url = std::env::var("DATABASE_URL").unwrap();
+    // Skips (like the rest of the DB-backed suites) when DATABASE_URL is unset;
+    // `make test-db` / CI always set it.
+    let Some(url) = std::env::var("DATABASE_URL").ok() else {
+        return;
+    };
     let (pool, _db) = common::spawn_db(&url).await;
     let mut conn = pool.acquire().await.unwrap();
     let has_role: bool =
@@ -72,7 +76,9 @@ async fn app_role_can_read_every_app_schema_table() {
 /// schema <s>" — the int-schema bug).
 #[tokio::test]
 async fn app_role_has_usage_on_app_schemas() {
-    let url = std::env::var("DATABASE_URL").unwrap();
+    let Some(url) = std::env::var("DATABASE_URL").ok() else {
+        return;
+    };
     let (pool, _db) = common::spawn_db(&url).await;
     let mut conn = pool.acquire().await.unwrap();
     let has_role: bool =
@@ -111,7 +117,9 @@ async fn app_role_has_usage_on_app_schemas() {
 /// race-tolerantly; this test would fail without it.
 #[tokio::test]
 async fn concurrent_migrations_do_not_race_on_the_app_role() {
-    let admin_url = std::env::var("DATABASE_URL").unwrap();
+    let Some(admin_url) = std::env::var("DATABASE_URL").ok() else {
+        return;
+    };
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(10)
         .connect(&admin_url)

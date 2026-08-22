@@ -527,7 +527,10 @@ async fn integration_schedule_pulls_flow_from_connector() {
 /// with "relation does not exist" when the app served as `mda_app`.
 #[tokio::test]
 async fn scheduler_tables_are_visible_to_the_app_role() {
-    let url = std::env::var("DATABASE_URL").unwrap();
+    // Skips (like the rest of the DB-backed suites) when DATABASE_URL is unset.
+    let Some(url) = std::env::var("DATABASE_URL").ok() else {
+        return;
+    };
     let (pool, _db) = common::spawn_db(&url).await;
     let mut conn = pool.acquire().await.unwrap();
     let has_role: bool =

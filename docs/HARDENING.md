@@ -498,6 +498,31 @@ the app through the `mda_app` pool) now pins slug login end-to-end plus the
 unknown-slug fail-closed 422 (same `invalid credentials` shape a bad password
 produces — no tenant enumeration by status or message).
 
+## Ninth pass (2026-08-22): review — test-harness consistency (skip vs panic)
+
+A bare `cargo test --workspace` with no `DATABASE_URL` in the environment
+failed — not because anything was broken, but because the DB-backed suites
+disagree on what to do when the database is not configured:
+
+- **16 of 19 suites skip gracefully** (`std::env::var("DATABASE_URL").ok()?`
+  in a shared `setup()` that returns `Option`), on the theory that CI and
+  `make test-db` always set it and a local unit-test run should stay green.
+- **`security.rs` panics by design**, with a documented rationale: *"a vacuous
+  security suite is worse than a failed one"* — silently passing the RLS/FLS
+  suite on a misconfigured run would hide exactly the class of bug this repo
+  keeps finding.
+- **Three tests were accidental panics** — neither convention, just
+  `unwrap()`s that predated the `Option`-setup pattern:
+  `app_role.rs` (all three tests, including the six-database migration-race
+  test) and `scheduler.rs::scheduler_tables_are_visible_to_the_app_role`.
+
+The accidental ones now follow the majority skip idiom (with a comment
+pointing at `make test-db`), so `cargo test --workspace` is green without a
+database while CI still exercises them for real. The security suite keeps its
+deliberate panic, and its `oversized_body_rejected` test builds a custom
+`EdgeConfig` (64-byte body limit) so it cannot reuse `setup()` — left as-is.
+No production code changed.
+
 ## Verifying a deployment yourself
 
 ```bash
