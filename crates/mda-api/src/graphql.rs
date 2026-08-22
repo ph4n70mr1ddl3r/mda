@@ -344,7 +344,14 @@ async fn build_schema(st: &AppState, tenant: Uuid) -> Result<Schema, Error> {
                         let Some(id) = id else {
                             return Ok(None);
                         };
-                        let def = defs_map.get(&target).unwrap();
+                        // Defense in depth: the publish gate rejects
+                        // relationships whose target is not in the draft model
+                        // (draft.rs diff pass 3), so the target is always
+                        // registered — but a resolver must never panic on
+                        // model state; resolve null instead.
+                        let Some(def) = defs_map.get(&target) else {
+                            return Ok(None);
+                        };
                         Ok(load_one(&pool, &user, def, id)
                             .await
                             .map_err(gql_err)?

@@ -266,6 +266,25 @@ Per §5.1/§5.7 a reference is modeled as a *relationship* (hoisted FK column);
 the publish gate now rejects a `reference`-typed field with a message pointing
 at relationships (`mda-meta/src/draft.rs`).
 
+## Fifth pass (2026-08-22): publish-gate + GraphQL hardening
+
+### Retiring an entity that a surviving relationship targets was publishable (medium)
+
+`diff()` validated relationship targets against **active ∪ draft** entity ids,
+so a draft that removed entity `B` while another entity's `→ B` relationship
+survived passed validation — `B`'s id is still in the active half of the union.
+Post-publish `B.status = 'retired'`, and every consumer that resolves the
+target by name breaks: the GraphQL schema registers object types from *active*
+entities only, so the next `build_schema()` fails (`Type ... not found`) and
+**every GraphQL request for the tenant 500s** until the model is repaired. The
+publish gate now (pass 3 in `diff()`, `mda-meta/src/draft.rs`) requires every
+surviving relationship to target an entity also present in the draft, with a
+message telling the modeler to remove the relationship first. Regression test:
+`rejects_relationship_targeting_retired_entity`. Defense in depth: the GraphQL
+reference resolver no longer `unwrap()`s the target lookup — it resolves null
+(`crates/mda-api/src/graphql.rs`) instead of panicking on out-of-gate model
+state.
+
 ## Verifying a deployment yourself
 
 ```bash

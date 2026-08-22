@@ -398,6 +398,25 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
         }
     }
 
+    // 3) Every *surviving* relationship must target an entity that also
+    //    survives the publish (is present in the draft). The additions check
+    //    above validates targets against active ∪ draft ids, which lets a
+    //    relationship aimed at an entity being retired in this very publish
+    //    slip through — post-publish the target is no longer active, and every
+    //    consumer that resolves the target by name (the GraphQL schema
+    //    registers object types from active entities only) breaks tenant-wide.
+    let draft_entity_ids: HashSet<Uuid> = draft.entities.iter().map(|e| e.id).collect();
+    for e in &draft.entities {
+        for r in &e.relationships {
+            if !draft_entity_ids.contains(&r.target_entity_id) {
+                report.errors.push(format!(
+                    "relationship {} on {} targets entity {}, which is not in the draft model (retired or unknown) — remove the relationship before retiring its target",
+                    r.source_field_name, e.name, r.target_entity_id
+                ));
+            }
+        }
+    }
+
     if !report.violations.is_empty() || !report.errors.is_empty() {
         report.valid = false;
     }
@@ -733,6 +752,40 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("targets unknown entity")));
+    }
+
+    #[test]
+    fn rejects_relationship_targeting_retired_entity() {
+        // Entity 1 (Invoice) survives with a relationship to entity 2
+        // (Customer), but the draft *retires* Customer (drops it). The
+        // additions gate passes (Customer's id is still in the active model),
+        // but the publish must fail: a relationship whose target leaves the
+        // active model breaks every target-by-name consumer post-publish
+        // (GraphQL registers object types from active entities only).
+        let mut active = DraftModel::empty();
+        let mut invoice = ent(1, "Invoice");
+        invoice.relationships.push(DraftRelationship {
+            id: Uuid::from_u128(7),
+            source_field_name: "ref_customer_id".into(),
+            target_entity_id: Uuid::from_u128(2),
+            cardinality: "many_to_one".into(),
+            strength: "lookup".into(),
+            on_delete: None,
+            required: false,
+            reference_qualifier: None,
+            rollup_summary: None,
+        });
+        active.entities.push(invoice.clone());
+        active.entities.push(ent(2, "Customer"));
+        let mut draft = DraftModel::empty();
+        draft.entities.push(invoice); // Customer retired
+        let r = diff(&active, &draft);
+        assert!(!r.valid, "retiring a referenced entity must be rejected");
+        assert!(r
+            .errors
+            .iter()
+            .any(|e| e.contains("not in the draft model (retired or unknown)")));
+        assert_eq!(r.retirements.entities, 1);
     }
 
     #[test]

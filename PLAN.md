@@ -381,7 +381,11 @@ Consequences:
 | **Destructive (two-phase)** | drop field, drop entity, drop relationship | Phase 1 **retire** (mark inactive, hide, keep data); Phase 2 **purge** after grace (default 14 days) with explicit confirmation |
 
 **Validation checks at publish:**
-- No dangling references (relationship target entity/field exists)
+- No dangling references (relationship target entity/field exists — and, as
+  built, a target that is being **retired in the same publish** is rejected:
+  every surviving relationship must target an entity also present in the draft,
+  else target-by-name consumers such as the GraphQL schema break post-publish;
+  see `docs/HARDENING.md` fifth pass)
 - No orphaned dependencies (forms/views/rules/reports referencing deleted fields/entities)
 - Type-compatibility for transforms (e.g. every value must parse as the target type)
 - FK cycle detection → mark `DEFERRABLE` (§5.7)
