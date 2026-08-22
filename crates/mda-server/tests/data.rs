@@ -3538,3 +3538,557 @@ async fn import_csv_strips_bom_and_rejects_malformed() {
         "{res}"
     );
 }
+
+// ===== FLS on reference columns (§5.11 grain 4) =====
+//
+// Anti-regression: reference (FK) columns are relationships, not md_field
+// rows — but the FLS grant surface (`sec_field_permission`, /api/admin
+// roles/:id/field-permissions) accepts them by name. Every read/write/export
+// surface must therefore enforce `none`/`read` on them exactly like scalar
+// fields. Regression: project()/assert_writable()/export iterated def.fields
+// only, so a `none` grant on e.g. `customer_id` was silently ignored (the FK
+// id was returned on reads, writable via PATCH, and exported in the CSV).
+
+fn fls_ref_model(table_c: &str, table_i: &str) -> Value {
+    let cust = Uuid::new_v4();
+    json!({
+        "modules": [],
+        "entities": [
+            {
+                "id": cust, "module_id": null, "name": "Customer",
+                "table_name": table_c, "label": "Customer", "description": null,
+                "fields": [
+                    {"id": Uuid::new_v4(), "name":"name","label":"Name","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}
+                ],
+                "relationships": []
+            },
+            {
+                "id": Uuid::new_v4(), "module_id": null, "name": "Invoice",
+                "table_name": table_i, "label": "Invoice", "description": null,
+                "fields": [
+                    {"id": Uuid::new_v4(), "name":"amount","label":"Amount","field_type":"decimal","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{"precision":12,"scale":2}}
+                ],
+                "relationships": [
+                    {"id": Uuid::new_v4(), "source_entity_id": Uuid::new_v4(), "source_field_name":"customer_id","target_entity_id": cust,"cardinality":"many_to_one","strength":"lookup","on_delete":"set_null","required":false,"reference_qualifier":null,"rollup_summary":null}
+                ]
+            }
+        ]
+    })
+}
+
+#[tokio::test]
+async fn field_level_security_covers_reference_columns() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        fls_ref_model(
+            &format!("c_{}", Uuid::new_v4().simple()),
+            &format!("i_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+
+    // Public-read OWDs so record security does not mask the FLS assertions.
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    for e in ["Customer", "Invoice"] {
+        sqlx::query(
+            "INSERT INTO sec.sec_owd (tenant_id, entity, default_access)
+             VALUES ($1, $2, 'public_read')
+             ON CONFLICT (tenant_id, entity) DO UPDATE SET default_access = 'public_read'",
+        )
+        .bind(ctx.tenant)
+        .bind(e)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // Superuser creates a Customer + an Invoice referencing it.
+    let (_, c) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme"}).to_string()),
+        None,
+    )
+    .await;
+    let cust_id = c["id"].as_str().unwrap().to_string();
+    let (_, i) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Invoice",
+        &ctx.token,
+        Some(json!({"amount":"10.00","customer_id": cust_id}).to_string()),
+        None,
+    )
+    .await;
+    let inv_id = i["id"].as_str().unwrap().to_string();
+    let inv_ver = i["version"].as_i64().unwrap();
+
+    // Limited user: read+update on Invoice, read on Customer — but FLS `none`
+    // on the reference column `Invoice.customer_id`.
+    let role_id = common::seed_role(
+        &ctx.pool,
+        ctx.tenant,
+        &format!("flsref{}", Uuid::new_v4().simple()),
+        &[
+            ("Invoice", "read"),
+            ("Invoice", "update"),
+            ("Customer", "read"),
+        ],
+    )
+    .await;
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(&ctx.pool, ctx.tenant, &email, "limited", &hash).await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, uid, role_id).await;
+    common::seed_field_permission(
+        &ctx.pool,
+        ctx.tenant,
+        role_id,
+        "Invoice",
+        "customer_id",
+        "none",
+    )
+    .await;
+    let tok = ctx.jwt.issue_access(uid, ctx.tenant, None).unwrap();
+
+    // (1) single read: the FK column is dropped from the response.
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Invoice/{inv_id}"),
+        &tok,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v.get("customer_id").is_none(),
+        "FLS `none` on a reference column must hide the FK id: {v}"
+    );
+    assert_eq!(v["amount"].as_f64().unwrap(), 10.0);
+
+    // (2) list: same projection per row.
+    let (st, v) = call(&ctx.app, "GET", "/api/data/Invoice", &tok, None, None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let items = v["items"].as_array().unwrap();
+    assert!(!items.is_empty());
+    for it in items {
+        assert!(
+            it.get("customer_id").is_none(),
+            "list must project the FK column away: {it}"
+        );
+    }
+
+    // (3) write: a PATCH touching the reference column is rejected (403),
+    // even though the caller may `update` the entity itself.
+    let (st, v) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Invoice/{inv_id}"),
+        &tok,
+        Some(json!({"customer_id": cust_id}).to_string()),
+        Some(inv_ver),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "write to FLS-`none` ref column: {v}"
+    );
+
+    // (4) CSV export: the column must not appear in the header either.
+    let (st, csv) = call_text(&ctx.app, "GET", "/api/impex/Invoice/export", &tok).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        !csv.split('\n').next().unwrap_or("").contains("customer_id"),
+        "export header must omit the FLS-`none` reference column: {csv}"
+    );
+
+    // (5) control: the superuser still sees and may set the column.
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Invoice/{inv_id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["customer_id"].as_str().unwrap(), cust_id);
+}
+
+// ===== typed filters, null-clears, precision guards (anti-regression) =====
+//
+// Regression cluster found 2026-08-23: (a) ordered filters on numeric fields
+// and every filter on typed system columns / FK columns compiled to invalid
+// SQL (`text > numeric`, `uuid = text`, …) → 500; (b) eq on numerics
+// compared the jsonb TEXT rendering ('10' ≠ '10.0'); (c) explicit JSON null
+// silently no-opped instead of clearing; (d) >15-significant-digit decimals
+// silently lost precision through f64; (e) datetimes were stored verbatim
+// (mixed offsets break comparisons); (f) auto_number fields were
+// client-writable; (g) unique/FK violations surfaced as 500s.
+
+#[tokio::test]
+async fn typed_filters_and_sort_are_valid_sql() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(&ctx, customer_model()).await;
+    let mut ids: Vec<String> = ["a@x.com", "b@x.com", "c@x.com"]
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+    for (i, email) in ["a@x.com", "b@x.com", "c@x.com"].iter().enumerate() {
+        let (_, r) = call(
+            &ctx.app,
+            "POST",
+            "/api/data/Customer",
+            &ctx.token,
+            Some(
+                json!({"name": format!("c{i}"), "email": email, "balance": (i as i64) * 100, "tier": "Gold"})
+                    .to_string(),
+            ),
+            None,
+        )
+        .await;
+        ids[i] = r["id"].as_str().unwrap().to_string();
+    }
+    // public read so list works (superuser bypasses anyway)
+
+    // ordered filter on a numeric field: previously `text > numeric` → 500.
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=balance:gt:50",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 2, "{v}");
+
+    // eq on a numeric field matches across renderings ('100' vs stored 100.0).
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=balance:eq:100",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["total"], 1,
+        "numeric eq must not compare text renderings: {v}"
+    );
+
+    // typed system-column filters (all previously 500s).
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer?filter=owner_id:eq:{}", ctx.user_id),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "owner_id filter: {v}");
+    assert_eq!(v["total"], 3, "{v}");
+
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=version:eq:1",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "version filter: {v}");
+    assert_eq!(v["total"], 3, "{v}");
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=state:eq:active",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "state filter: {v}");
+    assert_eq!(v["total"], 3, "{v}");
+
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=created_at:gte:2020-01-01T00:00:00Z",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "created_at filter: {v}");
+    assert_eq!(v["total"], 3, "{v}");
+
+    // malformed typed filter values are 400s, not DB-error 500s.
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=owner_id:eq:not-a-uuid",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=balance:gt:not-a-number",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=balance:like:%x%",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "like on a numeric field is a 422"
+    );
+
+    // ordered comparison on a text field stays rejected.
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=name:gt:A",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // numeric sort works; unknown sort field is a 400 (filters already reject).
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?sort=-balance",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["items"][0]["name"], "c2", "numeric DESC sort: {v}");
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?sort=bogus",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "unknown sort field must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn explicit_null_clears_field_and_rules_can_clear() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, r) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"n","email":"x@y.com","tier":"Gold"}).to_string()),
+        None,
+    )
+    .await;
+    let id = r["id"].as_str().unwrap();
+    let ver = r["version"].as_i64().unwrap();
+
+    // PATCH with explicit null clears the attribute (was: silent no-op).
+    let (st, v) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"tier": null}).to_string()),
+        Some(ver),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(
+        v.get("tier").is_none() || v["tier"].is_null(),
+        "null PATCH must clear the field: {v}"
+    );
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert!(v.get("tier").is_none(), "cleared field stays cleared: {v}");
+}
+
+#[tokio::test]
+async fn decimal_precision_and_datetime_normalization() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    // one model carrying both a decimal and a datetime field
+    let mut m = customer_model();
+    m["entities"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": Uuid::new_v4(), "name":"due","label":"Due","field_type":"datetime","required":false,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}));
+    publish(&ctx, m).await;
+
+    // >15 significant digits is a client error, not silent f64 rounding.
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"n","balance":"9999999999999999.99"}).to_string()),
+        None,
+    )
+    .await;
+    assert!(
+        !st.is_success(),
+        "16-significant-digit decimal must be rejected, got: {v}"
+    );
+
+    // datetime input with an offset is normalized to UTC on write (§5.1), so
+    // DSL string comparisons and jsonb eq filters compare instants, not
+    // verbatim offsets.
+    let (_, r) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"n2","email":"tz@x.com","due":"2026-01-01T23:00:00-05:00"}).to_string()),
+        None,
+    )
+    .await;
+    let due = r["due"].as_str().unwrap_or_default();
+    assert_eq!(
+        due, "2026-01-02T04:00:00+00:00",
+        "datetime stored as normalized UTC: {r}"
+    );
+    // the eq filter matches the same instant in a different rendering
+    let (_st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=due:eq:2026-01-02T04:00:00Z",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "datetime eq compares instants: {v}");
+}
+
+#[tokio::test]
+async fn auto_number_is_not_client_writable() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    let mut m = customer_model();
+    m["entities"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": Uuid::new_v4(), "name":"docnum","label":"Doc #","field_type":"auto_number","required":true,"is_unique":false,"is_indexed":true,"default_expr":null,"config":{}}));
+    publish(&ctx, m).await;
+
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"n","docnum": 77}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "client-supplied auto_number must be rejected: {v}"
+    );
+    // engine still generates it
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"n2"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert_eq!(v["docnum"].as_i64(), Some(1), "{v}");
+}
+
+#[tokio::test]
+async fn unique_and_fk_violations_map_to_client_errors() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(&ctx, customer_model()).await;
+    let _ = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"n","email":"dup@x.com"}).to_string()),
+        None,
+    )
+    .await;
+    // duplicate unique value → 409 conflict (was 500).
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"n2","email":"dup@x.com"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "duplicate unique must be 409: {v}"
+    );
+}

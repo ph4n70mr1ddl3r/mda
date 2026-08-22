@@ -222,6 +222,17 @@ fn as_str(args: &[Value], i: usize) -> Result<&str> {
 
 fn compare(kind: &str, l: &Value, r: &Value) -> Result<bool> {
     use std::cmp::Ordering;
+    // NULL semantics (§5.2): a comparison with a null operand — including an
+    // absent/optional field resolving to null — evaluates to null (non-match),
+    // NOT an error. Erroring here would let one record missing an optional
+    // field break every write to the entity via a rule/guard/formula that
+    // touches it; rules simply don't fire and guards simply fail for that
+    // record. Mixed-type operands stay an authoring error.
+    if l.is_null() || r.is_null() {
+        // eq/ne with null: SQL-ish three-valued logic collapsed to "no match"
+        // for every comparison kind — never an error, never a surprise match.
+        return Ok(false);
+    }
     let ord = match (l, r) {
         (Value::Number(a), Value::Number(b)) => a
             .as_f64()
@@ -248,6 +259,12 @@ fn compare(kind: &str, l: &Value, r: &Value) -> Result<bool> {
 }
 
 fn arith(kind: &str, l: &Value, r: &Value) -> Result<Value> {
+    // NULL propagation (§5.2): arithmetic over an absent optional field
+    // yields null (the calculated field simply stays absent) instead of
+    // erroring the whole write.
+    if l.is_null() || r.is_null() {
+        return Ok(Value::Null);
+    }
     let a = l
         .as_f64()
         .ok_or_else(|| Error::Invalid("arithmetic on non-number".into()))?;
@@ -266,9 +283,12 @@ fn arith(kind: &str, l: &Value, r: &Value) -> Result<Value> {
         }
         other => return Err(Error::Invalid(format!("unknown arithmetic {other}"))),
     };
-    Ok(serde_json::Number::from_f64(v)
+    // Overflow (inf) is NOT representable and must not silently become null
+    // (null would no-op the assignment and retain a stale stored value) —
+    // fail the write loudly instead.
+    serde_json::Number::from_f64(v)
         .map(Value::Number)
-        .unwrap_or(Value::Null))
+        .ok_or_else(|| Error::Invalid("arithmetic overflow".into()))
 }
 
 #[cfg(test)]
@@ -331,5 +351,45 @@ mod tests {
     fn type_mismatch_errors() {
         let e = json!({"op":"Cmp","kind":"eq","lhs":{"op":"Lit","value":1},"rhs":{"op":"Lit","value":"x"}});
         assert!(eval(&Expr::from_json(&e).unwrap(), &ctx(), &Registry::new()).is_err());
+    }
+
+    // ===== NULL semantics (§5.2): an absent optional field must never break
+    // a write — comparisons are non-matches, arithmetic propagates null. =====
+
+    #[test]
+    fn null_comparisons_are_non_matches_not_errors() {
+        // a rule condition over an absent field: evaluates cleanly to false.
+        let e = json!({"op":"Cmp","kind":"eq","lhs":{"op":"Field","name":"missing"},"rhs":{"op":"Lit","value":"Closed"}});
+        let v = eval(&Expr::from_json(&e).unwrap(), &ctx(), &Registry::new()).unwrap();
+        assert!(
+            !truth(&v),
+            "null eq string must be a non-match, not an error"
+        );
+        for kind in ["ne", "lt", "le", "gt", "ge"] {
+            let e = json!({"op":"Cmp","kind":kind,"lhs":{"op":"Field","name":"missing"},"rhs":{"op":"Lit","value":1}});
+            let v = eval(&Expr::from_json(&e).unwrap(), &ctx(), &Registry::new())
+                .unwrap_or_else(|e| panic!("{kind} on null must not error: {e}"));
+            assert!(!truth(&v), "{kind} on null must be a non-match");
+        }
+    }
+
+    #[test]
+    fn null_arithmetic_propagates_null() {
+        let e = json!({"op":"Arith","kind":"mul","lhs":{"op":"Field","name":"missing"},"rhs":{"op":"Lit","value":3}});
+        let v = eval(&Expr::from_json(&e).unwrap(), &ctx(), &Registry::new()).unwrap();
+        assert!(
+            v.is_null(),
+            "arithmetic over an absent field is null (calculated field stays absent)"
+        );
+    }
+
+    #[test]
+    fn arithmetic_overflow_errors_loudly() {
+        // 1e308 * 10 overflows to inf — previously silently Value::Null, which
+        // no-opped the assignment and retained a stale stored value.
+        let e = json!({"op":"Arith","kind":"mul","lhs":{"op":"Lit","value":1e308},"rhs":{"op":"Lit","value":10.0}});
+        let err = eval(&Expr::from_json(&e).unwrap(), &ctx(), &Registry::new())
+            .expect_err("overflow must error, not silently become null");
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 }

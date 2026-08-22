@@ -43,6 +43,11 @@ struct Transition {
 }
 
 /// Run a named transition on a record. Returns the updated record.
+///
+/// The whole unit of work is ONE transaction (§5.9.5 / ADR-0016 sync-by-
+/// default): state change + share recompute + task creation + outbox
+/// side-effect + audit/event rows commit together — a crash can never leave
+/// the state advanced without its task/notification, or logs missing.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_transition(
     pool: &PgPool,
@@ -72,9 +77,15 @@ pub async fn run_transition(
     // superuser scope before the scope check would let error messages ("no
     // transition X from state Y", "guard failed") disclose the current state of
     // records the caller cannot even read.
-    mda_data::read(pool, tenant, def, record_id, scope).await?;
-    let current =
-        mda_data::read(pool, tenant, def, record_id, &RecordScope::superuser(actor)).await?;
+    mda_data::crud::read_tx(&mut tx, tenant, def, record_id, scope).await?;
+    let current = mda_data::crud::read_tx(
+        &mut tx,
+        tenant,
+        def,
+        record_id,
+        &RecordScope::superuser(actor),
+    )
+    .await?;
     let state = current["state"]
         .as_str()
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("record has no state")))?
@@ -88,7 +99,6 @@ pub async fn run_transition(
     .fetch_all(&mut *tx)
     .await
     .map_err(Error::internal)?;
-    tx.commit().await.map_err(Error::internal)?;
     let t = transitions
         .iter()
         .find(|t| t.name == transition_name && t.from_state == state)
@@ -129,9 +139,9 @@ pub async fn run_transition(
     mda_rules::compute_calculated(def, &mut ctx, &reg)?;
     ctx.remove("_new_state");
 
-    // persist: set state + derived fields (OCC + write scope)
-    let after = mda_data::update(
-        pool,
+    // persist: set state + derived fields (OCC + write scope) — same tx
+    let after = mda_data::crud::update_tx(
+        &mut tx,
         tenant,
         def,
         record_id,
@@ -142,10 +152,8 @@ pub async fn run_transition(
     )
     .await?;
 
-    // create a task if the transition requires one
+    // create a task if the transition requires one — same tx
     if t.creates_task {
-        let mut tx = pool.begin().await.map_err(Error::internal)?;
-        set_tenant(&mut tx, tenant).await?;
         sqlx::query(
             "INSERT INTO meta.md_workflow_task (tenant_id, workflow_id, entity, record_id, transition_id)
              VALUES ($1, $2, $3, $4, $5)",
@@ -158,10 +166,39 @@ pub async fn run_transition(
         .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
-        tx.commit().await.map_err(Error::internal)?;
     }
 
-    // enqueue a side-effect (outbox); the drain worker turns the
+    // domain events + audit, in the same tx: a `record.updated` row (the
+    // transition IS an update) plus the `workflow.transitioned` fact the
+    // §5.10.2 event log carries for SSE/replay (§5.9.5: "every transition
+    // attempt + outcome lands in sys_event_log").
+    mda_data::logs::write_logs(
+        &mut tx,
+        tenant,
+        actor,
+        entity,
+        Some(record_id),
+        "update",
+        Some(current.clone()),
+        Some(after.clone()),
+    )
+    .await?;
+    mda_data::logs::write_event(
+        &mut tx,
+        tenant,
+        actor,
+        entity,
+        record_id,
+        "workflow.transitioned",
+        serde_json::json!({
+            "transition": transition_name,
+            "from": state,
+            "to": t.to_state,
+        }),
+    )
+    .await?;
+
+    // enqueue a side-effect (outbox, same tx); the drain worker turns the
     // `workflow.transitioned` row into an in-app notification to the actor.
     sqlx::query(
         "INSERT INTO sys_outbox (tenant_id, kind, payload)
@@ -176,10 +213,11 @@ pub async fn run_transition(
         "to": t.to_state,
         "actor": actor,
     }))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(Error::internal)?;
 
+    tx.commit().await.map_err(Error::internal)?;
     Ok(after)
 }
 

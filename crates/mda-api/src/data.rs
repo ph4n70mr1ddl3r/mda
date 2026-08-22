@@ -115,6 +115,8 @@ async fn create_record(
 /// Shared create write-path used by both REST and GraphQL (ADR-0010 mutations
 /// reach REST parity by construction): RBAC + FLS write-check + rules +
 /// calculated fields + audit, then FLS read-projection of the result.
+/// The data write and its audit/event log rows land in ONE transaction
+/// (§5.9.3 step 7): a committed create always carries its logs.
 pub(crate) async fn create_record_service(
     st: &AppState,
     user: &Identity,
@@ -130,18 +132,23 @@ pub(crate) async fn create_record_service(
     let rules = mda_rules::load_active(&st.pool, user.tenant_id, entity).await?;
     mda_rules::fire(&rules, "after_create", &mut ctx, &reg)?;
     mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
-    let rec = mda_data::create(&st.pool, user.tenant_id, &def, ctx, user.user_id).await?;
-    audit(
-        st,
+
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+    let rec = mda_data::crud::create_tx(&mut tx, user.tenant_id, &def, ctx, user.user_id).await?;
+    let rid = rec["id"].as_str().unwrap_or("").parse::<Uuid>().ok();
+    write_logs_checked(
+        &mut tx,
         user.tenant_id,
         user.user_id,
         entity,
-        rec["id"].as_str().unwrap_or("").parse::<Uuid>().ok(),
+        rid,
         "create",
         None,
         Some(rec.clone()),
     )
-    .await;
+    .await?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(project(user, entity, &def, rec))
 }
 
@@ -171,7 +178,9 @@ async fn update_record(
 
 /// Shared update write-path (REST + GraphQL). Carries the OCC `version`, merges
 /// the before-image for rule/condition context, fires rules + calculated fields,
-/// and audits before/after — identical to a hand-typed REST PATCH.
+/// and audits before/after — identical to a hand-typed REST PATCH. The write,
+/// its share recompute, and the audit/event rows land in ONE transaction
+/// (§5.9.3): there is no window where the data committed but the logs did not.
 pub(crate) async fn update_record_service(
     st: &AppState,
     user: &Identity,
@@ -185,9 +194,15 @@ pub(crate) async fn update_record_service(
     let mut ctx = into_object(body)?;
     assert_writable(user, entity, &def, &ctx)?;
     let scope = scope_for(st, user, entity).await?;
-    // before-image for audit + condition context (existing merged with the patch).
-    let before = mda_data::read(
-        &st.pool,
+    let reg = mda_rules::Registry::new();
+    let rules = mda_rules::load_active(&st.pool, user.tenant_id, entity).await?;
+
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+    // before-image for audit + condition context (existing merged with the
+    // patch), read on the write transaction.
+    let before = mda_data::crud::read_tx(
+        &mut tx,
         user.tenant_id,
         &def,
         id,
@@ -209,12 +224,10 @@ pub(crate) async fn update_record_service(
         }
     }
     // Phase 4: fire set-field rules + calculated fields.
-    let reg = mda_rules::Registry::new();
-    let rules = mda_rules::load_active(&st.pool, user.tenant_id, entity).await?;
     mda_rules::fire(&rules, "after_update", &mut ctx, &reg)?;
     mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
-    let after = mda_data::update(
-        &st.pool,
+    let after = mda_data::crud::update_tx(
+        &mut tx,
         user.tenant_id,
         &def,
         id,
@@ -224,8 +237,8 @@ pub(crate) async fn update_record_service(
         None,
     )
     .await?;
-    audit(
-        st,
+    write_logs_checked(
+        &mut tx,
         user.tenant_id,
         user.user_id,
         entity,
@@ -234,7 +247,8 @@ pub(crate) async fn update_record_service(
         before,
         Some(after.clone()),
     )
-    .await;
+    .await?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(project(user, entity, &def, after))
 }
 
@@ -254,9 +268,11 @@ async fn restore_record(
     authorize(&user, &entity, "create")?;
     let def = entity_def(&st, user.tenant_id, &entity).await?;
     let scope = scope_for(&st, &user, &entity).await?;
-    let rec = mda_data::restore(&st.pool, user.tenant_id, &def, id, &scope).await?;
-    audit(
-        &st,
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+    let rec = mda_data::crud::restore_tx(&mut tx, user.tenant_id, &def, id, &scope).await?;
+    write_logs_checked(
+        &mut tx,
         user.tenant_id,
         user.user_id,
         &entity,
@@ -265,7 +281,8 @@ async fn restore_record(
         None,
         Some(rec.clone()),
     )
-    .await;
+    .await?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(Json(project(&user, &entity, &def, rec)))
 }
 
@@ -279,7 +296,8 @@ async fn delete_record(
 }
 
 /// Shared delete write-path (REST + GraphQL): RBAC + record-scope delete + audit
-/// before-image. Returns the before-image so a GraphQL mutation can echo it back.
+/// before-image, all in ONE transaction (§5.9.3). Returns () (the before-image
+/// rides the same tx into the audit row).
 pub(crate) async fn delete_record_service(
     st: &AppState,
     user: &Identity,
@@ -289,8 +307,10 @@ pub(crate) async fn delete_record_service(
     authorize(user, entity, "delete")?;
     let def = entity_def(st, user.tenant_id, entity).await?;
     let scope = scope_for(st, user, entity).await?;
-    let before = mda_data::read(
-        &st.pool,
+    let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+    let before = mda_data::crud::read_tx(
+        &mut tx,
         user.tenant_id,
         &def,
         id,
@@ -298,9 +318,9 @@ pub(crate) async fn delete_record_service(
     )
     .await
     .ok();
-    mda_data::delete(&st.pool, user.tenant_id, &def, id, &scope).await?;
-    audit(
-        st,
+    mda_data::crud::delete_tx(&mut tx, user.tenant_id, &def, id, &scope).await?;
+    write_logs_checked(
+        &mut tx,
         user.tenant_id,
         user.user_id,
         entity,
@@ -309,7 +329,8 @@ pub(crate) async fn delete_record_service(
         before,
         None,
     )
-    .await;
+    .await?;
+    tx.commit().await.map_err(Error::internal)?;
     Ok(())
 }
 
@@ -325,6 +346,8 @@ async fn transition_record(
     let expected = version_from_headers(&headers)?;
     let def = entity_def(&st, user.tenant_id, &entity).await?;
     let scope = scope_for(&st, &user, &entity).await?;
+    // run_transition writes the state change, task, outbox side-effect, and
+    // the audit/event rows in ONE transaction (§5.9.5 / ADR-0016).
     let after = mda_workflow::run_transition(
         &st.pool,
         user.tenant_id,
@@ -337,17 +360,6 @@ async fn transition_record(
         &scope,
     )
     .await?;
-    audit(
-        &st,
-        user.tenant_id,
-        user.user_id,
-        &entity,
-        Some(id),
-        "update",
-        None,
-        Some(after.clone()),
-    )
-    .await;
     Ok(Json(project(&user, &entity, &def, after)))
 }
 
@@ -540,10 +552,24 @@ fn assert_writable(
             return Err(Error::Forbidden(format!("no write access to {}", f.name)).into());
         }
     }
+    // Reference (FK) columns are relationships, not fields — the same grain-4
+    // FLS rule applies to them (§5.11): `read`/`none` ⇒ reject the write.
+    for r in &def.relationships {
+        if body.contains_key(&r.source_field_name)
+            && id.field_access(entity, &r.source_field_name) != Access::Write
+        {
+            return Err(
+                Error::Forbidden(format!("no write access to {}", r.source_field_name)).into(),
+            );
+        }
+    }
     Ok(())
 }
 
-/// Drop fields the caller may not read (FLS read projection).
+/// Drop fields the caller may not read (FLS read projection). Covers reference
+/// (FK) columns too — a `none` grant on a relationship column hides the id
+/// value on every read surface (§5.11 grain 4; same rule as `md_form` at
+/// ui.rs and `/api/schema`).
 pub(crate) fn project(
     id: &Identity,
     entity: &str,
@@ -554,6 +580,11 @@ pub(crate) fn project(
         for f in &def.fields {
             if id.field_access(entity, &f.name) == Access::None {
                 obj.remove(&f.name);
+            }
+        }
+        for r in &def.relationships {
+            if id.field_access(entity, &r.source_field_name) == Access::None {
+                obj.remove(&r.source_field_name);
             }
         }
     }
@@ -585,9 +616,13 @@ pub(crate) async fn entity_def(
     Ok(st.cache.get_entity(&st.pool, tenant, id).await?)
 }
 
+/// Write the audit + event rows on the caller's transaction (§5.9.3 step 7 —
+/// same commit as the data write). A log failure rolls the whole write back:
+/// the alternative (commit data, skip logs) is exactly the orphaned-write
+/// window the same-txn rule exists to close. Counted for the health surface.
 #[allow(clippy::too_many_arguments)]
-async fn audit(
-    st: &AppState,
+async fn write_logs_checked(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
     actor: Uuid,
     entity: &str,
@@ -595,122 +630,18 @@ async fn audit(
     op: &str,
     before: Option<Value>,
     after: Option<Value>,
-) {
-    // Both sys_audit_log and sys_event_log are tenant-RLS-gated, so the inserts
-    // must run under the tenant GUC — otherwise a non-superuser app role (the
-    // normal case) fails the WITH CHECK and the row is dropped. They share one
-    // short transaction so the two side-effects land together (best-effort).
-    let (etype, payload) = event_for(op, &before, &after);
-    match st.pool.begin().await {
-        Ok(mut tx) => {
-            if let Err(e) = mda_security::set_tenant(&mut tx, tenant).await {
-                tracing::warn!(?e, "audit: set_tenant failed");
-                return;
-            }
-            let audit_ok = sqlx::query(
-                "INSERT INTO sys_audit_log (tenant_id, actor_id, entity, record_id, op, before, after)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            )
-            .bind(tenant)
-            .bind(actor)
-            .bind(entity)
-            .bind(record_id.unwrap_or_else(Uuid::nil))
-            .bind(op)
-            .bind(&before)
-            .bind(&after)
-            .execute(&mut *tx)
-            .await
-            .is_ok();
-            let event_ok = if let (Some(etype), Some(rid)) = (etype, record_id) {
-                sqlx::query(
-                    "INSERT INTO sys_event_log (tenant_id, type, entity, record_id, actor_id, payload)
-                     VALUES ($1, $2, $3, $4, $5, $6)",
-                )
-                .bind(tenant)
-                .bind(etype)
-                .bind(entity)
-                .bind(rid)
-                .bind(actor)
-                .bind(&payload)
-                .execute(&mut *tx)
-                .await
-                .is_ok()
-            } else {
-                true
-            };
-            if audit_ok {
-                // Commit even when only the event-log insert failed: the audit
-                // row is the integrity record and must not vanish with it —
-                // the degraded event path is counted + logged instead.
-                if let Err(e) = tx.commit().await {
-                    tracing::warn!(?e, "audit tx commit failed");
-                }
-                if !event_ok {
-                    let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                    tracing::error!(
-                        failures = n,
-                        "event log insert failed (audit row committed)"
-                    );
-                }
-            } else {
-                let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::error!(failures = n, "audit log insert failed");
-            }
-        }
-        Err(e) => tracing::warn!(?e, "audit: begin tx failed"),
+) -> ApiResult<()> {
+    if let Err(e) =
+        mda_data::logs::write_logs(tx, tenant, actor, entity, record_id, op, before, after).await
+    {
+        let n = AUDIT_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::error!(
+            failures = n,
+            "write-path log insert failed (write rolled back)"
+        );
+        return Err(e.into());
     }
-}
-
-/// Map an audit op to a domain event type + a conservative payload. The payload
-/// carries only field *names* that changed (never values) so the SSE relay can
-/// notify a viewer that a record changed without leaking field-level data (the
-/// relay additionally AuthZ-filters; §5.10.6 full field filtering is a follow-up).
-fn event_for(
-    op: &str,
-    before: &Option<Value>,
-    after: &Option<Value>,
-) -> (Option<&'static str>, Value) {
-    let changed: Vec<String> = match (before, after) {
-        (Some(Value::Object(b)), Some(Value::Object(a))) => {
-            let core: &[&str] = &["id", "version", "updated_at", "created_at"];
-            a.iter()
-                .filter(|(k, v)| !core.contains(&k.as_str()) && b.get(*k) != Some(*v))
-                .map(|(k, _)| k.clone())
-                .collect()
-        }
-        (_, Some(Value::Object(a))) => {
-            let core: &[&str] = &["id", "version", "updated_at", "created_at"];
-            a.keys()
-                .filter(|k| !core.contains(&k.as_str()))
-                .cloned()
-                .collect()
-        }
-        _ => Vec::new(),
-    };
-    let (etype, from_v, to_v) = match op {
-        "create" => (
-            Some("record.created"),
-            None,
-            after.as_ref().and_then(version_of),
-        ),
-        "update" => (
-            Some("record.updated"),
-            before.as_ref().and_then(version_of),
-            after.as_ref().and_then(version_of),
-        ),
-        "delete" => (
-            Some("record.deleted"),
-            before.as_ref().and_then(version_of),
-            None,
-        ),
-        _ => (None, None, None),
-    };
-    let payload = json!({
-        "changed_fields": changed,
-        "from_version": from_v,
-        "to_version": to_v,
-    });
-    (etype, payload)
+    Ok(())
 }
 
 fn version_of(v: &Value) -> Option<i64> {
@@ -1142,12 +1073,17 @@ async fn resolve_import_target(
     if key == "id" {
         let id = Uuid::parse_str(keyval)
             .map_err(|_| Error::Invalid("key 'id' is not a valid UUID".into()))?;
+        // Only a genuine "record does not exist (for this caller)" means
+        // no-match (⇒ upsert falls through to create). Any other failure —
+        // transient DB error, retired entity, … — must surface as an error,
+        // not silently turn an update into a duplicate create.
         return match mda_data::read(pool, user.tenant_id, def, id, &write_scope.clone()).await {
             Ok(rec) => {
                 let ver = version_of(&rec).unwrap_or(1);
                 Ok(Some((id, ver)))
             }
-            Err(_) => Ok(None),
+            Err(mda_core::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
         };
     }
 
@@ -1241,7 +1177,11 @@ async fn export_records(
         }
     }
     for r in &def.relationships {
-        columns.push(r.source_field_name.clone());
+        // FLS grain 4: a `none` grant on a reference column must not export
+        // the FK ids either (same projection as the JSON read surfaces).
+        if user.field_access(&entity, &r.source_field_name) != Access::None {
+            columns.push(r.source_field_name.clone());
+        }
     }
     let rows: Vec<Map<String, Value>> = res_items
         .into_iter()

@@ -210,12 +210,19 @@ async fn scope_for(
     })
 }
 
-/// FLS read projection (same rule as the REST data API).
+/// FLS read projection (same rule as the REST data API). Reference (FK)
+/// columns are covered too — a `none` grant also hides the nested traversal
+/// (the resolver finds no FK on the projected parent and yields null).
 fn project_field_level(user: &Identity, def: &EntityDefinition, mut rec: Value) -> Value {
     if let Some(obj) = rec.as_object_mut() {
         for f in &def.fields {
             if user.field_access(&def.entity.name, &f.name) == Access::None {
                 obj.remove(&f.name);
+            }
+        }
+        for r in &def.relationships {
+            if user.field_access(&def.entity.name, &r.source_field_name) == Access::None {
+                obj.remove(&r.source_field_name);
             }
         }
     }

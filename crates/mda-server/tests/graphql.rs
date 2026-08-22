@@ -546,3 +546,104 @@ async fn graphql_schema_rebuilds_and_invalidates_after_publish() {
         "manual clear empties the cache"
     );
 }
+
+// Anti-regression (§5.11 grain 4): FLS `none` on a *reference* column must
+// hide the nested traversal too — the resolver reads the FK off the projected
+// parent, so a dropped FK yields null instead of leaking the target through
+// the relationship.
+#[tokio::test]
+async fn graphql_fls_none_on_reference_hides_traversal() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(
+        &ctx,
+        model(
+            &format!("c_{}", Uuid::new_v4().simple()),
+            &format!("i_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+
+    // Public-read OWD on both entities: isolate field-level security.
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    for e in ["Customer", "Invoice"] {
+        sqlx::query(
+            "INSERT INTO sec.sec_owd (tenant_id, entity, default_access)
+             VALUES ($1, $2, 'public_read')
+             ON CONFLICT (tenant_id, entity) DO UPDATE SET default_access = 'public_read'",
+        )
+        .bind(ctx.tenant)
+        .bind(e)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let (_, c) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","secret":"s"}).to_string()),
+    )
+    .await;
+    let cust_id = c["id"].as_str().unwrap();
+    let (_, i) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Invoice",
+        &ctx.token,
+        Some(json!({"amount":"5.00","customer_id": cust_id}).to_string()),
+    )
+    .await;
+    let inv_id = i["id"].as_str().unwrap();
+
+    // Limited user: read on both entities, FLS `none` on Invoice.customer_id.
+    let role_id = common::seed_role(
+        &ctx.pool,
+        ctx.tenant,
+        "flsref",
+        &[("Invoice", "read"), ("Customer", "read")],
+    )
+    .await;
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(&ctx.pool, ctx.tenant, &email, "limited", &hash).await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, uid, role_id).await;
+    common::seed_field_permission(
+        &ctx.pool,
+        ctx.tenant,
+        role_id,
+        "Invoice",
+        "customer_id",
+        "none",
+    )
+    .await;
+    let tok = JwtConfig::from_env()
+        .issue_access(uid, ctx.tenant, None)
+        .unwrap();
+
+    // Superuser control: traversal resolves.
+    let q = format!("{{ invoice(id: \"{inv_id}\") {{ amount customer {{ name }} }} }}");
+    let v = gql(&ctx, &q).await;
+    assert_eq!(v["data"]["invoice"]["customer"]["name"], "Acme");
+
+    // Limited user: same query — the reference is hidden, not traversed.
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/graphql",
+        &tok,
+        Some(json!({"query": q}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["data"]["invoice"]["amount"].as_f64().unwrap(), 5.0);
+    assert!(
+        v["data"]["invoice"]["customer"].is_null(),
+        "FLS `none` on the FK column must hide the nested traversal: {v}"
+    );
+}

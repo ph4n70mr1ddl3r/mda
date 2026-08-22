@@ -95,6 +95,7 @@ enum Bind {
     Json(Value),
     Uuid(Option<Uuid>),
     Text(String),
+    TextArray(Vec<String>),
 }
 
 enum ListBind {
@@ -207,10 +208,49 @@ pub fn pred_render(pred: &str, scope: &RecordScope, start: usize) -> (String, Ve
     (out, binds)
 }
 
+/// Map expected DB-level integrity failures onto the ADR-0018 error taxonomy
+/// instead of a raw 500: unique violations are a client conflict (409), FK
+/// violations (dangling reference / restrict-blocked delete) are validation
+/// errors (422). Everything else stays internal.
+fn map_db_err(e: sqlx::Error) -> Error {
+    if let Some(db) = e.as_database_error() {
+        match db.code().as_deref() {
+            Some("23505") => {
+                return Error::Conflict("duplicate value for a unique field".into());
+            }
+            Some("23503") => {
+                return Error::Invalid(
+                    "referential integrity: the referenced record does not exist, or the record is referenced by another (on_delete=restrict)".into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Error::internal(e)
+}
+
 // ===== create =====
 
 pub async fn create(
     pool: &PgPool,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    body: Map<String, Value>,
+    owner: Uuid,
+) -> Result<Value> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let rec = create_tx(&mut tx, tenant, def, body, owner).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(rec)
+}
+
+/// Same-transaction create core (§5.9.3 unit of work): the caller owns the
+/// transaction, so audit/event/outbox rows written after this land in the
+/// same commit as the data write — a crash can never orphan either side.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: Uuid,
     def: &EntityDefinition,
     body: Map<String, Value>,
@@ -221,6 +261,12 @@ pub async fn create(
 
     let mut attributes = Map::new();
     for f in &def.fields {
+        if f.field_type == "auto_number" && body.contains_key(&f.name) {
+            return Err(Error::Invalid(format!(
+                "field {} is engine-generated (auto_number) and cannot be set",
+                f.name
+            )));
+        }
         let raw = body.get(&f.name).cloned();
         let raw = match (raw, &f.default_expr) {
             (Some(v), _) => Some(v),
@@ -257,10 +303,7 @@ pub async fn create(
 
     let id = Uuid::from(mda_core::Id::new());
 
-    // Run under the tenant GUC so the biz.<t> RLS WITH CHECK passes, and keep
-    // the gapless auto_number UPSERT atomic with the INSERT.
-    let mut tx = pool.begin().await.map_err(Error::internal)?;
-    set_tenant(&mut tx, tenant).await?;
+    // The gapless auto_number UPSERT stays atomic with the INSERT (same tx).
     for f in &def.fields {
         if f.field_type == "auto_number" && !attributes.contains_key(&f.name) {
             let (n,): (i64,) = sqlx::query_as(
@@ -273,7 +316,7 @@ pub async fn create(
             .bind(tenant)
             .bind(def.entity.id)
             .bind(&f.name)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await
             .map_err(Error::internal)?;
             attributes.insert(f.name.clone(), Value::from(n));
@@ -298,7 +341,7 @@ pub async fn create(
     for v in fk_values {
         q = q.bind(v);
     }
-    q.execute(&mut *tx).await.map_err(Error::internal)?;
+    q.execute(&mut **tx).await.map_err(map_db_err)?;
     // ADR-0013: materialize this record's criteria-sharing-rule grants
     // synchronously in the write transaction (the per-record recompute step).
     let (doc,): (Value,) = sqlx::query_as(&format!(
@@ -306,20 +349,18 @@ pub async fn create(
         def.entity.table_name
     ))
     .bind(id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(Error::internal)?;
     crate::sharing::recompute_record(
-        &mut tx,
+        tx,
         tenant,
         &def.entity.name,
         id,
-        &reconstruct(def, doc),
+        &reconstruct(def, doc.clone()),
     )
     .await?;
-    tx.commit().await.map_err(Error::internal)?;
-
-    read(pool, tenant, def, id, &RecordScope::superuser(owner)).await
+    Ok(reconstruct(def, doc))
 }
 
 // ===== read =====
@@ -327,6 +368,22 @@ pub async fn create(
 pub async fn read(
     pool: &PgPool,
     tenant: Uuid,
+    def: &EntityDefinition,
+    id: Uuid,
+    scope: &RecordScope,
+) -> Result<Value> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let v = read_tx(&mut tx, tenant, def, id, scope).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(v)
+}
+
+/// Same-transaction read core (caller owns the transaction) — used for
+/// before-images inside the §5.9.3 write unit.
+pub async fn read_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    _tenant: Uuid,
     def: &EntityDefinition,
     id: Uuid,
     scope: &RecordScope,
@@ -343,16 +400,13 @@ pub async fn read(
         sql.push_str(&format!(" AND {}", frag));
         rp_binds = binds;
     }
-    let mut tx = pool.begin().await.map_err(Error::internal)?;
-    set_tenant(&mut tx, tenant).await?;
     let mut q = sqlx::query_as::<_, (Value,)>(sql.as_str())
         .bind(id)
-        .bind(tenant);
+        .bind(_tenant);
     for b in rp_binds {
         q = q.bind(b);
     }
-    let row = q.fetch_optional(&mut *tx).await.map_err(Error::internal)?;
-    tx.commit().await.map_err(Error::internal)?;
+    let row = q.fetch_optional(&mut **tx).await.map_err(Error::internal)?;
     row.map(|(v,)| reconstruct(def, v))
         .ok_or_else(|| Error::NotFound(format!("record {id}")))
 }
@@ -370,16 +424,59 @@ pub async fn update(
     scope: &RecordScope,
     new_state: Option<String>,
 ) -> Result<Value> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let rec = update_tx(
+        &mut tx,
+        tenant,
+        def,
+        id,
+        expected_version,
+        body,
+        scope,
+        new_state,
+    )
+    .await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(rec)
+}
+
+/// Same-transaction update core (OCC + write scope + share recompute) — the
+/// caller owns the transaction (§5.9.3 unit of work).
+#[allow(clippy::too_many_arguments)]
+pub async fn update_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    id: Uuid,
+    expected_version: i64,
+    body: Map<String, Value>,
+    scope: &RecordScope,
+    new_state: Option<String>,
+) -> Result<Value> {
     ensure_active(def)?;
     validate_record(def, &body)?;
 
     let mut attributes_merge = Map::new();
+    let mut null_keys: Vec<String> = Vec::new();
     for f in &def.fields {
         if let Some(v) = body.get(&f.name) {
-            if !v.is_null() {
-                if let Some(cv) = coerce::coerce(&f.field_type, Some(v.clone()))? {
-                    attributes_merge.insert(f.name.clone(), cv);
-                }
+            if f.field_type == "auto_number" {
+                return Err(Error::Invalid(format!(
+                    "field {} is engine-generated (auto_number) and cannot be set",
+                    f.name
+                )));
+            }
+            if v.is_null() {
+                // An explicit JSON null CLEARS the attribute — consistent with
+                // the relationship branch below (null FK → SQL NULL) and the
+                // admin surface's documented null-clears convention. It also
+                // gives set-field rules / calculated fields a working "clear"
+                // semantic: a formula evaluating to null removes the stored
+                // value instead of silently retaining a stale one.
+                null_keys.push(f.name.clone());
+            } else if let Some(cv) = coerce::coerce(&f.field_type, Some(v.clone()))? {
+                attributes_merge.insert(f.name.clone(), cv);
             }
         }
     }
@@ -390,9 +487,26 @@ pub async fn update(
         sets.push(format!("state = ${}", binds.len() + 1));
         binds.push(Bind::Text(st));
     }
-    if !attributes_merge.is_empty() {
-        sets.push(format!("attributes = attributes || ${}", binds.len() + 1));
-        binds.push(Bind::Json(Value::Object(attributes_merge)));
+    if !attributes_merge.is_empty() || !null_keys.is_empty() {
+        // `(attributes || $merge) - $null_keys`: merge non-null, then remove
+        // explicitly-nulled keys. The parentheses are LOAD-BEARING: unposed,
+        // Postgres parses `attributes || $1 - $2` as `attributes || ($1 - $2)`
+        // (jsonb `- text[]` binds tighter via operator resolution) and the
+        // merge payload re-introduces the very keys being cleared.
+        // Fully parenthesized: Postgres resolves the mixed `attributes || $m
+        // - $k` chain as `attributes || ($m - $k)` (operator resolution binds
+        // the jsonb-||-left chain late), which would re-add the cleared keys
+        // from the merge payload. Group merge-then-remove explicitly.
+        let mut expr = "attributes".to_string();
+        if !attributes_merge.is_empty() {
+            expr = format!("({} || ${})", expr, binds.len() + 1);
+            binds.push(Bind::Json(Value::Object(attributes_merge)));
+        }
+        if !null_keys.is_empty() {
+            expr = format!("({} - ${})", expr, binds.len() + 1);
+            binds.push(Bind::TextArray(null_keys));
+        }
+        sets.push(format!("attributes = {expr}"));
     }
     for r in &def.relationships {
         if let Some(v) = body.get(&r.source_field_name) {
@@ -432,6 +546,7 @@ pub async fn update(
             Bind::Json(v) => q.bind(v),
             Bind::Uuid(v) => q.bind(v),
             Bind::Text(v) => q.bind(v),
+            Bind::TextArray(v) => q.bind(v),
         };
     }
     q = q.bind(id).bind(tenant).bind(expected_version);
@@ -439,21 +554,17 @@ pub async fn update(
         q = q.bind(*b);
     }
 
-    let mut tx = pool.begin().await.map_err(Error::internal)?;
-    set_tenant(&mut tx, tenant).await?;
-    let result = match q.fetch_optional(&mut *tx).await.map_err(Error::internal)? {
+    match q.fetch_optional(&mut **tx).await.map_err(map_db_err)? {
         Some((doc,)) => {
             let rec = reconstruct(def, doc);
             // ADR-0013: synchronous per-record share recompute — inside the
             // write transaction, so a record's own shares are always fresh
             // immediately after its write (no per-record revocation lag).
-            crate::sharing::recompute_record(&mut tx, tenant, &def.entity.name, id, &rec).await?;
+            crate::sharing::recompute_record(tx, tenant, &def.entity.name, id, &rec).await?;
             Ok(rec)
         }
-        None => distinguish_not_found_or_conflict(&mut tx, def, tenant, id, scope).await,
-    };
-    tx.commit().await.map_err(Error::internal)?;
-    result
+        None => distinguish_not_found_or_conflict(tx, def, tenant, id, scope).await,
+    }
 }
 
 async fn distinguish_not_found_or_conflict(
@@ -515,6 +626,22 @@ pub async fn delete(
     id: Uuid,
     scope: &RecordScope,
 ) -> Result<()> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    delete_tx(&mut tx, tenant, def, id, scope).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(())
+}
+
+/// Same-transaction delete core (archive trigger + share cleanup) — the caller
+/// owns the transaction (§5.9.3 unit of work).
+pub async fn delete_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    id: Uuid,
+    scope: &RecordScope,
+) -> Result<()> {
     ensure_active(def)?;
     let rp = write_predicate(scope);
     let mut sql = format!(
@@ -531,17 +658,13 @@ pub async fn delete(
     for b in &rp_binds {
         q = q.bind(*b);
     }
-    let mut tx = pool.begin().await.map_err(Error::internal)?;
-    set_tenant(&mut tx, tenant).await?;
-    let res = q.execute(&mut *tx).await.map_err(Error::internal)?;
+    let res = q.execute(&mut **tx).await.map_err(map_db_err)?;
     if res.rows_affected() > 0 {
         // Hard delete (the row is archived by trigger, ADR-0006): drop the
         // materialized visibility rows too — sec_record_share has no FK to
         // dynamic biz.* tables, so cleanup is explicit.
-        crate::sharing::drop_record_shares(&mut tx, tenant, id).await?;
-    }
-    tx.commit().await.map_err(Error::internal)?;
-    if res.rows_affected() == 0 {
+        crate::sharing::drop_record_shares(tx, tenant, id).await?;
+    } else {
         return Err(Error::NotFound(format!("record {id}")));
     }
     Ok(())
@@ -578,7 +701,7 @@ pub async fn list(
             binds.push(ListBind::Uuid(b));
         }
     }
-    let order_sql = build_order(def, &params.sort);
+    let order_sql = build_order(def, &params.sort)?;
     let table = &def.entity.table_name;
 
     // count
@@ -672,7 +795,6 @@ fn build_list_where(
 ) -> Result<(String, Vec<ListBind>)> {
     let mut parts: Vec<String> = vec!["tenant_id = $1".to_string()];
     let mut binds: Vec<ListBind> = vec![ListBind::Uuid(tenant)];
-    let scalar: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
     let fk: HashSet<&str> = def
         .relationships
         .iter()
@@ -690,32 +812,119 @@ fn build_list_where(
             "like" => "ILIKE",
             other => return Err(Error::Invalid(format!("unsupported filter op {other}"))),
         };
-        // Ordered comparison on a scalar field casts to numeric — allowed only
-        // for numeric-typed fields: casting a non-numeric text value raises a
-        // Postgres error (a user-triggerable 500 from ?filter=name:gt:1).
-        let numeric_typed = def.fields.iter().any(|d| {
-            d.name == f.field
-                && matches!(
-                    d.field_type.as_str(),
-                    "integer" | "auto_number" | "decimal" | "money"
-                )
-        });
-        let (lhs, rhs_cast) = if fk.contains(f.field.as_str()) {
-            (f.field.clone(), "::uuid")
-        } else if scalar.contains(f.field.as_str()) {
-            if matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte") {
-                if !numeric_typed {
-                    return Err(Error::Invalid(format!(
-                        "ordered comparison needs a numeric field ({} is not)",
-                        f.field
-                    )));
+        let ordered = matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte");
+        // The LHS expression + RHS cast must match the field's real type —
+        // a text LHS against a typed bind is a guaranteed 'operator does not
+        // exist' 42883 (user-triggerable 500), and a *text* comparison of a
+        // numeric jsonb value misses equal values ('10' ≠ '10.0'). Values are
+        // validated app-side so malformed input is a 400, not a DB error.
+        let (lhs, rhs_cast) = if let Some(ft) = def
+            .fields
+            .iter()
+            .find(|d| d.name == f.field)
+            .map(|d| d.field_type.as_str())
+        {
+            match ft {
+                "integer" | "auto_number" | "decimal" | "money" => {
+                    if f.op == "like" {
+                        return Err(Error::Invalid(format!(
+                            "like needs a text field ({0} is {ft})",
+                            f.field
+                        )));
+                    }
+                    f.value
+                        .parse::<f64>()
+                        .map_err(|_| Error::Invalid(format!("not a number: {}", f.value)))?;
+                    (
+                        format!("(attributes->>'{}')::numeric", f.field),
+                        "::numeric",
+                    )
                 }
-                (format!("(attributes->>'{}')", f.field), "::numeric")
-            } else {
-                (format!("(attributes->>'{}')", f.field), "")
+                "bool" => {
+                    if ordered || f.op == "like" {
+                        return Err(Error::Invalid(format!(
+                            "bool fields support eq/ne only (got {})",
+                            f.op
+                        )));
+                    }
+                    if !f.value.eq_ignore_ascii_case("true")
+                        && !f.value.eq_ignore_ascii_case("false")
+                    {
+                        return Err(Error::Invalid(format!("not a boolean: {}", f.value)));
+                    }
+                    (
+                        format!("(attributes->>'{}')::boolean", f.field),
+                        "::boolean",
+                    )
+                }
+                "date" => {
+                    if f.op == "like" {
+                        return Err(Error::Invalid("like needs a text field".into()));
+                    }
+                    chrono::NaiveDate::parse_from_str(&f.value, "%Y-%m-%d")
+                        .map_err(|e| Error::Invalid(format!("invalid date '{}': {e}", f.value)))?;
+                    (format!("(attributes->>'{}')::date", f.field), "::date")
+                }
+                "datetime" => {
+                    if f.op == "like" {
+                        return Err(Error::Invalid("like needs a text field".into()));
+                    }
+                    parse_ts(&f.value)?;
+                    (
+                        format!("(attributes->>'{}')::timestamptz", f.field),
+                        "::timestamptz",
+                    )
+                }
+                _ => {
+                    // Text-ish scalars (string/text/enum/…): equality/like only.
+                    // An ordered comparison on text is lexicographic — legal
+                    // SQL but not what a modeler means, and historically
+                    // rejected (see tests/security.rs).
+                    if ordered {
+                        return Err(Error::Invalid(format!(
+                            "ordered comparison needs a numeric/date/datetime field ({0} is {ft})",
+                            f.field
+                        )));
+                    }
+                    (format!("(attributes->>'{}')", f.field), "")
+                }
             }
+        } else if fk.contains(f.field.as_str()) {
+            if ordered || f.op == "like" {
+                return Err(Error::Invalid(format!(
+                    "reference columns support eq/ne only (got {})",
+                    f.op
+                )));
+            }
+            Uuid::parse_str(&f.value)
+                .map_err(|_| Error::Invalid(format!("not a valid uuid: {}", f.value)))?;
+            (f.field.clone(), "::uuid")
         } else if core.contains(&f.field.as_str()) {
-            (f.field.clone(), "")
+            match f.field.as_str() {
+                "state" => (f.field.clone(), ""),
+                "version" => {
+                    f.value
+                        .parse::<i64>()
+                        .map_err(|_| Error::Invalid(format!("not an integer: {}", f.value)))?;
+                    (f.field.clone(), "::bigint")
+                }
+                "owner_id" => {
+                    if ordered || f.op == "like" {
+                        return Err(Error::Invalid(format!(
+                            "owner_id supports eq/ne only (got {})",
+                            f.op
+                        )));
+                    }
+                    Uuid::parse_str(&f.value)
+                        .map_err(|_| Error::Invalid(format!("not a valid uuid: {}", f.value)))?;
+                    (f.field.clone(), "::uuid")
+                }
+                _ => {
+                    // created_at / updated_at
+                    parse_ts(&f.value)?;
+                    (f.field.clone(), "::timestamptz")
+                }
+            }
         } else {
             return Err(Error::Invalid(format!("unknown filter field {}", f.field)));
         };
@@ -725,9 +934,17 @@ fn build_list_where(
     Ok((parts.join(" AND "), binds))
 }
 
-fn build_order(def: &EntityDefinition, sort: &[Sort]) -> String {
+/// Validate an RFC-3339 timestamp filter value (400 on garbage instead of a
+/// Postgres cast error surfacing as 500).
+fn parse_ts(v: &str) -> Result<()> {
+    chrono::DateTime::parse_from_rfc3339(v)
+        .map(|_| ())
+        .map_err(|e| Error::Invalid(format!("invalid datetime '{v}': {e}")))
+}
+
+fn build_order(def: &EntityDefinition, sort: &[Sort]) -> Result<String> {
     if sort.is_empty() {
-        return "id".to_string();
+        return Ok("id".to_string());
     }
     let scalar: HashSet<&str> = def.fields.iter().map(|f| f.name.as_str()).collect();
     // Numeric-typed scalars must sort numerically, not lexically (else "10" < "2").
@@ -766,12 +983,18 @@ fn build_order(def: &EntityDefinition, sort: &[Sort]) -> String {
                 format!("(attributes->>'{}')", s.field)
             };
             parts.push(format!("{expr} {}", dir(s.asc)));
+        } else {
+            // Unknown sort field: reject (consistent with the filter path's
+            // unknown-field 400). Silently ignoring it returns id-ordered rows
+            // that LOOK sorted — a wrong-output edge (e.g. a field retired
+            // after a client was built against it).
+            return Err(Error::Invalid(format!("unknown sort field {}", s.field)));
         }
     }
     if parts.is_empty() {
-        "id".to_string()
+        Ok("id".to_string())
     } else {
-        parts.join(", ")
+        Ok(parts.join(", "))
     }
 }
 
@@ -909,6 +1132,22 @@ pub async fn restore(
     id: Uuid,
     scope: &RecordScope,
 ) -> Result<Value> {
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    set_tenant(&mut tx, tenant).await?;
+    let rec = restore_tx(&mut tx, tenant, def, id, scope).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(rec)
+}
+
+/// Same-transaction restore core — the caller owns the transaction (§5.9.3
+/// unit of work: audit/event rows land in the same commit as the re-insert).
+pub async fn restore_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    def: &EntityDefinition,
+    id: Uuid,
+    scope: &RecordScope,
+) -> Result<Value> {
     ensure_active(def)?;
     // core + attributes + FK columns (same set as create; generated columns are
     // excluded — they regenerate from `attributes` on insert).
@@ -944,27 +1183,22 @@ pub async fn restore(
             format!(", {fk}")
         }
     );
-    let mut tx = pool.begin().await.map_err(Error::internal)?;
-    set_tenant(&mut tx, tenant).await?;
     let mut q = sqlx::query_as::<_, (Value,)>(&sql).bind(id).bind(tenant);
     for b in scope_binds {
         q = q.bind(b);
     }
-    let row: Option<(Value,)> = q.fetch_optional(&mut *tx).await.map_err(Error::internal)?;
-    if let Some((doc,)) = &row {
-        // Restoring a record re-materializes its rule-derived visibility
-        // (ADR-0013) — the archived row's shares were dropped at delete time.
-        crate::sharing::recompute_record(
-            &mut tx,
-            tenant,
-            &def.entity.name,
-            id,
-            &reconstruct(def, doc.clone()),
-        )
-        .await?;
-    }
-    tx.commit().await.map_err(Error::internal)?;
+    let row: Option<(Value,)> = q.fetch_optional(&mut **tx).await.map_err(map_db_err)?;
     let (doc,) = row.ok_or_else(|| Error::NotFound(format!("archived record {id}")))?;
+    // Restoring a record re-materializes its rule-derived visibility
+    // (ADR-0013) — the archived row's shares were dropped at delete time.
+    crate::sharing::recompute_record(
+        tx,
+        tenant,
+        &def.entity.name,
+        id,
+        &reconstruct(def, doc.clone()),
+    )
+    .await?;
     Ok(reconstruct(def, doc))
 }
 

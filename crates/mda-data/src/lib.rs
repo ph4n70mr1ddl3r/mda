@@ -14,6 +14,7 @@
 pub mod coerce;
 pub mod crud;
 pub mod ddl;
+pub mod logs;
 pub mod sharing;
 
 pub use crud::{

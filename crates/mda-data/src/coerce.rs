@@ -18,7 +18,7 @@ pub fn coerce(field_type: &str, value: Option<Value>) -> Result<Option<Value>> {
     Ok(Some(match field_type {
         "string" | "text" | "enum" | "attachment" => as_string(&v)?,
         "integer" | "auto_number" => Value::from(as_i64(&v)?),
-        "decimal" | "money" => as_f64(&v)?.into(),
+        "decimal" | "money" => as_decimal(&v)?,
         "bool" => Value::Bool(as_bool(&v)?),
         "date" => as_date(&v)?,
         "datetime" => as_datetime(&v)?,
@@ -70,6 +70,37 @@ fn as_f64(v: &Value) -> Result<f64> {
     Ok(n)
 }
 
+/// Decimal/money coercion with a JSON-model precision guard. The storage
+/// contract is NUMERIC (money = NUMERIC(20,4), decimal(p,s) up to NUMERIC
+/// domain), but a JSON number is an IEEE-754 binary64 with ~15.95 decimal
+/// digits of significand: values with more significant digits are SILENTLY
+/// rounded before they are ever stored (e.g. 9999999999999999.99 → 1e16).
+/// Fail loudly instead — a value outside the exact-JSON domain is a client
+/// error, not data to corrupt. (PLAN §5.1 hoisted-column rule; the bound is
+/// the JSON numeric model, not the NUMERIC domain.)
+fn as_decimal(v: &Value) -> Result<Value> {
+    let text = match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return Err(Error::Invalid("expected a number".into())),
+    };
+    // Count significant decimal digits of the mantissa (sign, leading zeros,
+    // decimal point, and exponent are not significant).
+    let mantissa = text
+        .split(['e', 'E'])
+        .next()
+        .unwrap_or(&text)
+        .trim_start_matches(['+', '-']);
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let significant = digits.trim_start_matches('0').len();
+    if significant > 15 {
+        return Err(Error::Invalid(format!(
+            "decimal value has {significant} significant digits — beyond the 15 the JSON numeric model represents exactly; store it as a string field or reduce precision: {text}"
+        )));
+    }
+    Ok(as_f64(v)?.into())
+}
+
 fn as_bool(v: &Value) -> Result<bool> {
     match v {
         Value::Bool(b) => Ok(*b),
@@ -101,8 +132,12 @@ fn as_datetime(v: &Value) -> Result<Value> {
             ))
         }
     };
-    // Accept both RFC 3339 (compact) and ISO-8601 variants that chrono parses.
-    let _ = chrono::DateTime::parse_from_rfc3339(&s)
+    // Accept both RFC 3339 (compact) and ISO-8601 variants that chrono parses,
+    // then NORMALIZE TO UTC (PLAN §5.1: "the DB never stores local time" — a
+    // single canonical rendering also makes the DSL's string comparisons and
+    // jsonb eq filters behave as instant equality instead of comparing
+    // verbatim offsets).
+    let dt = chrono::DateTime::parse_from_rfc3339(&s)
         .or_else(|_| {
             // Also try RFC 3339 without timezone offset (assume UTC).
             chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S")
@@ -110,7 +145,7 @@ fn as_datetime(v: &Value) -> Result<Value> {
                 .map(|dt| dt.and_utc().into())
         })
         .map_err(|e| Error::Invalid(format!("invalid datetime '{s}': {e}")))?;
-    Ok(Value::String(s))
+    Ok(Value::String(dt.with_timezone(&chrono::Utc).to_rfc3339()))
 }
 
 #[cfg(test)]

@@ -96,17 +96,17 @@ pub fn create_table(table: &str, e: &DraftEntity) -> Result<Vec<String>> {
         "updated_at TIMESTAMPTZ NOT NULL DEFAULT now()".into(),
     ];
     for f in &e.fields {
-        if f.is_unique || f.is_indexed {
+        if f.is_unique {
+            // Generated column for the value; the UNIQUE constraint itself is
+            // COMPOSITE (tenant_id, col) — §5.1 "tenant_id in every composite
+            // index": a single-column unique would span every tenant sharing
+            // the physical table (cross-tenant 500s + an existence oracle).
             let st = sql_type(&f.field_type, &f.config)?;
-            let mut c = format!(
+            cols.push(format!(
                 "{} {st} GENERATED ALWAYS AS ({}) STORED",
                 f.name,
                 gen_expr(&f.name, &st)
-            );
-            if f.is_unique {
-                c.push_str(" UNIQUE");
-            }
-            cols.push(c);
+            ));
         }
     }
     cols.push("attributes JSONB NOT NULL DEFAULT '{}'::jsonb".into());
@@ -114,17 +114,40 @@ pub fn create_table(table: &str, e: &DraftEntity) -> Result<Vec<String>> {
     out.push(format!(
         "CREATE TABLE IF NOT EXISTS biz.{table} (\n  {body}\n)"
     ));
+    // composite key for tenant-scoped FK references (tenant_id, id) — see
+    // add_relationship. Drop-if-exists + add keeps the statement idempotent
+    // for a second tenant publishing the same shared table (CREATE TABLE
+    // IF NOT EXISTS above already no-ops).
     out.push(format!(
-        "CREATE INDEX IF NOT EXISTS {table}_tenant_idx ON biz.{table} (tenant_id)"
+        "ALTER TABLE biz.{table} DROP CONSTRAINT IF EXISTS {table}_tenant_id_uk"
+    ));
+    out.push(format!(
+        "ALTER TABLE biz.{table} ADD CONSTRAINT {table}_tenant_id_uk UNIQUE (tenant_id, id)"
     ));
     for f in &e.fields {
-        if f.is_indexed && !f.is_unique {
+        if f.is_unique {
             out.push(format!(
-                "CREATE INDEX IF NOT EXISTS {table}_{}_idx ON biz.{table} ({})",
+                "ALTER TABLE biz.{table} DROP CONSTRAINT IF EXISTS {table}_{}_uk",
+                f.name
+            ));
+            out.push(format!(
+                "ALTER TABLE biz.{table} ADD CONSTRAINT {table}_{}_uk UNIQUE (tenant_id, {})",
                 f.name, f.name
+            ));
+        } else if f.is_indexed {
+            // Expression index mirroring the exact filter/sort LHS the CRUD and
+            // report engines emit (a plain column index could never be matched
+            // by an `(attributes->>'x')::type` predicate).
+            out.push(format!(
+                "CREATE INDEX IF NOT EXISTS {table}_{}_idx ON biz.{table} (tenant_id, {})",
+                f.name,
+                index_expr(&f.field_type, &f.name)
             ));
         }
     }
+    out.push(format!(
+        "CREATE INDEX IF NOT EXISTS {table}_tenant_idx ON biz.{table} (tenant_id)"
+    ));
     // ADR-0006 / ADR-0015: a twin archive table + BEFORE DELETE trigger so every
     // hard delete (and every cascade-deleted child) is recoverable. The archive
     // is a plain structural copy (no generated columns / constraints); the
@@ -182,22 +205,32 @@ pub fn add_field(table: &str, f: &DraftField) -> Result<Vec<String>> {
     if !(f.is_unique || f.is_indexed) {
         return Ok(vec![]);
     }
-    let st = sql_type(&f.field_type, &f.config)?;
     let mut out = Vec::new();
-    let mut col = format!(
-        "ADD COLUMN {} {st} GENERATED ALWAYS AS ({}) STORED",
-        f.name,
-        gen_expr(&f.name, &st)
-    );
+    let st = sql_type(&f.field_type, &f.config)?;
     if f.is_unique {
-        col.push_str(" UNIQUE");
-    }
-    out.push(format!("ALTER TABLE biz.{table} {col}"));
-    if f.is_indexed && !f.is_unique {
         out.push(format!(
-            "CREATE INDEX IF NOT EXISTS {table}_{}_idx ON biz.{table} ({})",
+            "ALTER TABLE biz.{table} ADD COLUMN {} {st} GENERATED ALWAYS AS ({}) STORED",
+            f.name,
+            gen_expr(&f.name, &st)
+        ));
+        // composite (tenant_id, col) — see create_table. Idempotent for a
+        // second tenant adding the same field to a shared table.
+        out.push(format!(
+            "ALTER TABLE biz.{table} DROP CONSTRAINT IF EXISTS {table}_{}_uk",
+            f.name
+        ));
+        out.push(format!(
+            "ALTER TABLE biz.{table} ADD CONSTRAINT {table}_{}_uk UNIQUE (tenant_id, {})",
             f.name, f.name
         ));
+    } else {
+        out.push(format!(
+            "CREATE INDEX IF NOT EXISTS {table}_{}_idx ON biz.{table} (tenant_id, {})",
+            f.name,
+            index_expr(&f.field_type, &f.name)
+        ));
+        // indexed-only fields no longer get a real column — nothing to mirror.
+        return Ok(out);
     }
     // mirror the column to the archive table as a plain stored column so the
     // BEFORE DELETE trigger's column list stays valid (generated columns aren't
@@ -209,11 +242,40 @@ pub fn add_field(table: &str, f: &DraftField) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Add a relationship: hoisted UUID FK column + native `FOREIGN KEY` constraint + index.
+/// The filter/sort LHS expression for a field type (must byte-match the
+/// expressions build_list_where / the report compiler emit, or the planner
+/// can never use the index).
+fn index_expr(field_type: &str, name: &str) -> String {
+    match field_type {
+        "integer" | "auto_number" | "decimal" | "money" => {
+            format!("((attributes->>'{name}')::numeric)")
+        }
+        "bool" => format!("((attributes->>'{name}')::boolean)"),
+        "date" => format!("((attributes->>'{name}')::date)"),
+        "datetime" => format!("((attributes->>'{name}')::timestamptz)"),
+        _ => format!("((attributes->>'{name}'))"),
+    }
+}
+
+/// Add a relationship: hoisted UUID FK column + native tenant-scoped
+/// `FOREIGN KEY` constraint + composite index.
 pub fn add_relationship(
     table: &str,
     r: &DraftRelationship,
     target_table: &str,
+) -> Result<Vec<String>> {
+    add_relationship_deferred(table, r, target_table, false)
+}
+
+/// [`add_relationship`] with an explicit deferrability: FKs on a reference
+/// cycle are emitted `DEFERRABLE INITIALLY DEFERRED` (PLAN §5.7 mutual
+/// references / §5.8 publish check) so two records referencing each other can
+/// be written in one transaction.
+pub fn add_relationship_deferred(
+    table: &str,
+    r: &DraftRelationship,
+    target_table: &str,
+    deferrable: bool,
 ) -> Result<Vec<String>> {
     guard_ident("table", table)?;
     guard_ident("table", target_table)?;
@@ -223,13 +285,26 @@ pub fn add_relationship(
         "master_detail" => (" NOT NULL", "CASCADE"),
         _ => ("", on_delete_clause(&r.on_delete)),
     };
+    // The FK is TENANT-SCOPED — (tenant_id, col) → target (tenant_id, id).
+    // A bare id FK is validated by Postgres RI triggers which BYPASS row-level
+    // security, so they would happily accept another tenant's record id and
+    // store a durable cross-tenant reference (and a foreign delete cascade
+    // would reach into this tenant's rows). Scoping by tenant_id makes the
+    // reference structurally in-tenant.
+    let defer = if deferrable {
+        " DEFERRABLE INITIALLY DEFERRED"
+    } else {
+        ""
+    };
     let mut out = vec![
-        format!("ALTER TABLE biz.{table} ADD COLUMN {col} UUID{nullspec}"),
+        format!("ALTER TABLE biz.{table} ADD COLUMN IF NOT EXISTS {col} UUID{nullspec}"),
+        format!("ALTER TABLE biz.{table} DROP CONSTRAINT IF EXISTS {table}_{col}_fk"),
         format!(
             "ALTER TABLE biz.{table} ADD CONSTRAINT {table}_{col}_fk \
-             FOREIGN KEY ({col}) REFERENCES biz.{target_table} (id) ON DELETE {ondel}"
+             FOREIGN KEY (tenant_id, {col}) REFERENCES biz.{target_table} (tenant_id, id) \
+             ON DELETE {ondel}{defer}"
         ),
-        format!("CREATE INDEX IF NOT EXISTS {table}_{col}_idx ON biz.{table} ({col})"),
+        format!("CREATE INDEX IF NOT EXISTS {table}_{col}_idx ON biz.{table} (tenant_id, {col})"),
     ];
     // mirror the FK column to the archive table (see add_field).
     out.push(format!(
