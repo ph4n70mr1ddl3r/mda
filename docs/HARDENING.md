@@ -285,6 +285,44 @@ reference resolver no longer `unwrap()`s the target lookup — it resolves null
 (`crates/mda-api/src/graphql.rs`) instead of panicking on out-of-gate model
 state.
 
+## Sixth pass (2026-08-22): review — non-superuser migration role + webhook receiver
+
+### `mda.lookup_webhook` returned nothing on non-superuser deployments (high)
+
+The inbound receiver resolves `(tenant_id, secret_ref)` via the SECURITY DEFINER
+function `mda.lookup_webhook` (`20260122000001`), whose comment assumed "the
+migration role … bypasses RLS". That holds only when the migration role is a
+SUPERUSER: migration `20260123000001` put `int.webhook` under ENABLE **and
+FORCE** RLS, and under FORCE the table OWNER is subject to the policies too.
+The lookup runs with no `app.tenant_id` GUC, so on any deployment whose
+migrations run as a non-superuser owner — every managed Postgres (RDS, Cloud
+SQL; they never grant superuser) — it saw zero rows and **every inbound webhook
+was rejected with 404** while tests (superuser owner) stayed green. Fixed by
+`20260137000001`: FORCE is dropped on `int.webhook` only. Tenant isolation is
+unaffected — RLS stays ENABLED and every non-owner role (`mda_app` included)
+remains fully subject to `tenant_isolation`; only the owner context, i.e.
+exactly that one SECURITY DEFINER lookup, crosses tenants. Audited the whole
+codebase for the same class: `lookup_webhook` was the only SECURITY DEFINER
+function, and every other `int.*` reader sets the tenant GUC first
+(`flow_for_webhook`, `flow_by_id`, the outbound relay's per-event transaction).
+Regression test: `webhook_to_inbound_flow_materializes_via_drain`, which now
+also passes under a non-CREATEROLE, non-superuser migration role.
+
+### Unconditional `GRANT … TO mda_app` broke restricted fresh installs (medium)
+
+Migration `20260111000001` deliberately treats `mda_app` as optional — skipped
+where the migrating role lacks CREATEROLE — and every later migration guards
+its grants with `IF EXISTS` … except `20260122000001`'s bare `GRANT EXECUTE ON
+FUNCTION mda.lookup_webhook TO mda_app`, which hard-failed the entire chain
+wherever the role legitimately does not exist. Editing an applied migration is
+not possible (sqlx checksum validation fails startup on every healthy existing
+database), so `20260137000001` re-issues the grant guarded + idempotently.
+**Operational consequence:** a *fresh* install whose migration role cannot
+create roles must have `mda_app` pre-created before first boot — release
+deployments require the role anyway (`MDA_APP_DATABASE_URL`), so this only
+bites debug-mode boots against managed Postgres, and it fails loudly with
+`role "mda_app" does not exist` rather than silently.
+
 ## Verifying a deployment yourself
 
 ```bash

@@ -650,7 +650,10 @@ async fn inbound(
 ) -> ApiResult<StatusCode> {
     // Resolve the webhook + its tenant + secret via the SECURITY DEFINER lookup
     // (the receiver is edge-unauthenticated; int.webhook is RLS-gated, so a
-    // tenant-less SELECT would see nothing under FORCE RLS).
+    // tenant-less SELECT would see nothing under RLS). FORCE RLS was dropped on
+    // int.webhook (migration 20260137000001): under FORCE even the non-superuser
+    // function owner is subject to the policies and would see zero rows — every
+    // managed-Postgres deployment 404'd here. Non-owner roles stay isolated.
     let row: Option<(Uuid, String)> =
         sqlx::query_as("SELECT tenant_id, secret_ref FROM mda.lookup_webhook($1)")
             .bind(id)

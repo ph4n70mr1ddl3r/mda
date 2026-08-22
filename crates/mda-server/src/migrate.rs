@@ -28,6 +28,46 @@ pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     .execute(pool)
     .await
     .ok();
+
+    // Fail fast — with an actionable message — on the one topology where the
+    // migration chain cannot succeed: a migrating role that can neither create
+    // the optional `mda_app` role nor rely on it existing, facing migration
+    // 20260122000001's unconditional `GRANT … TO mda_app` (see
+    // docs/HARDENING.md, sixth pass). Without this the operator gets a bare
+    // sqlx "role \"mda_app\" does not exist" buried mid-chain.
+    let has_app_role: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'mda_app')")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+    if !has_app_role {
+        let createrole: bool = sqlx::query_scalar(
+            "SELECT COALESCE(bool(rolcreaterole), false) FROM pg_roles WHERE rolname = current_user",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+        if !createrole {
+            // A missing row means the table (or DB) is fresh → still pending.
+            let already_applied: Option<i64> = sqlx::query_scalar(
+                "SELECT version FROM _sqlx_migrations WHERE version = 20260122000001",
+            )
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            if already_applied.is_none() {
+                anyhow::bail!(
+                    "cannot run first-boot migrations: the connecting role lacks CREATEROLE \
+                     and the optional 'mda_app' role does not exist, but migration \
+                     20260122000001 grants EXECUTE to it unconditionally. Fix: pre-create the \
+                     'mda_app' role (release deployments need it anyway — see \
+                     MDA_APP_DATABASE_URL in .env.example and docs/HARDENING.md), or grant \
+                     CREATEROLE to the migrating role."
+                );
+            }
+        }
+    }
     // Path is relative to this crate's `Cargo.toml` (CARGO_MANIFEST_DIR),
     // i.e. `crates/mda-server` → workspace root `migrations/`.
     sqlx::migrate!("../../migrations")
