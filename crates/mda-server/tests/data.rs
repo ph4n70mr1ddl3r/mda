@@ -3959,6 +3959,7 @@ async fn explicit_null_clears_field_and_rules_can_clear() {
         None,
     )
     .await;
+    assert_eq!(st, StatusCode::OK);
     assert!(v.get("tier").is_none(), "cleared field stays cleared: {v}");
 }
 
