@@ -208,8 +208,11 @@ pub fn add_field(table: &str, f: &DraftField) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let st = sql_type(&f.field_type, &f.config)?;
     if f.is_unique {
+        // IF NOT EXISTS keeps un-retire idempotent: a retired field's column
+        // still exists (retire keeps data, §5.8 two-phase), so re-activating
+        // the field must not collide on ADD COLUMN.
         out.push(format!(
-            "ALTER TABLE biz.{table} ADD COLUMN {} {st} GENERATED ALWAYS AS ({}) STORED",
+            "ALTER TABLE biz.{table} ADD COLUMN IF NOT EXISTS {} {st} GENERATED ALWAYS AS ({}) STORED",
             f.name,
             gen_expr(&f.name, &st)
         ));
@@ -239,6 +242,43 @@ pub fn add_field(table: &str, f: &DraftField) -> Result<Vec<String>> {
         "ALTER TABLE biz_archive.{table} ADD COLUMN IF NOT EXISTS {} {st}",
         f.name
     ));
+    Ok(out)
+}
+
+/// CREATE TABLE for a many-to-many join table (§5.7 "materialized as a real
+/// join table … with a composite PK and FKs to both sides — real constraints,
+/// real integrity"): composite PK (tenant, a, b), tenant-scoped FKs to BOTH
+/// sides with ON DELETE CASCADE (deleting either endpoint removes the link,
+/// not the other side's row), a reverse-lookup index, and the same forced-RLS
+/// tenant isolation as every `biz.*` table.
+pub fn create_join_table(join: &str, a_table: &str, b_table: &str) -> Result<Vec<String>> {
+    guard_ident("join table", join)?;
+    guard_ident("table", a_table)?;
+    guard_ident("table", b_table)?;
+    let (a_col, b_col) = (format!("{a_table}_id"), format!("{b_table}_id"));
+    let mut out = vec![format!(
+        "CREATE TABLE IF NOT EXISTS biz.{join} (\n  \
+           tenant_id UUID NOT NULL,\n  \
+           {a_col} UUID NOT NULL,\n  \
+           {b_col} UUID NOT NULL,\n  \
+           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n  \
+           PRIMARY KEY (tenant_id, {a_col}, {b_col})\n)"
+    )];
+    for (col, target) in [(a_col.clone(), a_table), (b_col.clone(), b_table)] {
+        out.push(format!(
+            "ALTER TABLE biz.{join} DROP CONSTRAINT IF EXISTS {join}_{col}_fk"
+        ));
+        out.push(format!(
+            "ALTER TABLE biz.{join} ADD CONSTRAINT {join}_{col}_fk \
+             FOREIGN KEY (tenant_id, {col}) REFERENCES biz.{target} (tenant_id, id) \
+             ON DELETE CASCADE"
+        ));
+    }
+    // reverse lookup (the PK already serves a→b)
+    out.push(format!(
+        "CREATE INDEX IF NOT EXISTS {join}_rev_idx ON biz.{join} (tenant_id, {b_col}, {a_col})"
+    ));
+    out.extend(rls_stmts("biz", join));
     Ok(out)
 }
 

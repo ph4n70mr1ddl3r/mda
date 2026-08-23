@@ -1026,6 +1026,396 @@ async fn import_dry_run_writes_nothing() {
     assert_eq!(res["total"], 0);
 }
 
+/// §5.13 key contract + dry-run completeness:
+/// - update/upsert by a NON-unique key is rejected up front (it would match an
+///   arbitrary row), while a unique key still works;
+/// - duplicate keys inside one batch are per-row validation errors;
+/// - dry-run reports unique-value conflicts (against existing rows AND within
+///   the batch) and FK references to non-existent records — the same
+///   invariants the write path enforces, surfaced before anything writes.
+#[tokio::test]
+async fn import_validates_key_and_dry_run_constraints() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // non-unique key rejected: city is a plain field
+    let (st, res) = call(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?mode=upsert&key=city",
+        &ctx.token,
+        Some(json!([{"name":"A","email":"a@x.com","city":"Oslo"}]).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{res}");
+    assert!(res.to_string().contains("must be unique"), "{res}");
+
+    // seed one record so a duplicate-key + unique-conflict batch has state
+    let _ = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Contact",
+        &ctx.token,
+        Some(json!({"name":"Ada","email":"ada@x.com"}).to_string()),
+        None,
+    )
+    .await;
+
+    // dry-run (upsert by email): row 0 fine; row 1 duplicates row 0's key
+    // within the batch (a per-row error). NOTE row 2 (ada@x.com, the existing
+    // record's email) is NOT an error here — in upsert mode the key's match IS
+    // the update target (would_update counts it).
+    let (st, res) = call(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?mode=upsert&key=email&dry_run=true",
+        &ctx.token,
+        Some(
+            json!([
+                {"name":"New","email":"new@x.com"},
+                {"name":"Dup","email":"new@x.com"},
+                {"name":"Ada2","email":"ada@x.com"}
+            ])
+            .to_string(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    let errs = res["errors"].as_array().unwrap();
+    assert_eq!(
+        errs.len(),
+        1,
+        "only the in-batch duplicate key errors: {res}"
+    );
+    assert!(
+        errs[0]["error"].to_string().contains("duplicate key"),
+        "in-batch duplicate key: {res}"
+    );
+    assert_eq!(
+        res["would_update"], 1,
+        "existing key match is the update target: {res}"
+    );
+    assert_eq!(res["created"], 0, "dry-run writes nothing: {res}");
+
+    // create mode: the existing ada@x.com IS a conflict (every unique value
+    // must be free), and a value duplicated WITHIN the batch is too.
+    let (st, res) = call(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?dry_run=true",
+        &ctx.token,
+        Some(
+            json!([
+                {"name":"Ada2","email":"ada@x.com"},
+                {"name":"Twin","email":"twin@x.com"},
+                {"name":"Twin2","email":"twin@x.com"}
+            ])
+            .to_string(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    let errs = res["errors"].as_array().unwrap();
+    assert_eq!(
+        errs.len(),
+        2,
+        "existing conflict + in-batch duplicate: {res}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e["error"].to_string().contains("already exists")),
+        "existing unique conflict: {res}"
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e["error"].to_string().contains("within the batch")),
+        "in-batch unique duplicate: {res}"
+    );
+
+    // FK existence: extend the ACTIVE model with Deal → Contact (a reference),
+    // then import a Deal whose reference points nowhere.
+    let (_, active) = call(&ctx.app, "GET", "/api/studio/model", &ctx.token, None, None).await;
+    let contact_id = active["entities"][0]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let mut model = active.clone();
+    model["entities"].as_array_mut().unwrap().push(json!({
+        "id": Uuid::new_v4(), "module_id": null, "name": "Deal",
+        "table_name": format!("deal_{0}", Uuid::new_v4().simple()), "label": "Deal", "description": null,
+        "fields": [{"id": Uuid::new_v4(), "name":"note","label":"Note","field_type":"string","required":true,"is_unique":false,"is_indexed":false,"default_expr":null,"config":{}}],
+        "relationships": [{"id": Uuid::new_v4(), "source_field_name":"ref_contact_id","target_entity_id": contact_id,"cardinality":"many_to_one","strength":"lookup","on_delete":"set_null","required":false,"reference_qualifier":null,"rollup_summary":null}]
+    }));
+    publish(&ctx, model).await;
+    let bogus = Uuid::new_v4();
+    let (st, res) = call(
+        &ctx.app,
+        "POST",
+        "/api/impex/Deal/import?dry_run=true",
+        &ctx.token,
+        Some(json!([{"note":"n","ref_contact_id": bogus.to_string()}]).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    assert!(
+        res["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["error"].to_string().contains("does not exist")),
+        "FK existence reported at dry-run: {res}"
+    );
+}
+
+/// §5.13 all-or-nothing is REAL atomicity: `on_error=abort` runs the whole
+/// batch in ONE transaction, so a failure that only surfaces at write time
+/// (here: a set-field rule whose value expression divides by zero on the
+/// second row) rolls back the first row too — pre-fix the first row stayed
+/// committed and the loop continued.
+#[tokio::test]
+async fn import_abort_rolls_back_midwrite_failure() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(
+        &ctx,
+        keyed_model(&format!("imp_{0}", Uuid::new_v4().simple())),
+    )
+    .await;
+
+    // rule: when name = "Poison", set city = 1/0 → the write errors mid-txn
+    // (validation cannot see it: it is engine logic, not declarative shape).
+    {
+        let mut tx = ctx.pool.begin().await.unwrap();
+        mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+        sqlx::query(
+            "INSERT INTO meta.md_rule (tenant_id, entity, event, condition, action_type, action_field, action_value)
+             VALUES ($1,'Contact','after_create',
+                '{\"op\":\"Cmp\",\"kind\":\"eq\",\"lhs\":{\"op\":\"Field\",\"name\":\"name\"},\"rhs\":{\"op\":\"Lit\",\"value\":\"Poison\"}}'::jsonb,
+                'set_field','city','{\"op\":\"Arith\",\"kind\":\"div\",\"lhs\":{\"op\":\"Lit\",\"value\":1},\"rhs\":{\"op\":\"Lit\",\"value\":0}}'::jsonb)",
+        )
+        .bind(ctx.tenant)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let (st, res) = call(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?on_error=abort",
+        &ctx.token,
+        Some(
+            json!([
+                {"name":"Good","email":"good@x.com","city":"Here"},
+                {"name":"Poison","email":"poison@x.com","city":"There"}
+            ])
+            .to_string(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    assert_eq!(res["created"], 0, "abort must leave nothing written: {res}");
+    assert_eq!(res["updated"], 0, "{res}");
+    assert!(
+        res["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["error"].to_string().contains("aborted")),
+        "the mid-write failure is reported: {res}"
+    );
+
+    // the GOOD row was rolled back with the batch (pre-fix: it stayed)
+    let (_st, list) = call(&ctx.app, "GET", "/api/data/Contact", &ctx.token, None, None).await;
+    assert_eq!(
+        list["total"], 0,
+        "all-or-nothing: the first row must not survive: {list}"
+    );
+
+    // and the same import under `continue` keeps the good row
+    let (st, res) = call(
+        &ctx.app,
+        "POST",
+        "/api/impex/Contact/import?on_error=continue",
+        &ctx.token,
+        Some(
+            json!([
+                {"name":"Good","email":"good@x.com","city":"Here"},
+                {"name":"Poison","email":"poison@x.com","city":"There"}
+            ])
+            .to_string(),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{res}");
+    assert_eq!(res["created"], 1, "best-effort keeps valid rows: {res}");
+    let (_st, list) = call(&ctx.app, "GET", "/api/data/Contact", &ctx.token, None, None).await;
+    assert_eq!(list["total"], 1, "{list}");
+}
+
+/// §5.11 grain-4 / §5.17: a field under FLS `none` must not be usable as a
+/// list filter, sort, export filter, or mass-action filter — honoring it is a
+/// value oracle (match/no-match leaks the hidden value). Pre-fix every query
+/// surface accepted filters on hidden fields.
+#[tokio::test]
+async fn fls_none_field_rejected_in_filter_and_sort_positions() {
+    let ctx = match setup().await {
+        Some(c) => c,
+        None => return,
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, rec) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"Acme","email":"fls@x.com","tier":"Gold"}).to_string()),
+        None,
+    )
+    .await;
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // reader: object read on Customer + a role with FLS `none` on `tier`
+    let (fls_token, fls_user) = limited_user(&ctx, &[("Customer", "read")]).await;
+    {
+        let mut tx = ctx.pool.begin().await.unwrap();
+        mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+        let (role_id,): (Uuid,) = sqlx::query_as(
+            "INSERT INTO sec.sec_role (tenant_id, name) VALUES ($1,$2) RETURNING id",
+        )
+        .bind(ctx.tenant)
+        .bind(format!("fls_filter_{0}", Uuid::new_v4().simple()))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sec.sec_permission (role_id, entity, verb) VALUES ($1,'Customer','read')",
+        )
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sec.sec_field_permission (role_id, entity, field, access)
+             VALUES ($1,'Customer','tier','none')",
+        )
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO sec.sec_role_assignment (user_id, role_id) VALUES ($1,$2)")
+            .bind(fls_user)
+            .bind(role_id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        // share the record so the reader genuinely has record access (the
+        // positive control must be a real 200, not a scope-driven 200/0-rows)
+        sqlx::query(
+            "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access)
+             VALUES ($1,'Customer',$2,$3,'read')",
+        )
+        .bind(ctx.tenant)
+        .bind(id.parse::<Uuid>().unwrap())
+        .bind(fls_user)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    // filtering by the hidden field: 403 naming it (never a value oracle)
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=tier:eq:Gold",
+        &fls_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert!(v.to_string().contains("tier"), "{v}");
+
+    // sorting by the hidden field: 403
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?sort=-tier",
+        &fls_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+    // export filter by the hidden field: 403
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/impex/Customer/export?filter=tier:eq:Gold",
+        &fls_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+    // mass-action filter by the hidden field: 403
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer/mass-delete",
+        &fls_token,
+        Some(json!({"filter": ["tier:eq:Gold"], "dry_run": true}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+    // positive controls: the same user may filter/sort by a VISIBLE field
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=name:eq:Acme&sort=-name",
+        &fls_token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+    // and the admin (no FLS restriction) may filter by tier
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=tier:eq:Gold",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["total"], 1, "{v}");
+}
+
 #[tokio::test]
 async fn import_upsert_by_key_creates_and_updates() {
     let ctx = match setup().await {
@@ -3877,11 +4267,53 @@ async fn typed_filters_and_sort_are_valid_sql() {
         "like on a numeric field is a 422"
     );
 
-    // ordered comparison on a text field stays rejected.
+    // like on non-text CORE columns is a 422, not a DB 'operator does not
+    // exist' 500 (version ILIKE $n::bigint / created_at ILIKE $n::timestamptz).
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=version:like:x",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "like on version is a 422"
+    );
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=created_at:like:x",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "like on created_at is a 422"
+    );
+
+    // ordered comparison on a text field stays rejected — including `state`,
+    // matching the report compiler's typed-filter rules.
     let (st, _) = call(
         &ctx.app,
         "GET",
         "/api/data/Customer?filter=name:gt:A",
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    let (st, _) = call(
+        &ctx.app,
+        "GET",
+        "/api/data/Customer?filter=state:gt:active",
         &ctx.token,
         None,
         None,
@@ -3964,6 +4396,90 @@ async fn explicit_null_clears_field_and_rules_can_clear() {
 }
 
 #[tokio::test]
+async fn null_on_required_field_is_rejected_not_cleared() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+    publish(&ctx, customer_model()).await;
+    let (_, r) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name":"keep","email":"req@x.com"}).to_string()),
+        None,
+    )
+    .await;
+    let id = r["id"].as_str().unwrap().to_string();
+    let ver = r["version"].as_i64().unwrap();
+
+    // create with an explicit null on a required field is a validation error
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/data/Customer",
+        &ctx.token,
+        Some(json!({"name": null, "email":"null-create@x.com"}).to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert!(
+        v.to_string().contains("mda.required"),
+        "create null-on-required must carry the per-field code: {v}"
+    );
+
+    // PATCH clearing a required field must be rejected — the update path's
+    // null-clears branch (optional fields) must never remove a required value.
+    let (st, v) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"name": null}).to_string()),
+        Some(ver),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert!(
+        v.to_string().contains("mda.required"),
+        "PATCH null-on-required must carry the per-field code: {v}"
+    );
+
+    // the record is untouched: value intact and version NOT bumped (the write
+    // aborted), so the same expected-version still patches cleanly afterwards.
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(
+        v["name"], "keep",
+        "rejected clear must not alter the record: {v}"
+    );
+    assert_eq!(
+        v["version"], ver,
+        "rejected clear must not bump the version: {v}"
+    );
+    let (st, v) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/data/Customer/{id}"),
+        &ctx.token,
+        Some(json!({"name":"renamed"}).to_string()),
+        Some(ver),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["name"], "renamed");
+}
+
+#[tokio::test]
 async fn decimal_precision_and_datetime_normalization() {
     let Some(ctx) = setup().await else {
         return;
@@ -4009,7 +4525,7 @@ async fn decimal_precision_and_datetime_normalization() {
         "datetime stored as normalized UTC: {r}"
     );
     // the eq filter matches the same instant in a different rendering
-    let (_st, v) = call(
+    let (st, v) = call(
         &ctx.app,
         "GET",
         "/api/data/Customer?filter=due:eq:2026-01-02T04:00:00Z",

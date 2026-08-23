@@ -95,6 +95,7 @@ async fn list_records(
     let def = entity_def(&st, user.tenant_id, &entity).await?;
     let scope = scope_for(&st, &user, &entity).await?;
     let params = parse_list_params(q)?;
+    assert_filter_readable(&user, &entity, &def, &params)?;
     let mut res = mda_data::list(&st.pool, user.tenant_id, &def, &params, &scope).await?;
     for item in res.items.iter_mut() {
         *item = project(&user, &entity, &def, item.clone());
@@ -125,20 +126,40 @@ pub(crate) async fn create_record_service(
 ) -> ApiResult<Value> {
     authorize(user, entity, "create")?;
     let def = entity_def(st, user.tenant_id, entity).await?;
-    let mut ctx = into_object(body)?;
+    let ctx = into_object(body)?;
     assert_writable(user, entity, &def, &ctx)?;
-    // Phase 4: fire set-field rules + calculated fields (synchronous, in-write).
-    let reg = mda_rules::Registry::new();
     let rules = mda_rules::load_active(&st.pool, user.tenant_id, entity).await?;
-    mda_rules::fire(&rules, "after_create", &mut ctx, &reg)?;
-    mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
 
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
-    let rec = mda_data::crud::create_tx(&mut tx, user.tenant_id, &def, ctx, user.user_id).await?;
+    let rec = create_record_in_tx(&mut tx, user, entity, &def, &rules, ctx).await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(project(user, entity, &def, rec))
+}
+
+/// The in-transaction core of a create (rules + calculated fields + data
+/// write + audit/event rows) — the caller owns the transaction (§5.9.3 unit
+/// of work) and has already run AuthZ/FLS. The bulk importer runs many of
+/// these inside ONE transaction so `on_error=abort` is genuinely
+/// all-or-nothing (§5.13); rules fire INSIDE so an imported row is
+/// indistinguishable from a hand-typed write.
+pub(crate) async fn create_record_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user: &Identity,
+    entity: &str,
+    def: &EntityDefinition,
+    rules: &[mda_rules::Rule],
+    ctx: Map<String, Value>,
+) -> ApiResult<Value> {
+    let mut ctx = ctx;
+    // Phase 4: fire set-field rules + calculated fields (synchronous, in-write).
+    let reg = mda_rules::Registry::new();
+    mda_rules::fire(rules, "after_create", &mut ctx, &reg)?;
+    mda_rules::compute_calculated(def, &mut ctx, &reg)?;
+    let rec = mda_data::crud::create_tx(tx, user.tenant_id, def, ctx, user.user_id).await?;
     let rid = rec["id"].as_str().unwrap_or("").parse::<Uuid>().ok();
     write_logs_checked(
-        &mut tx,
+        tx,
         user.tenant_id,
         user.user_id,
         entity,
@@ -148,8 +169,7 @@ pub(crate) async fn create_record_service(
         Some(rec.clone()),
     )
     .await?;
-    tx.commit().await.map_err(Error::internal)?;
-    Ok(project(user, entity, &def, rec))
+    Ok(rec)
 }
 
 async fn read_record(
@@ -191,20 +211,60 @@ pub(crate) async fn update_record_service(
 ) -> ApiResult<Value> {
     authorize(user, entity, "update")?;
     let def = entity_def(st, user.tenant_id, entity).await?;
-    let mut ctx = into_object(body)?;
+    let ctx = into_object(body)?;
     assert_writable(user, entity, &def, &ctx)?;
     let scope = scope_for(st, user, entity).await?;
-    let reg = mda_rules::Registry::new();
     let rules = mda_rules::load_active(&st.pool, user.tenant_id, entity).await?;
 
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+    let after = update_record_in_tx(
+        &mut tx,
+        &RecordWriteCtx {
+            user,
+            entity,
+            def: &def,
+        },
+        &scope,
+        &rules,
+        id,
+        expected_version,
+        ctx,
+    )
+    .await?;
+    tx.commit().await.map_err(Error::internal)?;
+    Ok(project(user, entity, &def, after))
+}
+
+/// Bundles the per-request context the in-transaction write cores need, so
+/// the cores stay under clippy's argument budget when reused by the bulk
+/// importer.
+pub(crate) struct RecordWriteCtx<'a> {
+    pub user: &'a Identity,
+    pub entity: &'a str,
+    pub def: &'a EntityDefinition,
+}
+
+/// The in-transaction core of an update (before-image + rules + OCC write +
+/// audit/event rows) — the caller owns the transaction. Rules are passed in
+/// (preloaded once) so a bulk import of N rows loads them once, not N times.
+pub(crate) async fn update_record_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    w: &RecordWriteCtx<'_>,
+    scope: &RecordScope,
+    rules: &[mda_rules::Rule],
+    id: Uuid,
+    expected_version: i64,
+    body: Map<String, Value>,
+) -> ApiResult<Value> {
+    let (user, entity, def) = (w.user, w.entity, w.def);
+    let mut ctx = body;
     // before-image for audit + condition context (existing merged with the
     // patch), read on the write transaction.
     let before = mda_data::crud::read_tx(
-        &mut tx,
+        tx,
         user.tenant_id,
-        &def,
+        def,
         id,
         &RecordScope::superuser(user.user_id),
     )
@@ -224,21 +284,22 @@ pub(crate) async fn update_record_service(
         }
     }
     // Phase 4: fire set-field rules + calculated fields.
-    mda_rules::fire(&rules, "after_update", &mut ctx, &reg)?;
-    mda_rules::compute_calculated(&def, &mut ctx, &reg)?;
+    let reg = mda_rules::Registry::new();
+    mda_rules::fire(rules, "after_update", &mut ctx, &reg)?;
+    mda_rules::compute_calculated(def, &mut ctx, &reg)?;
     let after = mda_data::crud::update_tx(
-        &mut tx,
+        tx,
         user.tenant_id,
-        &def,
+        def,
         id,
         expected_version,
         ctx,
-        &scope,
+        scope,
         None,
     )
     .await?;
     write_logs_checked(
-        &mut tx,
+        tx,
         user.tenant_id,
         user.user_id,
         entity,
@@ -248,8 +309,7 @@ pub(crate) async fn update_record_service(
         Some(after.clone()),
     )
     .await?;
-    tx.commit().await.map_err(Error::internal)?;
-    Ok(project(user, entity, &def, after))
+    Ok(after)
 }
 
 // ===== restore from archive (ADR-0006 / ADR-0015) =====
@@ -419,6 +479,7 @@ async fn mass_targets(
         page: 1,
         page_size: 0,
     };
+    assert_filter_readable(user, entity, &def, &params)?;
     let cap = limit.unwrap_or(MAX_MASS_BATCH).clamp(1, MAX_MASS_BATCH);
     Ok(mda_data::mass_target_ids(&st.pool, user.tenant_id, &def, &params, &scope, cap).await?)
 }
@@ -537,6 +598,48 @@ async fn mass_delete_record(
 pub(crate) fn authorize(id: &Identity, entity: &str, verb: &str) -> ApiResult<()> {
     if !id.can(entity, verb) {
         return Err(Error::Forbidden(format!("missing {verb} on {entity}")).into());
+    }
+    Ok(())
+}
+
+/// §5.11 grain-4 / §5.17 semantic-position rule, applied to the data API's
+/// own query surfaces (list filters/sort, exports, mass-action filters): a
+/// field the caller holds FLS `none` on must not appear in a filter or sort.
+/// Honoring it is a value oracle (match/no-match leaks the hidden value);
+/// silently dropping it changes what the query returns. Same rule the report
+/// engine applies to filter/group/order positions.
+pub(crate) fn assert_filter_readable(
+    id: &Identity,
+    entity: &str,
+    def: &EntityDefinition,
+    params: &ListParams,
+) -> ApiResult<()> {
+    const CORE: [&str; 6] = [
+        "id",
+        "owner_id",
+        "state",
+        "version",
+        "created_at",
+        "updated_at",
+    ];
+    let names = params
+        .filters
+        .iter()
+        .map(|f| f.field.as_str())
+        .chain(params.sort.iter().map(|s| s.field.as_str()));
+    for n in names {
+        if CORE.contains(&n) {
+            continue; // core columns are not FLS-governed
+        }
+        let governed = def.fields.iter().any(|f| f.name == n)
+            || def.relationships.iter().any(|r| r.source_field_name == n);
+        if governed && id.field_access(entity, n) == Access::None {
+            return Err(Error::Forbidden(format!(
+                "no read access to field {n} — cannot filter or sort by it"
+            ))
+            .into());
+        }
+        // unknown names fall through: the query builder rejects them (400)
     }
     Ok(())
 }
@@ -803,7 +906,9 @@ async fn import_records(
         _ => unreachable!(),
     }
 
-    // Key field is required for update/upsert and must name a known column.
+    // Key field is required for update/upsert, must name a known column, and
+    // — per §5.13 "must be unique" — must be `id` or a unique field. Matching
+    // by a non-unique key silently targets an arbitrary first row.
     let key = q.key.clone();
     if mode != "create" {
         let k = key
@@ -812,6 +917,12 @@ async fn import_records(
         if !key_is_known(&def, k) {
             return Err(Error::Invalid(format!(
                 "key field '{k}' is not a known field of {entity}"
+            ))
+            .into());
+        }
+        if k != "id" && !def.fields.iter().any(|f| f.name == k && f.is_unique) {
+            return Err(Error::Invalid(format!(
+                "key field '{k}' must be unique (or use `id`) — a non-unique key matches an arbitrary row"
             ))
             .into());
         }
@@ -888,6 +999,7 @@ async fn import_records(
     }
 
     // ---- validation pass: per-row field-write AuthZ + record validation +
+    // uniqueness/FK-existence checks (§5.13: the dry-run report covers them) +
     // (update/upsert) key resolution. Nothing is written here. ----
     struct Planned {
         index: usize,
@@ -895,6 +1007,24 @@ async fn import_records(
         target: Option<(Uuid, i64)>, // Some for an existing record (update)
         errors: Vec<Value>,
     }
+    // relationship column → target table (for FK-existence checks)
+    let mut fk_targets: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for r in &def.relationships {
+        let tdef =
+            mda_meta::loader::load_entity_definition(&st.pool, user.tenant_id, r.target_entity_id)
+                .await
+                .map_err(Error::internal)?;
+        fk_targets.insert(r.source_field_name.clone(), tdef.entity.table_name.clone());
+    }
+    // batch-internal key duplication: two rows matching the same key would
+    // both write the same target (or double-create); the later row errors.
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // batch-internal unique-value duplication (create mode): the second row
+    // would hit the unique constraint at write time; surface it at validation.
+    let mut seen_unique: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
     let mut planned: Vec<Planned> = Vec::with_capacity(rows.len());
     for (i, raw) in rows.into_iter().enumerate() {
         let mut errors: Vec<Value> = Vec::new();
@@ -910,6 +1040,40 @@ async fn import_records(
         // write path runs, so dry-run reflects what commit would reject.
         if let Err(e) = mda_data::crud::validate_record(&def, &body) {
             errors.push(json!({"row": i, "error": e.to_string()}));
+        }
+
+        // Duplicate keys inside one batch: the second row targeting the same
+        // key would race the first (stale version) or double-apply.
+        if mode != "create" {
+            if let Some(kv) = raw
+                .get(key.as_deref().unwrap())
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+            {
+                if !seen_keys.insert(kv.clone()) {
+                    errors.push(json!({
+                        "row": i,
+                        "error": format!(
+                            "duplicate key '{}' in batch — each row must match a distinct record",
+                            kv
+                        )
+                    }));
+                }
+            }
+        }
+
+        // §5.13 dry-run completeness: unique-value conflicts (vs existing rows
+        // and vs this batch) and FK target existence — the same DB-enforced
+        // invariants the write would hit, reported before anything writes.
+        // The row's own update target legitimately holds its current unique
+        // values, so the existing-row check runs after (and excludes) it.
+        for (col, target_table) in &fk_targets {
+            if let Some(v) = body.get(col).filter(|v| !v.is_null()) {
+                let id = v.as_str().unwrap_or_default();
+                if let Err(e) = fk_target_exists(&st.pool, user.tenant_id, target_table, id).await {
+                    errors.push(json!({"row": i, "error": e.to_string()}));
+                }
+            }
         }
 
         // Resolve the target record for update/upsert (write-scoped: a user can
@@ -947,6 +1111,35 @@ async fn import_records(
             }
         };
 
+        for f in def.fields.iter().filter(|f| f.is_unique) {
+            if let Some(v) = body.get(&f.name).filter(|v| !v.is_null()) {
+                let text = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if Some(f.name.as_str()) != key.as_deref()
+                    && !seen_unique.insert((f.name.clone(), text.clone()))
+                {
+                    errors.push(json!({
+                        "row": i,
+                        "error": format!("duplicate value for unique field '{}' within the batch", f.name)
+                    }));
+                    continue;
+                }
+                // In create mode every unique value must be free; in
+                // update/upsert mode the row's matched target (and the key
+                // field's own match) is not a conflict — everything else is.
+                if mode == "create" || Some(f.name.as_str()) != key.as_deref() {
+                    let exclude = target.map(|(id, _)| id);
+                    if let Err(e) =
+                        unique_value_taken(&st.pool, user.tenant_id, &def, f, &text, exclude).await
+                    {
+                        errors.push(json!({"row": i, "error": e.to_string()}));
+                    }
+                }
+            }
+        }
+
         planned.push(Planned {
             index: i,
             body,
@@ -969,38 +1162,106 @@ async fn import_records(
     let mut created = 0u64;
     let mut updated = 0u64;
 
-    // Commit: never on dry_run; under `abort`, only if the validation pass was
-    // fully clean (validate-then-commit ⇒ all-or-nothing).
+    // Commit (§5.13): never on dry_run. `abort` = ONE transaction for the
+    // whole batch — a mid-write failure (e.g. a unique race the validation
+    // pass could not see) rolls back every row this import wrote; genuinely
+    // all-or-nothing, not just validate-then-commit. `continue` = best-effort
+    // in batched transactions (500 rows each, PLAN's "batched transactions")
+    // with a SAVEPOINT per row, so one bad row rolls back only itself.
     let do_write = !dry_run && (on_error == "continue" || validation_errors == 0);
     if do_write {
-        for p in &planned {
-            if !p.errors.is_empty() {
-                continue;
-            }
-            let res = match p.target {
-                Some((id, ver)) => update_record_service(
-                    &st,
-                    &user,
-                    &entity,
-                    id,
-                    ver,
-                    Value::Object(p.body.clone()),
-                )
-                .await
-                .map(|_| ()),
-                None => create_record_service(&st, &user, &entity, Value::Object(p.body.clone()))
-                    .await
-                    .map(|_| ()),
+        let rules = mda_rules::load_active(&st.pool, user.tenant_id, &entity).await?;
+        if on_error == "abort" {
+            let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+            mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+            let mut failure: Option<Value> = None;
+            let w = &RecordWriteCtx {
+                user: &user,
+                entity: &entity,
+                def: &def,
             };
-            match res {
-                Ok(()) => {
-                    if p.target.is_some() {
-                        updated += 1;
-                    } else {
-                        created += 1;
+            for p in &planned {
+                if !p.errors.is_empty() {
+                    continue;
+                }
+                if let Err(e) =
+                    import_write_row(&mut tx, w, &write_scope, &rules, p.target, p.body.clone())
+                        .await
+                {
+                    failure = Some(json!({
+                        "row": p.index,
+                        "error": format!("aborted (nothing written): {e}")
+                    }));
+                    break;
+                }
+                if p.target.is_some() {
+                    updated += 1;
+                } else {
+                    created += 1;
+                }
+            }
+            match failure {
+                Some(f) => {
+                    tx.rollback().await.map_err(Error::internal)?;
+                    errors.push(f);
+                    created = 0;
+                    updated = 0;
+                }
+                None => {
+                    tx.commit().await.map_err(Error::internal)?;
+                }
+            }
+        } else {
+            for batch in planned.chunks(500) {
+                let mut tx = st.pool.begin().await.map_err(Error::internal)?;
+                mda_security::set_tenant(&mut tx, user.tenant_id).await?;
+                let w = RecordWriteCtx {
+                    user: &user,
+                    entity: &entity,
+                    def: &def,
+                };
+                for (n, p) in batch.iter().enumerate() {
+                    if !p.errors.is_empty() {
+                        continue;
+                    }
+                    let sp = format!("impex_row_{n}");
+                    sqlx::query(&format!("SAVEPOINT {sp}"))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(Error::internal)?;
+                    match import_write_row(
+                        &mut tx,
+                        &w,
+                        &write_scope,
+                        &rules,
+                        p.target,
+                        p.body.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            sqlx::query(&format!("RELEASE SAVEPOINT {sp}"))
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(Error::internal)?;
+                            if p.target.is_some() {
+                                updated += 1;
+                            } else {
+                                created += 1;
+                            }
+                        }
+                        Err(e) => {
+                            // roll back ONLY this row's savepoint; the batch
+                            // transaction (and earlier rows) survive.
+                            sqlx::query(&format!("ROLLBACK TO SAVEPOINT {sp}"))
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(Error::internal)?;
+                            errors.push(json!({"row": p.index, "error": e.to_string()}));
+                        }
                     }
                 }
-                Err(e) => errors.push(json!({"row": p.index, "error": e.to_string()})),
+                tx.commit().await.map_err(Error::internal)?;
             }
         }
     }
@@ -1050,6 +1311,106 @@ fn strip_system_columns(m: &Map<String, Value>) -> Map<String, Value> {
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+/// One import row's write inside a caller-owned transaction (§5.13): the
+/// same in-tx cores the single-record services run, so an imported row is
+/// indistinguishable from a hand-typed REST write.
+async fn import_write_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    w: &RecordWriteCtx<'_>,
+    scope: &RecordScope,
+    rules: &[mda_rules::Rule],
+    target: Option<(Uuid, i64)>,
+    body: Map<String, Value>,
+) -> ApiResult<()> {
+    match target {
+        Some((id, ver)) => update_record_in_tx(tx, w, scope, rules, id, ver, body)
+            .await
+            .map(|_| ()),
+        None => create_record_in_tx(tx, w.user, w.entity, w.def, rules, body)
+            .await
+            .map(|_| ()),
+    }
+}
+
+/// §5.13 dry-run completeness: does `value` already exist for unique field `f`?
+/// Compares with the field's real type (numeric values compare numerically —
+/// '10' must conflict with '10.0'), mirroring the typed filter LHS.
+async fn unique_value_taken(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    def: &mda_meta::EntityDefinition,
+    f: &mda_meta::Field,
+    value: &str,
+    exclude: Option<Uuid>,
+) -> ApiResult<()> {
+    let numeric = matches!(
+        f.field_type.as_str(),
+        "integer" | "auto_number" | "decimal" | "money"
+    );
+    let lhs = if numeric {
+        format!("(attributes->>'{}')::numeric", f.name)
+    } else {
+        format!("(attributes->>'{}')", f.name)
+    };
+    let rhs_cast = if numeric { "::numeric" } else { "" };
+    let excl = exclude
+        .map(|id| format!(" AND id <> '{id}'"))
+        .unwrap_or_default();
+    let sql = format!(
+        "SELECT 1 FROM biz.{} WHERE tenant_id = $1 AND {lhs} = $2{rhs_cast}{excl} LIMIT 1",
+        def.entity.table_name
+    );
+    // biz.* is RLS-fail-closed: the check must run under the tenant GUC.
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    let taken: Option<(i32,)> = sqlx::query_as(&sql)
+        .bind(tenant)
+        .bind(value)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    if taken.is_some() {
+        Err(Error::Conflict(format!(
+            "a record with {} '{}' already exists",
+            f.name, value
+        ))
+        .into())
+    } else {
+        Ok(())
+    }
+}
+
+/// §5.13 dry-run completeness: does the referenced record exist (same tenant)?
+async fn fk_target_exists(
+    pool: &sqlx::PgPool,
+    tenant: Uuid,
+    target_table: &str,
+    id: &str,
+) -> ApiResult<()> {
+    let Ok(uuid) = Uuid::parse_str(id) else {
+        // shape errors are validate_record's job; skip here
+        return Ok(());
+    };
+    // biz.* is RLS-fail-closed: the check must run under the tenant GUC.
+    let mut tx = pool.begin().await.map_err(Error::internal)?;
+    mda_security::set_tenant(&mut tx, tenant).await?;
+    let exists: Option<(i32,)> = sqlx::query_as(&format!(
+        "SELECT 1 FROM biz.{target_table} WHERE tenant_id = $1 AND id = $2 LIMIT 1"
+    ))
+    .bind(tenant)
+    .bind(uuid)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+    tx.commit().await.map_err(Error::internal)?;
+    if exists.is_some() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!("referenced record '{id}' does not exist")).into())
+    }
 }
 
 /// Resolve an existing record by the import key under the caller's **write**
@@ -1143,6 +1504,7 @@ async fn export_records(
     let def = entity_def(&st, user.tenant_id, &entity).await?;
     let scope = scope_for(&st, &user, &entity).await?;
     let mut params = parse_list_params(q)?;
+    assert_filter_readable(&user, &entity, &def, &params)?;
     // stable pagination: order by id unless the caller picked a sort
     if params.sort.is_empty() {
         params.sort.push(mda_data::Sort {

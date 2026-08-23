@@ -52,6 +52,10 @@ pub struct Dataset {
     pub order_by: Vec<Sort>,
     #[serde(default)]
     pub limit: Option<u64>,
+    /// Pagination offset (§5.17 `limit / offset`). Clamped against the same
+    /// row cap as `limit`; absent = 0.
+    #[serde(default)]
+    pub offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
@@ -111,6 +115,9 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
 
     // ---- joins accumulated by reference traversals ----
     let mut joins: Vec<String> = Vec::new();
+    // (join alias, entity name) per hop, first-appearance order — the input to
+    // the per-hop record-security pass below (PLAN.md:701).
+    let mut hops: Vec<(String, String)> = Vec::new();
 
     // ---- select (jsonb_build_object pairs) + columns ----
     let mut pairs: Vec<String> = Vec::new();
@@ -137,11 +144,25 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         if !readable(identity, &r) {
             continue;
         }
-        merge_joins(&mut joins, &r);
+        merge_joins(&mut joins, &mut hops, &r);
         let expr = match f.aggregate.as_deref() {
             Some("count") => format!("count({})", r.sql),
             Some("sum") | Some("avg") => {
-                format!("{}({}::numeric)", f.aggregate.as_deref().unwrap(), r.sql)
+                // Aggregate over the field's REAL type: sum/avg over a text
+                // leaf is a runtime cast error (500) — reject at compile of
+                // the dataset instead, with a message naming the field.
+                if !matches!(
+                    r.leaf_type.as_deref(),
+                    Some("integer" | "auto_number" | "decimal" | "money")
+                ) {
+                    return Err(Error::Invalid(format!(
+                        "{} requires a numeric field ({} is {})",
+                        f.aggregate.as_deref().unwrap(),
+                        f.field,
+                        r.leaf_type.as_deref().unwrap_or("not a scalar field")
+                    )));
+                }
+                format!("{}(({})::numeric)", f.aggregate.as_deref().unwrap(), r.sql)
             }
             Some("min") | Some("max") => format!("{}({})", f.aggregate.as_deref().unwrap(), r.sql),
             Some(other) => return Err(Error::Invalid(format!("unknown aggregate {other}"))),
@@ -174,7 +195,7 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
     for g in &ds.group_by {
         let r = resolve_field(pool, identity.tenant_id, &def, g).await?;
         require_readable(identity, &r, "group_by")?;
-        merge_joins(&mut joins, &r);
+        merge_joins(&mut joins, &mut hops, &r);
         group_exprs.push(r.sql);
     }
 
@@ -183,7 +204,7 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
     for s in &ds.order_by {
         let r = resolve_field(pool, identity.tenant_id, &def, &s.field).await?;
         require_readable(identity, &r, "order_by")?;
-        merge_joins(&mut joins, &r);
+        merge_joins(&mut joins, &mut hops, &r);
         let d = if s.asc { "ASC" } else { "DESC" };
         order_parts.push(format!("{} {d}", r.sql));
     }
@@ -193,10 +214,54 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         order_parts.join(", ")
     };
 
-    // ---- WHERE: tenant + record scope + filters ----
-    let mut parts: Vec<String> = vec!["t.tenant_id = $1".into()];
+    // ---- pre-resolve filters (readability + hops) so their joins join the
+    // per-hop security pass below — a filter over a traversal (`customer.region`)
+    // must not escape per-hop record security by being resolved after it. ----
+    let mut filter_refs: Vec<FieldRef> = Vec::with_capacity(ds.filters.len());
+    for f in &ds.filters {
+        let r = resolve_field(pool, identity.tenant_id, &def, &f.field).await?;
+        require_readable(identity, &r, "filter")?;
+        merge_joins(&mut joins, &mut hops, &r);
+        filter_refs.push(r);
+    }
+
+    // ---- per-hop record security (PLAN.md:701 / ADR-0014): the runner's
+    // record-scope predicate applies at EVERY entity in the traversal, not
+    // only the base — object-grain read on a crossed entity is not enough; a
+    // join must never surface a row (or its fields) the runner could not read
+    // through the data API. The predicate is appended to each hop's JOIN ON
+    // clause with its row references rewritten to that hop's alias; a LEFT
+    // JOIN whose target fails the predicate yields NULL fields (the row is
+    // not leaked), matching the "applies regardless of join type" rule. ----
     let mut binds: Vec<RB> = vec![RB::Uuid(identity.tenant_id)];
     let mut n = 2usize;
+    for (alias, hop_entity) in &hops {
+        let owd = mda_security::resolve_owd(pool, identity.tenant_id, hop_entity).await?;
+        let hop_scope = RecordScope {
+            user_id: identity.user_id,
+            public_read: owd.allows_read_for_all(),
+            public_write: false,
+            bypass: identity.is_superuser,
+            team_owd: owd == Owd::Team,
+            team_id: identity.team_id,
+        };
+        if let Some(pred) = mda_data::read_predicate(&hop_scope) {
+            let (frag, ub) = mda_data::pred_render(&pred, &hop_scope, n);
+            // The predicate's row references are all bare `t.` aliases (same
+            // invariant restore_tx relies on); rewrite them to the hop alias.
+            let on_add = frag.replace("t.", &format!("{alias}."));
+            if let Some(j) = joins.iter_mut().find(|j| join_key(j) == alias.as_str()) {
+                *j = format!("{j} AND {on_add}");
+            }
+            n += ub.len();
+            for u in ub {
+                binds.push(RB::Uuid(u));
+            }
+        }
+    }
+
+    // ---- WHERE: tenant + record scope + filters ----
+    let mut parts: Vec<String> = vec!["t.tenant_id = $1".into()];
     if let Some(pred) = mda_data::read_predicate(&scope) {
         let (frag, ub) = mda_data::pred_render(&pred, &scope, n);
         parts.push(frag);
@@ -205,10 +270,7 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
             binds.push(RB::Uuid(u));
         }
     }
-    for f in &ds.filters {
-        let r = resolve_field(pool, identity.tenant_id, &def, &f.field).await?;
-        require_readable(identity, &r, "filter")?;
-        merge_joins(&mut joins, &r);
+    for (f, r) in ds.filters.iter().zip(filter_refs.iter()) {
         let op = match f.op.as_str() {
             "eq" => "=",
             "ne" => "<>",
@@ -219,17 +281,13 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
             "like" => "ILIKE",
             other => return Err(Error::Invalid(format!("unsupported filter op {other}"))),
         };
-        let rhs_cast = match r.kind {
-            FieldKind::Fk => "::uuid",
-            FieldKind::System if matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte") => {
-                "::numeric"
-            }
-            FieldKind::Scalar if matches!(f.op.as_str(), "gt" | "gte" | "lt" | "lte") => {
-                "::numeric"
-            }
-            _ => "",
-        };
-        parts.push(format!("{} {op} ${n}{rhs_cast}", r.sql));
+        // Typed LHS + validated RHS, mirroring the data API's filter builder
+        // (crud.rs build_list_where): a text LHS against a numeric bind is a
+        // guaranteed 'operator does not exist' 500, and a text comparison of
+        // a numeric value misses equal renderings ('10' ≠ '10.0'). Malformed
+        // values are a client error (mda.invalid), never a DB error.
+        let (lhs, rhs_cast) = typed_filter(r, f.op.as_str(), &f.field, &f.value)?;
+        parts.push(format!("{lhs} {op} ${n}{rhs_cast}"));
         binds.push(RB::Text(f.value.clone()));
         n += 1;
     }
@@ -254,7 +312,8 @@ pub async fn run(pool: &PgPool, identity: &Identity, ds: &Dataset) -> Result<Rep
         .limit
         .unwrap_or(DEFAULT_ROW_CAP)
         .clamp(1, DEFAULT_ROW_CAP);
-    sql.push_str(&format!(" LIMIT {lim}"));
+    let off = ds.offset.unwrap_or(0).min(DEFAULT_ROW_CAP * 100);
+    sql.push_str(&format!(" LIMIT {lim} OFFSET {off}"));
 
     // bind tenant + owner + filters (all text; casts applied in SQL). Run inside
     // a short-lived txn so the per-run statement_timeout is scoped to this query
@@ -327,14 +386,18 @@ fn is_safe_alias(s: &str) -> bool {
 
 /// A resolved field reference: the SQL column expression (base table alias
 /// `t`, traversal join aliases `j_*`), the join fragments each hop needs, the
-/// entities crossed (for per-hop AuthZ), and the leaf (entity, field) the
-/// field-level check applies to.
+/// entities crossed (for per-hop AuthZ), the (join alias, entity) of each hop
+/// (for per-hop record security, §5.17/PLAN.md:701), the leaf's declared field
+/// type (for typed filter LHS + aggregate typing), and the leaf (entity, field)
+/// the field-level check applies to.
 struct FieldRef {
     sql: String,
     joins: Vec<String>,
     hop_entities: Vec<String>,
+    hops: Vec<(String, String)>,
     leaf_entity: String,
     leaf_field: String,
+    leaf_type: Option<String>,
     kind: FieldKind,
 }
 
@@ -365,6 +428,7 @@ async fn resolve_field(
     let mut alias = "t".to_string();
     let mut joins: Vec<String> = Vec::new();
     let mut hop_entities: Vec<String> = Vec::new();
+    let mut hops: Vec<(String, String)> = Vec::new();
 
     for (i, seg) in segments.iter().enumerate() {
         let last = i == segments.len() - 1;
@@ -374,8 +438,10 @@ async fn resolve_field(
                 sql: format!("{alias}.{seg}"),
                 joins,
                 hop_entities,
+                hops,
                 leaf_entity: entity,
                 leaf_field: (*seg).to_string(),
+                leaf_type: None,
                 kind: FieldKind::System,
             });
         }
@@ -392,8 +458,10 @@ async fn resolve_field(
                     sql: leaf_sql,
                     joins,
                     hop_entities,
+                    hops,
                     leaf_entity: entity,
                     leaf_field: (*seg).to_string(),
+                    leaf_type: None,
                     kind: FieldKind::Fk,
                 });
             }
@@ -425,6 +493,7 @@ async fn resolve_field(
                 ja = jalias,
             ));
             hop_entities.push(target.entity.name.clone());
+            hops.push((jalias.clone(), target.entity.name.clone()));
             entity = target.entity.name;
             table = target.entity.table_name;
             alias = jalias;
@@ -435,12 +504,19 @@ async fn resolve_field(
         if !last || !d.fields.iter().any(|f| f.name == *seg) {
             return Err(Error::Invalid(format!("unknown field {path}")));
         }
+        let leaf_type = d
+            .fields
+            .iter()
+            .find(|f| f.name == *seg)
+            .map(|f| f.field_type.clone());
         return Ok(FieldRef {
             sql: format!("({alias}.attributes->>'{seg}')"),
             joins,
             hop_entities,
+            hops,
             leaf_entity: entity,
             leaf_field: (*seg).to_string(),
+            leaf_type,
             kind: FieldKind::Scalar,
         });
     }
@@ -485,13 +561,139 @@ fn require_readable(identity: &Identity, r: &FieldRef, position: &str) -> Result
     Ok(())
 }
 
+/// Typed filter LHS + RHS cast + app-side value validation for one report
+/// filter — the report-side twin of the data API's `build_list_where`
+/// (crud.rs). The LHS expression must match the field's real type (a text LHS
+/// against a typed bind is a guaranteed 'operator does not exist' 500) and the
+/// value is validated here so malformed input is `mda.invalid`, never a DB
+/// error. Text-ish fields reject ordered comparisons (lexicographic text
+/// ordering is not what a modeler means); bool/FK accept eq/ne only.
+fn typed_filter(r: &FieldRef, op: &str, field: &str, value: &str) -> Result<(String, String)> {
+    let ordered = matches!(op, "gt" | "gte" | "lt" | "lte");
+    let bad_order = || {
+        Error::Invalid(format!(
+            "ordered comparison needs a numeric/date/datetime field ({field} does not support {op})"
+        ))
+    };
+    Ok(match (&r.kind, r.leaf_type.as_deref()) {
+        (FieldKind::Fk, _) => {
+            if ordered || op == "like" {
+                return Err(Error::Invalid(format!(
+                    "reference columns support eq/ne only (got {op})"
+                )));
+            }
+            Uuid::parse_str(value)
+                .map_err(|_| Error::Invalid(format!("not a valid uuid: {value}")))?;
+            (r.sql.clone(), "::uuid".into())
+        }
+        (FieldKind::System, _) => match r.leaf_field.as_str() {
+            "version" => {
+                if op == "like" {
+                    return Err(Error::Invalid(format!(
+                        "like needs a text field ({field} is an integer)"
+                    )));
+                }
+                value
+                    .parse::<i64>()
+                    .map_err(|_| Error::Invalid(format!("not an integer: {value}")))?;
+                (r.sql.clone(), "::bigint".into())
+            }
+            "id" | "owner_id" => {
+                if ordered || op == "like" {
+                    return Err(Error::Invalid(format!(
+                        "{0} supports eq/ne only (got {op})",
+                        r.leaf_field
+                    )));
+                }
+                Uuid::parse_str(value)
+                    .map_err(|_| Error::Invalid(format!("not a valid uuid: {value}")))?;
+                (r.sql.clone(), "::uuid".into())
+            }
+            "state" => {
+                if ordered {
+                    return Err(bad_order());
+                }
+                (r.sql.clone(), String::new())
+            }
+            // created_at / updated_at
+            _ => {
+                if op == "like" {
+                    return Err(Error::Invalid("like needs a text field".into()));
+                }
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map_err(|e| Error::Invalid(format!("invalid datetime '{value}': {e}")))?;
+                (r.sql.clone(), "::timestamptz".into())
+            }
+        },
+        (FieldKind::Scalar, Some(ft)) => match ft {
+            "integer" | "auto_number" | "decimal" | "money" => {
+                if op == "like" {
+                    return Err(Error::Invalid(format!(
+                        "like needs a text field ({field} is {ft})"
+                    )));
+                }
+                value
+                    .parse::<f64>()
+                    .map_err(|_| Error::Invalid(format!("not a number: {value}")))?;
+                (format!("({})::numeric", r.sql), "::numeric".into())
+            }
+            "bool" => {
+                if ordered || op == "like" {
+                    return Err(Error::Invalid(format!(
+                        "bool fields support eq/ne only (got {op})"
+                    )));
+                }
+                if !value.eq_ignore_ascii_case("true") && !value.eq_ignore_ascii_case("false") {
+                    return Err(Error::Invalid(format!("not a boolean: {value}")));
+                }
+                (format!("({})::boolean", r.sql), "::boolean".into())
+            }
+            "date" => {
+                if op == "like" {
+                    return Err(Error::Invalid("like needs a text field".into()));
+                }
+                chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                    .map_err(|e| Error::Invalid(format!("invalid date '{value}': {e}")))?;
+                (format!("({})::date", r.sql), "::date".into())
+            }
+            "datetime" => {
+                if op == "like" {
+                    return Err(Error::Invalid("like needs a text field".into()));
+                }
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map_err(|e| Error::Invalid(format!("invalid datetime '{value}': {e}")))?;
+                (format!("({})::timestamptz", r.sql), "::timestamptz".into())
+            }
+            // string / text / enum / attachment / json
+            _ => {
+                if ordered {
+                    return Err(bad_order());
+                }
+                (r.sql.clone(), String::new())
+            }
+        },
+        (FieldKind::Scalar, None) => {
+            return Err(Error::internal(anyhow::anyhow!(
+                "scalar field {field} resolved without a type"
+            )))
+        }
+    })
+}
+
 /// Dedupe join fragments already accumulated (two fields sharing a path prefix
-/// join the same target table once).
-fn merge_joins(acc: &mut Vec<String>, r: &FieldRef) {
+/// join the same target table once) and collect the (alias, entity) of every
+/// hop in first-appearance order — the input the per-hop record-security pass
+/// below iterates.
+fn merge_joins(acc: &mut Vec<String>, hops: &mut Vec<(String, String)>, r: &FieldRef) {
     for j in &r.joins {
         let key = join_key(j);
         if !acc.iter().any(|e| join_key(e) == key) {
             acc.push(j.clone());
+        }
+    }
+    for h in &r.hops {
+        if !hops.iter().any(|(a, _)| a == &h.0) {
+            hops.push(h.clone());
         }
     }
 }

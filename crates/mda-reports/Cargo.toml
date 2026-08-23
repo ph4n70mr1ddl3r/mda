@@ -14,6 +14,8 @@ sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
 tracing = { workspace = true }
 # XLSX rendering of report results (Phase 7 renderer) — dependency-free writer.
 rust_xlsxwriter = "0.79"

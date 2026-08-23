@@ -53,8 +53,8 @@ pub async fn load_active_model(pool: &sqlx::PgPool, tenant: Uuid) -> Result<Draf
 
     let rels: Vec<Relationship> = sqlx::query_as::<_, Relationship>(
         "SELECT id, tenant_id, source_entity_id, source_field_name, target_entity_id, cardinality,
-                strength, on_delete, required, reference_qualifier, rollup_summary, created_at, updated_at
-         FROM meta.md_relationship WHERE tenant_id = $1",
+                strength, on_delete, required, reference_qualifier, rollup_summary, join_table_name, created_at, updated_at
+         FROM meta.md_relationship WHERE tenant_id = $1 AND status = 'active'",
     )
     .bind(tenant)
     .fetch_all(&mut *tx)
@@ -98,8 +98,8 @@ pub async fn load_entity_definition(
 
     let relationships = sqlx::query_as::<_, Relationship>(
         "SELECT id, tenant_id, source_entity_id, source_field_name, target_entity_id, cardinality,
-                strength, on_delete, required, reference_qualifier, rollup_summary, created_at, updated_at
-         FROM meta.md_relationship WHERE tenant_id = $1 AND source_entity_id = $2",
+                strength, on_delete, required, reference_qualifier, rollup_summary, join_table_name, created_at, updated_at
+         FROM meta.md_relationship WHERE tenant_id = $1 AND source_entity_id = $2 AND status = 'active'",
     )
     .bind(tenant)
     .bind(entity_id)
@@ -207,6 +207,7 @@ fn assemble_draft_model(
                 required: r.required,
                 reference_qualifier: r.reference_qualifier.clone(),
                 rollup_summary: r.rollup_summary.clone(),
+                join_table_name: r.join_table_name.clone(),
             })
             .collect();
         model.entities.push(DraftEntity {

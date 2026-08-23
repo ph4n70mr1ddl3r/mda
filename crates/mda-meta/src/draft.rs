@@ -102,6 +102,11 @@ pub struct DraftRelationship {
     pub reference_qualifier: Option<serde_json::Value>,
     #[serde(default)]
     pub rollup_summary: Option<serde_json::Value>,
+    /// Explicit override for the many-to-many join-table name (§5.7): the
+    /// deterministic `<smaller>_<larger>` name is used unless it would collide
+    /// with an existing table, in which case an override is REQUIRED.
+    #[serde(default)]
+    pub join_table_name: Option<String>,
 }
 
 fn default_object() -> serde_json::Value {
@@ -415,6 +420,45 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
                     r.source_field_name, e.name, r.strength
                 ));
             }
+            // §5.7 behavior matrix: on_delete is a lookup-only enumerated
+            // behavior; master_detail is ALWAYS `required` (NOT NULL FK) and
+            // always CASCADE — an on_delete on it would be a contradiction.
+            match r.strength.as_str() {
+                "lookup" => {
+                    if let Some(od) = r.on_delete.as_deref() {
+                        if !matches!(od, "restrict" | "set_null" | "cascade") {
+                            report.errors.push(format!(
+                                "relationship {} on {}: on_delete must be restrict|set_null|cascade (got {od})",
+                                r.source_field_name, e.name
+                            ));
+                        }
+                    }
+                }
+                "master_detail" => {
+                    if !r.required {
+                        report.errors.push(format!(
+                            "relationship {} on {}: master_detail requires required=true (the child cannot exist without its parent, §5.7)",
+                            r.source_field_name, e.name
+                        ));
+                    }
+                    if r.on_delete.is_some() {
+                        report.errors.push(format!(
+                            "relationship {} on {}: master_detail is always ON DELETE CASCADE; on_delete is lookup-only (§5.7)",
+                            r.source_field_name, e.name
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            // explicit join-table overrides must be safe identifiers
+            if let Some(j) = r.join_table_name.as_deref() {
+                if !is_valid_table_name(j) {
+                    report.errors.push(format!(
+                        "relationship {} on {}: join_table_name `{j}` is not a valid SQL identifier",
+                        r.source_field_name, e.name
+                    ));
+                }
+            }
             if !rel_names.insert(r.source_field_name.as_str()) {
                 report.errors.push(format!(
                     "duplicate relationship column {} on {}",
@@ -443,10 +487,396 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
         }
     }
 
+    // 4) Many-to-many join-table names (§5.7): deterministic `<smaller>_<larger>`
+    //    over the two entity TABLE names, with a collision check against every
+    //    entity table name (active ∪ draft), every already-materialized active
+    //    m2m join table, and every other new m2m's join name. A collision
+    //    REQUIRES an explicit `join_table_name` override.
+    {
+        let mut occupied: HashSet<String> = table_names.iter().map(|s| s.to_string()).collect();
+        // join tables already materialized by active m2m relationships
+        let table_of: HashMap<Uuid, &str> = active
+            .entities
+            .iter()
+            .chain(draft.entities.iter())
+            .map(|e| (e.id, e.table_name.as_str()))
+            .collect();
+        for e in &active.entities {
+            for r in &e.relationships {
+                if r.cardinality == "many_to_many" {
+                    if let (Some(a), Some(b)) =
+                        (table_of.get(&e.id), table_of.get(&r.target_entity_id))
+                    {
+                        occupied.insert(join_table_name(a, b, r.join_table_name.as_deref()));
+                    }
+                }
+            }
+        }
+        for e in &draft.entities {
+            for r in &e.relationships {
+                if active_rel_ids.contains(&r.id) || r.cardinality != "many_to_many" {
+                    continue;
+                }
+                let (Some(a), Some(b)) = (table_of.get(&e.id), table_of.get(&r.target_entity_id))
+                else {
+                    continue;
+                };
+                let join = join_table_name(a, b, r.join_table_name.as_deref());
+                if !is_valid_table_name(&join) {
+                    report.errors.push(format!(
+                        "many-to-many join table name `{join}` ({} ↔ {}) is not a valid SQL identifier — provide a shorter join_table_name override",
+                        e.name, r.target_entity_id
+                    ));
+                    continue;
+                }
+                if !occupied.insert(join.clone()) {
+                    report.errors.push(format!(
+                        "many-to-many join table name `{join}` collides with an existing table — set an explicit join_table_name on the relationship (§5.7)",
+                    ));
+                }
+            }
+        }
+    }
+
+    // 5) Formula dependency DAG (§5.8: cycles are a HARD publish error; max
+    //    dependency depth enforced; every referenced field exists and is
+    //    type-compatible) + rollup spec validation (ADR-0017).
+    report
+        .errors
+        .extend(validate_logic_graphs(active, draft, &active_rel_ids));
+
     if !report.violations.is_empty() || !report.errors.is_empty() {
         report.valid = false;
     }
     report
+}
+
+/// Field types that participate in arithmetic (§5.2 / coerce).
+const NUMERIC_TYPES: &[&str] = &["integer", "auto_number", "decimal", "money"];
+
+/// The deterministic many-to-many join-table name (§5.7): the two entity
+/// table names in ascending lexicographic order, `<smaller>_<larger>`. An
+/// explicit override (validated as an identifier by the draft gate) wins when
+/// the deterministic name would collide with an existing table. Lives here
+/// (not in mda-data) so the pure diff can compute it without a DB.
+pub fn join_table_name(a_table: &str, b_table: &str, override_name: Option<&str>) -> String {
+    if let Some(n) = override_name {
+        return n.to_string();
+    }
+    let (lo, hi) = if a_table <= b_table {
+        (a_table, b_table)
+    } else {
+        (b_table, a_table)
+    };
+    format!("{lo}_{hi}")
+}
+
+/// Publish-time validation of the metadata's executable logic: calculated-field
+/// formulas (a directed graph over same-entity fields) and rollup specs
+/// (child field → parent target field across the relationship). This is the
+/// publish-time analog of the runtime recursion budget (§5.9.5): without it a
+/// cyclic formula set (`C = A + B`, `B = C + 1`) only blows up at runtime.
+fn validate_logic_graphs(
+    active: &DraftModel,
+    draft: &DraftModel,
+    active_rel_ids: &HashSet<Uuid>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    /// entity_id -> (entity name, field name -> (field_type, Option<formula>))
+    type FieldGraph = HashMap<String, (String, Option<serde_json::Value>)>;
+    // active ∪ draft (a draft's view of a shared entity wins for its fields).
+    let mut ents: HashMap<Uuid, (String, FieldGraph)> = HashMap::new();
+    for e in &active.entities {
+        let m = ents
+            .entry(e.id)
+            .or_insert_with(|| (e.name.clone(), HashMap::new()));
+        for f in &e.fields {
+            m.1.insert(f.name.clone(), (f.field_type.clone(), formula_of(f)));
+        }
+    }
+    for e in &draft.entities {
+        let m = ents
+            .entry(e.id)
+            .or_insert_with(|| (e.name.clone(), HashMap::new()));
+        for f in &e.fields {
+            m.1.insert(f.name.clone(), (f.field_type.clone(), formula_of(f)));
+        }
+    }
+
+    // ---- calculated-field formulas (same-entity dependency DAG) ----
+    for e in &draft.entities {
+        let Some((ent_name, fields)) = ents.get(&e.id) else {
+            continue;
+        };
+        for f in &e.fields {
+            let Some(formula) = formula_of(f) else {
+                continue;
+            };
+            let expr = match mda_expression::Expr::from_json(&formula) {
+                Ok(x) => x,
+                Err(err) => {
+                    errors.push(format!(
+                        "field {}.{}: formula does not parse: {err}",
+                        ent_name, f.name
+                    ));
+                    continue;
+                }
+            };
+            let mut refs = Vec::new();
+            expr_field_refs(&expr, &mut refs);
+            for dep in &refs {
+                match fields.get(dep) {
+                    None => errors.push(format!(
+                        "field {}.{}: formula references unknown field {dep}",
+                        ent_name, f.name
+                    )),
+                    Some((dep_type, _)) => {
+                        if expr_has_arith_over(&expr, dep)
+                            && !NUMERIC_TYPES.contains(&dep_type.as_str())
+                        {
+                            errors.push(format!(
+                                "field {}.{}: arithmetic over {dep} ({dep_type}) is not type-compatible (needs a numeric field)",
+                                ent_name, f.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // cycle + depth over the merged per-entity formula graph (active + draft)
+    for (ent_name, fields) in ents.values() {
+        // edges: formula field -> referenced field (when that one is calculated too)
+        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, (_, formula)) in fields {
+            let Some(formula) = formula else { continue };
+            let Ok(expr) = mda_expression::Expr::from_json(formula) else {
+                continue; // parse error already reported for draft fields
+            };
+            let mut refs = Vec::new();
+            expr_field_refs(&expr, &mut refs);
+            let deps: Vec<String> = refs
+                .into_iter()
+                .filter(|r| fields.get(r).is_some_and(|(_, f)| f.is_some()))
+                .collect();
+            if !deps.is_empty() {
+                edges.insert(name.clone(), deps);
+            }
+        }
+        if edges.is_empty() {
+            continue;
+        }
+        // DFS with color marking; depth memo guards the max chain
+        let mut color: HashMap<String, u8> = HashMap::new(); // 0 white 1 gray 2 black
+        let mut depth: HashMap<String, usize> = HashMap::new();
+        fn dfs(
+            n: &str,
+            edges: &HashMap<String, Vec<String>>,
+            color: &mut HashMap<String, u8>,
+            depth: &mut HashMap<String, usize>,
+            stack: &mut Vec<String>,
+            ent_name: &str,
+            errors: &mut Vec<String>,
+        ) -> usize {
+            match color.get(n) {
+                Some(1) => {
+                    let cycle_at = stack.iter().position(|s| *s == n).unwrap_or(0);
+                    errors.push(format!(
+                        "entity {ent_name}: calculated-field cycle detected ({} → … → {n}); cyclic formulas are a hard publish error (§5.8)",
+                        stack[cycle_at..].join(" → ")
+                    ));
+                    return 0;
+                }
+                Some(2) => return *depth.get(n).unwrap_or(&0),
+                _ => {}
+            }
+            color.insert(n.to_string(), 1);
+            stack.push(n.to_string());
+            let mut d = 0usize;
+            if let Some(deps) = edges.get(n) {
+                for dep in deps.clone() {
+                    d = d.max(1 + dfs(&dep, edges, color, depth, stack, ent_name, errors));
+                }
+            }
+            stack.pop();
+            color.insert(n.to_string(), 2);
+            depth.insert(n.to_string(), d);
+            d
+        }
+        let names: Vec<String> = edges.keys().cloned().collect();
+        for n in names {
+            let mut stack: Vec<String> = Vec::new();
+            let d = dfs(
+                &n,
+                &edges,
+                &mut color,
+                &mut depth,
+                &mut stack,
+                ent_name,
+                &mut errors,
+            );
+            if d > 10 {
+                errors.push(format!(
+                    "entity {ent_name}: calculated-field dependency depth for {n} is {d} (max 10, §5.8)"
+                ));
+            }
+        }
+    }
+
+    // ---- rollup specs (ADR-0017): child field -> parent target field ----
+    for e in &draft.entities {
+        for r in &e.relationships {
+            if active_rel_ids.contains(&r.id) {
+                continue;
+            }
+            let Some(spec) = &r.rollup_summary else {
+                continue;
+            };
+            let ent_name = &e.name;
+            let mut bad = |msg: String| {
+                errors.push(format!(
+                    "rollup on {ent_name}.{}: {msg}",
+                    r.source_field_name
+                ))
+            };
+            let Some(obj) = spec.as_object() else {
+                bad("rollup_summary must be a JSON object".into());
+                continue;
+            };
+            let agg = obj.get("aggregate").and_then(|v| v.as_str()).unwrap_or("");
+            if !matches!(agg, "count" | "sum" | "avg" | "min" | "max") {
+                bad(format!(
+                    "aggregate must be count|sum|avg|min|max (got {agg})"
+                ));
+                continue;
+            }
+            if let Some(asyn) = obj.get("async") {
+                // ADR-0017 async opt-out: must be a boolean flag
+                if !asyn.is_boolean() {
+                    bad("the `async` opt-out flag must be a boolean".into());
+                }
+            }
+            let Some((_, parent_fields)) = ents.get(&e.id) else {
+                continue;
+            };
+            let Some(target_field) = obj.get("target_field").and_then(|v| v.as_str()) else {
+                bad("target_field (the parent field storing the rollup) is required".into());
+                continue;
+            };
+            let Some((t_type, t_formula)) = parent_fields.get(target_field) else {
+                bad(format!(
+                    "target_field {target_field} does not exist on {ent_name}"
+                ));
+                continue;
+            };
+            if t_formula.is_some() {
+                bad(format!(
+                    "target_field {target_field} is itself calculated — a rollup target must be stored, not derived"
+                ));
+            }
+            let child_fields = ents
+                .get(&r.target_entity_id)
+                .map(|(_, m)| m)
+                .cloned()
+                .unwrap_or_default();
+            if agg == "count" {
+                if !NUMERIC_TYPES.contains(&t_type.as_str()) {
+                    bad(format!(
+                        "count needs a numeric target_field ({target_field} is {t_type})"
+                    ));
+                }
+                continue;
+            }
+            let Some(field) = obj.get("field").and_then(|v| v.as_str()) else {
+                bad(format!(
+                    "aggregate {agg} requires `field` (the child field to aggregate)"
+                ));
+                continue;
+            };
+            let Some((c_type, _)) = child_fields.get(field) else {
+                bad(format!(
+                    "child field {field} does not exist on the target entity"
+                ));
+                continue;
+            };
+            let numeric = NUMERIC_TYPES.contains(&c_type.as_str())
+                && NUMERIC_TYPES.contains(&t_type.as_str());
+            let temporal = matches!(c_type.as_str(), "date" | "datetime")
+                && matches!(t_type.as_str(), "date" | "datetime")
+                && matches!(agg, "min" | "max");
+            if !numeric && !temporal {
+                bad(format!(
+                    "{agg} of {field} ({c_type}) into {target_field} ({t_type}) is not type-compatible (numeric→numeric, or date/datetime for min/max)"
+                ));
+            }
+        }
+    }
+    errors
+}
+
+/// A field's formula (`config.formula`), treating JSON null as absent.
+fn formula_of(f: &DraftField) -> Option<serde_json::Value> {
+    let v = f.config.get("formula")?;
+    if v.is_null() {
+        None
+    } else {
+        Some(v.clone())
+    }
+}
+
+/// Collect every [`mda_expression::Expr::Field`] reference in an expression.
+fn expr_field_refs(e: &mda_expression::Expr, out: &mut Vec<String>) {
+    use mda_expression::Expr;
+    match e {
+        Expr::Field { name } => out.push(name.clone()),
+        Expr::And { of } | Expr::Or { of } => {
+            for x in of {
+                expr_field_refs(x, out)
+            }
+        }
+        Expr::Not { of } => expr_field_refs(of, out),
+        Expr::Cmp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
+            expr_field_refs(lhs, out);
+            expr_field_refs(rhs, out);
+        }
+        Expr::If { cond, then, els } => {
+            expr_field_refs(cond, out);
+            expr_field_refs(then, out);
+            expr_field_refs(els, out);
+        }
+        Expr::Call { args, .. } => {
+            for a in args {
+                expr_field_refs(a, out)
+            }
+        }
+        Expr::Lit { .. } => {}
+    }
+}
+
+/// Does the expression perform arithmetic DIRECTLY over field `name` (used for
+/// the type-compatibility check — an Arith node whose operand is that field)?
+fn expr_has_arith_over(e: &mda_expression::Expr, name: &str) -> bool {
+    use mda_expression::Expr;
+    match e {
+        Expr::Arith { lhs, rhs, .. } => {
+            matches!(lhs.as_ref(), Expr::Field { name: n } if n == name)
+                || matches!(rhs.as_ref(), Expr::Field { name: n } if n == name)
+                || expr_has_arith_over(lhs, name)
+                || expr_has_arith_over(rhs, name)
+        }
+        Expr::And { of } | Expr::Or { of } => of.iter().any(|x| expr_has_arith_over(x, name)),
+        Expr::Not { of } => expr_has_arith_over(of, name),
+        Expr::Cmp { lhs, rhs, .. } => {
+            expr_has_arith_over(lhs, name) || expr_has_arith_over(rhs, name)
+        }
+        Expr::If { cond, then, els } => {
+            expr_has_arith_over(cond, name)
+                || expr_has_arith_over(then, name)
+                || expr_has_arith_over(els, name)
+        }
+        Expr::Call { args, .. } => args.iter().any(|x| expr_has_arith_over(x, name)),
+        Expr::Lit { .. } | Expr::Field { .. } => false,
+    }
 }
 
 // ---- canonicalization (only user-facing fields; excludes id) ----
@@ -479,6 +909,10 @@ fn canon_field(f: &DraftField) -> serde_json::Value {
 }
 
 fn canon_rel(r: &DraftRelationship) -> serde_json::Value {
+    // Includes reference_qualifier / rollup_summary / join_table_name: an
+    // active relationship re-published with a changed qualifier or rollup spec
+    // is a TRANSFORM (Phase 2), not an invisible no-op — pre-fix the canon
+    // omitted them, so such edits were silently discarded at publish.
     serde_json::json!({
         "source_field_name": r.source_field_name,
         "target_entity_id": r.target_entity_id,
@@ -486,6 +920,9 @@ fn canon_rel(r: &DraftRelationship) -> serde_json::Value {
         "strength": r.strength,
         "on_delete": r.on_delete,
         "required": r.required,
+        "reference_qualifier": r.reference_qualifier,
+        "rollup_summary": r.rollup_summary,
+        "join_table_name": r.join_table_name,
     })
 }
 
@@ -829,6 +1266,7 @@ mod tests {
             required: false,
             reference_qualifier: None,
             rollup_summary: None,
+            join_table_name: None,
         });
         draft.entities.push(e);
         let r = diff(&DraftModel::empty(), &draft);
@@ -859,6 +1297,7 @@ mod tests {
             required: false,
             reference_qualifier: None,
             rollup_summary: None,
+            join_table_name: None,
         });
         active.entities.push(invoice.clone());
         active.entities.push(ent(2, "Customer"));
@@ -944,6 +1383,7 @@ mod tests {
             required: false,
             reference_qualifier: None,
             rollup_summary: None,
+            join_table_name: None,
         });
         let r2 = diff(&active, &draft2);
         assert!(
@@ -1098,6 +1538,7 @@ mod tests {
             required: false,
             reference_qualifier: None,
             rollup_summary: None,
+            join_table_name: None,
         });
         draft.entities.push(customer);
         draft.entities.push(invoice);

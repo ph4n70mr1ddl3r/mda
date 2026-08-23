@@ -1601,6 +1601,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "mda-core",
+ "mda-expression",
  "moka",
  "serde",
  "serde_json",
@@ -1614,6 +1615,8 @@ dependencies = [
 name = "mda-reports"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
  "mda-core",
  "mda-data",
  "mda-expression",

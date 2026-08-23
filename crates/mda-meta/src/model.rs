@@ -63,6 +63,7 @@ pub struct Relationship {
     pub required: bool,
     pub reference_qualifier: Option<serde_json::Value>,
     pub rollup_summary: Option<serde_json::Value>,
+    pub join_table_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

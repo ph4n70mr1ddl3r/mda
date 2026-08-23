@@ -566,6 +566,215 @@ async fn report_runs_under_record_scope_not_just_owner() {
     assert_eq!(res.rows[0]["ref"].as_str(), Some("R-2"));
 }
 
+/// PLAN.md:701 / ADR-0014: the runner's record-scope predicate applies at
+/// EVERY entity in the traversal — object-grain `read` on the crossed entity
+/// is not enough. A runner who may read Order (via a manual share) but holds
+/// only object-grain read on a PRIVATE-OWD Customer must get NULL for
+/// `customer_id.name`, never the private row's fields; the same report run
+/// by the owner (bypass) still resolves the join. Pre-fix, the join carried
+/// only `tenant_id` and leaked the Customer name through.
+#[tokio::test]
+async fn report_traversal_applies_record_scope_per_hop() {
+    let Some(ctx) = setup().await else { return };
+    publish(
+        &ctx,
+        order_model(
+            "order_hopscope",
+            &format!("customer_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+    seed_data(&ctx).await;
+
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let reader = common::seed_user(&ctx.pool, ctx.tenant, &email, "u", &hash).await;
+    // object-grain read on BOTH entities — the hop is crossable at the object
+    // grain, which is exactly what makes the record-grain leak reachable.
+    let role = common::seed_role(
+        &ctx.pool,
+        ctx.tenant,
+        "orderviewer2",
+        &[("Order", "read"), ("Customer", "read")],
+    )
+    .await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, reader, role).await;
+
+    // share ONE order row (R-2) with the reader; Customer stays private-OWD
+    // and owned by the admin, so the reader has no record access to it.
+    let mut tx = ctx.pool.begin().await.unwrap();
+    mda_security::set_tenant(&mut tx, ctx.tenant).await.unwrap();
+    let (shared_id,): (Uuid,) = sqlx::query_as(
+        "SELECT id FROM biz.order_hopscope WHERE tenant_id = $1 AND attributes->>'ref' = 'R-2'",
+    )
+    .bind(ctx.tenant)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sec.sec_record_share (tenant_id, entity, record_id, principal_id, access) \
+         VALUES ($1, 'Order', $2, $3, 'read')",
+    )
+    .bind(ctx.tenant)
+    .bind(shared_id)
+    .bind(reader)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let ident = mda_security::load_identity(&ctx.pool, reader, ctx.tenant)
+        .await
+        .expect("load reader identity");
+    let ds: mda_reports::Dataset = serde_json::from_value(json!({
+        "base_entity":"Order",
+        "fields":[{"field":"ref"}, {"field":"customer_id.name","alias":"cname"}]
+    }))
+    .unwrap();
+    let res = mda_reports::run(&ctx.pool, &ident, &ds).await.expect("run");
+    assert_eq!(res.rows.len(), 1, "shared record only: {:?}", res.rows);
+    assert_eq!(res.rows[0]["ref"].as_str(), Some("R-2"));
+    assert!(
+        res.rows[0]["cname"].is_null(),
+        "private Customer fields must NOT leak through the traversal join: {:?}",
+        res.rows[0]
+    );
+
+    // the owner (superuser bypass) resolves the same join fine — the fix
+    // filters, it does not break the join.
+    let admin_ident = mda_security::load_identity(&ctx.pool, ctx.admin_id, ctx.tenant)
+        .await
+        .expect("load admin identity");
+    let res = mda_reports::run(&ctx.pool, &admin_ident, &ds)
+        .await
+        .expect("run");
+    let names: Vec<&str> = res
+        .rows
+        .iter()
+        .filter_map(|r| r["cname"].as_str())
+        .collect();
+    assert_eq!(names, vec!["Acme", "Acme"], "admin sees both Acme orders");
+
+    // a FILTER over a traversal path is equally secured: matching on the
+    // private Customer's name yields nothing for the reader (the hop row is
+    // NULL-predicated), while the admin matches R-1 + R-2.
+    let ds_filtered: mda_reports::Dataset = serde_json::from_value(json!({
+        "base_entity":"Order",
+        "fields":[{"field":"ref"}],
+        "filters":[{"field":"customer_id.name","op":"eq","value":"Acme"}]
+    }))
+    .unwrap();
+    let res = mda_reports::run(&ctx.pool, &ident, &ds_filtered)
+        .await
+        .expect("run with hop filter");
+    assert!(
+        res.rows.is_empty(),
+        "hop filter must not match rows whose target the reader cannot read: {:?}",
+        res.rows
+    );
+    let res = mda_reports::run(&ctx.pool, &admin_ident, &ds_filtered)
+        .await
+        .expect("admin run with hop filter");
+    assert_eq!(res.rows.len(), 2, "admin matches both Acme orders");
+}
+
+/// Typed report filters (§5.17: the structured model compiles to *valid*
+/// parameterized SQL). An ordered comparison on a decimal field must compare
+/// numerically (pre-fix: text LHS vs `::numeric` RHS → 'operator does not
+/// exist' 500); ordered comparisons on text fields and sum/avg over
+/// non-numeric leaves are authoring errors (422), not DB errors.
+#[tokio::test]
+async fn report_filters_are_typed_and_aggregates_check_leaf_types() {
+    let Some(ctx) = setup().await else { return };
+    publish(
+        &ctx,
+        order_model(
+            &format!("order_{}", Uuid::new_v4().simple()),
+            &format!("customer_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+    seed_data(&ctx).await;
+
+    let ident = mda_security::load_identity(&ctx.pool, ctx.admin_id, ctx.tenant)
+        .await
+        .expect("load identity");
+
+    // ordered numeric filter: only R-2 (250) exceeds 100 — and '100.0' must
+    // match the same instant semantics as '100' (typed comparison, not text).
+    let ds: mda_reports::Dataset = serde_json::from_value(json!({
+        "base_entity":"Order",
+        "fields":[{"field":"ref"}],
+        "filters":[{"field":"total","op":"gt","value":"100.0"}],
+        "order_by":[{"field":"ref","asc":true}]
+    }))
+    .unwrap();
+    let res = mda_reports::run(&ctx.pool, &ident, &ds).await.expect("run");
+    assert_eq!(res.rows.len(), 1, "typed numeric gt: {:?}", res.rows);
+    assert_eq!(res.rows[0]["ref"].as_str(), Some("R-2"));
+
+    // ordered comparison on a text field is an authoring error
+    let ds: mda_reports::Dataset = serde_json::from_value(json!({
+        "base_entity":"Order",
+        "fields":[{"field":"ref"}],
+        "filters":[{"field":"ref","op":"gt","value":"A"}]
+    }))
+    .unwrap();
+    let err = mda_reports::run(&ctx.pool, &ident, &ds)
+        .await
+        .expect_err("ordered comparison on text must be rejected");
+    assert!(
+        err.to_string().contains("ordered comparison"),
+        "unexpected error: {err}"
+    );
+
+    // like on a non-text CORE column is an authoring error, not a DB
+    // 'operator does not exist' 500 (version ILIKE $n::bigint).
+    let ds: mda_reports::Dataset = serde_json::from_value(json!({
+        "base_entity":"Order",
+        "fields":[{"field":"ref"}],
+        "filters":[{"field":"version","op":"like","value":"1"}]
+    }))
+    .unwrap();
+    let err = mda_reports::run(&ctx.pool, &ident, &ds)
+        .await
+        .expect_err("like on version must be rejected");
+    assert!(err.to_string().contains("like needs a text field"), "{err}");
+
+    // sum over a text leaf is an authoring error naming the field
+    let ds: mda_reports::Dataset = serde_json::from_value(json!({
+        "base_entity":"Order",
+        "fields":[{"field":"ref","aggregate":"sum","alias":"s"}]
+    }))
+    .unwrap();
+    let err = mda_reports::run(&ctx.pool, &ident, &ds)
+        .await
+        .expect_err("sum over a text field must be rejected");
+    assert!(
+        err.to_string().contains("numeric"),
+        "unexpected error: {err}"
+    );
+
+    // sum over the decimal leaf works, and offset paginates
+    let ds: mda_reports::Dataset = serde_json::from_value(json!({
+        "base_entity":"Order",
+        "fields":[{"field":"ref"}, {"field":"total","aggregate":"sum","alias":"s"}],
+        "group_by":["ref"],
+        "order_by":[{"field":"ref","asc":true}],
+        "limit":2, "offset":1
+    }))
+    .unwrap();
+    let res = mda_reports::run(&ctx.pool, &ident, &ds).await.expect("run");
+    assert_eq!(
+        res.rows.len(),
+        2,
+        "limit 2 offset 1 of 3 groups: {:?}",
+        res.rows
+    );
+    assert_eq!(res.rows[0]["ref"].as_str(), Some("R-2"));
+    assert_eq!(res.rows[0]["s"].as_f64(), Some(250.0));
+}
+
 #[tokio::test]
 async fn scheduled_report_notifies_on_delivery() {
     let Some(ctx) = setup().await else { return };

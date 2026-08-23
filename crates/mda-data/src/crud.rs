@@ -901,8 +901,25 @@ fn build_list_where(
             (f.field.clone(), "::uuid")
         } else if core.contains(&f.field.as_str()) {
             match f.field.as_str() {
-                "state" => (f.field.clone(), ""),
+                "state" => {
+                    // Same policy as text-ish scalars: lexicographic state
+                    // ordering is not what a caller means (and must match the
+                    // report compiler's rejection).
+                    if ordered {
+                        return Err(Error::Invalid(
+                            "ordered comparison needs a numeric/date/datetime field (state is text)"
+                                .into(),
+                        ));
+                    }
+                    (f.field.clone(), "")
+                }
                 "version" => {
+                    if f.op == "like" {
+                        return Err(Error::Invalid(format!(
+                            "like needs a text field ({0} is an integer)",
+                            f.field
+                        )));
+                    }
                     f.value
                         .parse::<i64>()
                         .map_err(|_| Error::Invalid(format!("not an integer: {}", f.value)))?;
@@ -920,7 +937,11 @@ fn build_list_where(
                     (f.field.clone(), "::uuid")
                 }
                 _ => {
-                    // created_at / updated_at
+                    // created_at / updated_at: like on a timestamp column is a
+                    // guaranteed 'operator does not exist' (42883) at the DB.
+                    if f.op == "like" {
+                        return Err(Error::Invalid("like needs a text field".into()));
+                    }
                     parse_ts(&f.value)?;
                     (f.field.clone(), "::timestamptz")
                 }
@@ -1070,6 +1091,21 @@ pub fn validate_record(def: &EntityDefinition, body: &Map<String, Value>) -> Res
                 if let Err(e) = coerce::coerce(&f.field_type, Some(v)) {
                     errs.push(FieldError::new(&f.name, "mda.invalid_type", e.to_string()));
                 }
+            }
+            // An explicit null is a CLEAR — legal on optional fields, but a
+            // required field can never be cleared: without this arm a PATCH
+            // `{"required_field": null}` sails past validation (the Some arm
+            // above only coerces non-null) and the update path's null-keys
+            // branch silently removes the stored value, leaving a record that
+            // violates its own model. (Create already caught this indirectly —
+            // coerce(null) → None → the required check on the None branch —
+            // but update's null branch never re-checked.)
+            Some(Value::Null) if f.required && f.field_type != "auto_number" => {
+                errs.push(FieldError::new(
+                    &f.name,
+                    "mda.required",
+                    format!("field {} is required and cannot be null", f.name),
+                ));
             }
             _ => {}
         }

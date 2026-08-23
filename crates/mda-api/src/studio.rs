@@ -481,6 +481,71 @@ async fn apply_additive_publish(
     // All meta.md_* writes below are RLS-gated → set the tenant GUC for the txn.
     mda_security::set_tenant(&mut tx, tenant).await?;
 
+    // 0a) Sequential cutover per tenant (§5.8 / ADR-0011): an advisory xact
+    //     lock inside the apply transaction serializes concurrent publishes of
+    //     the same tenant (the cutover must be short and atomic; the lock dies
+    //     with the transaction). A second concurrent publish blocks here, then
+    //     either proceeds or fails cleanly — it can never interleave DDL.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(tenant.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::internal)?;
+
+    // 0b) Engage the one-'publishing'-draft-per-tenant gate (partial unique
+    //     index on md_draft, ADR-0011). The flip rides the same transaction —
+    //     a failed publish rolls the draft back to its prior status, and the
+    //     unique index makes a concurrent second publish a clean 409.
+    let flipped = sqlx::query(
+        "UPDATE meta.md_draft SET status = 'publishing', updated_at = now()
+          WHERE id = $1 AND tenant_id = $2 AND status IN ('draft','validating','failed')",
+    )
+    .bind(draft_id)
+    .bind(tenant)
+    .execute(&mut *tx)
+    .await
+    .map_err(map_publish_gate_err)?;
+    if flipped.rows_affected() == 0 {
+        return Err(Error::Conflict(
+            "another publish is already in progress for this tenant".into(),
+        ));
+    }
+
+    // 0c) biz.<table> names are GLOBAL (one physical table per entity,
+    //     tenant_id column — §5.1): a new entity may not reuse another
+    //     tenant's active table_name, or the second tenant's generated
+    //     columns/constraints would silently miss (CREATE TABLE IF NOT EXISTS
+    //     no-ops on the existing table) and its uniques would never be
+    //     enforced. The declared Phase-2 follow-up, now enforced.
+    {
+        let new_tables: Vec<String> = draft
+            .entities
+            .iter()
+            .filter(|e| !active_entity_ids.contains(&e.id))
+            .map(|e| e.table_name.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if !new_tables.is_empty() {
+            let taken: Vec<(String,)> = sqlx::query_as(
+                "SELECT DISTINCT table_name FROM meta.md_entity
+                  WHERE tenant_id <> $1 AND status = 'active' AND table_name = ANY($2)",
+            )
+            .bind(tenant)
+            .bind(&new_tables)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(Error::internal)?;
+            if !taken.is_empty() {
+                let names: Vec<String> = taken.into_iter().map(|(n,)| n).collect();
+                return Err(Error::Invalid(format!(
+                    "table_name(s) already used by another tenant in this database (biz.* tables are global): {}",
+                    names.join(", ")
+                )));
+            }
+        }
+    }
+
     // 1) archive the current active model
     let active_json = serde_json::to_value(active).map_err(Error::internal)?;
     let (snapshot_id,): (Uuid,) = sqlx::query_as(
@@ -495,7 +560,24 @@ async fn apply_additive_publish(
     .await
     .map_err(Error::internal)?;
 
-    // 2) INSERT additions: modules
+    // 1b) bounded snapshot history (§5.8: "keep last N snapshots (default 10)")
+    sqlx::query(
+        "DELETE FROM meta.md_snapshot WHERE tenant_id = $1 AND id NOT IN (
+            SELECT id FROM meta.md_snapshot WHERE tenant_id = $1
+             ORDER BY created_at DESC, version DESC LIMIT 10)",
+    )
+    .bind(tenant)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::internal)?;
+
+    // 2) INSERT additions: modules. Entities/fields/relationships use
+    //    ON CONFLICT (id) DO UPDATE … SET status='active' — that is the
+    //    UN-RETIRE path (§5.8 "Fully reversible: un-retire clears the status
+    //    and removes the md_retirement row"): a retired artifact re-appearing
+    //    in a later draft re-activates in place instead of colliding on its
+    //    still-existing retired row. The tenant guard makes a (cosmic-odds)
+    //    cross-tenant id collision a no-op rather than a hijack.
     let mut additions = AdditionSummary::default();
     for m in &draft.modules {
         if active_module_ids.contains(&m.id) {
@@ -515,7 +597,7 @@ async fn apply_additive_publish(
         .map_err(Error::internal)?;
     }
 
-    // 3) INSERT additions: entities
+    // 3) INSERT additions: entities (or re-activate a retired one)
     for e in &draft.entities {
         if active_entity_ids.contains(&e.id) {
             continue;
@@ -524,7 +606,9 @@ async fn apply_additive_publish(
         sqlx::query(
             "INSERT INTO meta.md_entity
                 (id, tenant_id, module_id, table_name, name, label, description, status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
+             ON CONFLICT (id) DO UPDATE SET status = 'active', updated_at = now()
+              WHERE meta.md_entity.tenant_id = excluded.tenant_id",
         )
         .bind(e.id)
         .bind(tenant)
@@ -536,6 +620,7 @@ async fn apply_additive_publish(
         .execute(&mut *tx)
         .await
         .map_err(Error::internal)?;
+        unretire(&mut tx, tenant, "entity", e.id).await?;
     }
 
     // 4) INSERT additions: fields (entity must exist — either active or just inserted)
@@ -549,7 +634,9 @@ async fn apply_additive_publish(
                 "INSERT INTO meta.md_field
                     (id, tenant_id, entity_id, name, label, field_type, required,
                      is_unique, is_indexed, default_expr, config, status)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active')",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'active')
+                 ON CONFLICT (id) DO UPDATE SET status = 'active', updated_at = now()
+                  WHERE meta.md_field.tenant_id = excluded.tenant_id",
             )
             .bind(f.id)
             .bind(tenant)
@@ -565,6 +652,7 @@ async fn apply_additive_publish(
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?;
+            unretire(&mut tx, tenant, "field", f.id).await?;
         }
     }
 
@@ -578,8 +666,11 @@ async fn apply_additive_publish(
             sqlx::query(
                 "INSERT INTO meta.md_relationship
                     (id, tenant_id, source_entity_id, source_field_name, target_entity_id,
-                     cardinality, strength, on_delete, required, reference_qualifier, rollup_summary)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                     cardinality, strength, on_delete, required, reference_qualifier,
+                     rollup_summary, join_table_name)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                 ON CONFLICT (id) DO UPDATE SET status = 'active', updated_at = now()
+                  WHERE meta.md_relationship.tenant_id = excluded.tenant_id",
             )
             .bind(r.id)
             .bind(tenant)
@@ -592,9 +683,11 @@ async fn apply_additive_publish(
             .bind(r.required)
             .bind(&r.reference_qualifier)
             .bind(&r.rollup_summary)
+            .bind(&r.join_table_name)
             .execute(&mut *tx)
             .await
             .map_err(Error::internal)?;
+            unretire(&mut tx, tenant, "relationship", r.id).await?;
         }
     }
 
@@ -647,7 +740,13 @@ async fn apply_additive_publish(
             added_columns += 1;
         }
     }
-    // added relationships -> ALTER ADD FK column + constraint (after tables exist)
+    // added relationships -> ALTER ADD FK column + constraint (after tables
+    // exist). MANY-TO-MANY relationships do NOT hoist a single-FK column —
+    // they materialize a join table below (§5.7). Relationships on a
+    // reference cycle are emitted DEFERRABLE INITIALLY DEFERRED so mutual
+    // references can be written in one transaction (§5.7 / §5.8).
+    let cycle_rels = relationships_on_cycles(active, draft);
+    let mut created_join_tables: i64 = 0;
     for e in &draft.entities {
         for r in &e.relationships {
             if active_rel_ids.contains(&r.id) {
@@ -659,11 +758,35 @@ async fn apply_additive_publish(
                     r.source_field_name, r.target_entity_id
                 ))
             })?;
-            exec_stmts(&mut tx, &ddl::add_relationship(&e.table_name, r, target)?).await?;
-            added_fks += 1;
+            if r.cardinality == "many_to_many" {
+                let join = mda_meta::draft::join_table_name(
+                    &e.table_name,
+                    target,
+                    r.join_table_name.as_deref(),
+                );
+                exec_stmts(
+                    &mut tx,
+                    &ddl::create_join_table(&join, &e.table_name, target)?,
+                )
+                .await?;
+                created_join_tables += 1;
+            } else {
+                let deferrable = cycle_rels.contains(&r.id);
+                exec_stmts(
+                    &mut tx,
+                    &ddl::add_relationship_deferred(&e.table_name, r, target, deferrable)?,
+                )
+                .await?;
+                added_fks += 1;
+            }
         }
     }
-    // retire removed entities / fields (two-phase)
+    // retire removed entities / fields / relationships (two-phase)
+    let draft_rel_ids: HashSet<Uuid> = draft
+        .entities
+        .iter()
+        .flat_map(|e| e.relationships.iter().map(|r| r.id))
+        .collect();
     for ae in &active.entities {
         if !draft_entity_ids.contains(&ae.id) {
             retirements.entities += 1;
@@ -675,12 +798,34 @@ async fn apply_additive_publish(
                 retire_field(&mut tx, tenant, af.id).await?;
             }
         }
+        for ar in &ae.relationships {
+            if !draft_rel_ids.contains(&ar.id) {
+                retirements.relationships += 1;
+                retire_relationship(&mut tx, tenant, ar.id).await?;
+            }
+        }
     }
 
     // 7) record what this publish executed (§14 observability; ADR-0011 log).
     log_migration(&mut tx, tenant, draft_id, "create_table", created_tables).await?;
     log_migration(&mut tx, tenant, draft_id, "add_column", added_columns).await?;
     log_migration(&mut tx, tenant, draft_id, "add_relationship", added_fks).await?;
+    log_migration(
+        &mut tx,
+        tenant,
+        draft_id,
+        "create_join_table",
+        created_join_tables,
+    )
+    .await?;
+    log_migration(
+        &mut tx,
+        tenant,
+        draft_id,
+        "retire_relationship",
+        retirements.relationships as i64,
+    )
+    .await?;
     log_migration(
         &mut tx,
         tenant,
@@ -730,6 +875,39 @@ async fn apply_additive_publish(
         additions,
         retirements,
     })
+}
+
+/// Clear a retirement row when an artifact (re-)activates (§5.8 un-retire:
+/// "clears the status and removes the md_retirement row"). No-op for fresh
+/// artifacts that were never retired.
+async fn unretire(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    kind: &str,
+    target_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM meta.md_retirement WHERE tenant_id = $1 AND kind = $2 AND target_id = $3",
+    )
+    .bind(tenant)
+    .bind(kind)
+    .bind(target_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
+}
+
+/// The one-publishing-draft partial unique index (ADR-0011) surfaces a
+/// concurrent publish as SQLSTATE 23505 on the status flip — map it to a
+/// clean 409 instead of an internal error.
+fn map_publish_gate_err(e: sqlx::Error) -> Error {
+    if e.as_database_error()
+        .is_some_and(|db| db.code().as_deref() == Some("23505"))
+    {
+        return Error::Conflict("another publish is already in progress for this tenant".into());
+    }
+    Error::internal(e)
 }
 
 /// Execute a batch of (identifier-only) DDL statements inside the publish txn.
@@ -826,4 +1004,78 @@ async fn retire_field(
     .await
     .map_err(Error::internal)?;
     Ok(())
+}
+
+/// Two-phase retire of a relationship (§5.8: "drop relationship" is in the
+/// destructive op class; its hoisted FK column stays until purge).
+async fn retire_relationship(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    rel_id: Uuid,
+) -> Result<()> {
+    sqlx::query("UPDATE meta.md_relationship SET status = 'retired', updated_at = now() WHERE id = $1 AND tenant_id = $2")
+        .bind(rel_id)
+        .bind(tenant)
+        .execute(&mut **tx)
+        .await
+        .map_err(Error::internal)?;
+    sqlx::query(
+        "INSERT INTO meta.md_retirement (tenant_id, kind, target_id, purge_after)
+         VALUES ($1, 'relationship', $2, now() + ($3)::interval)",
+    )
+    .bind(tenant)
+    .bind(rel_id)
+    .bind(RETIRE_GRACE)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::internal)?;
+    Ok(())
+}
+
+/// Relationships (active ∪ draft) that lie on a reference CYCLE (§5.7 mutual
+/// references / §5.8 publish check): their FKs are emitted DEFERRABLE
+/// INITIALLY DEFERRED so two records referencing each other can be written in
+/// one transaction. Pure graph reachability: for each edge u→v, is u
+/// reachable from v?
+fn relationships_on_cycles(active: &DraftModel, draft: &DraftModel) -> HashSet<Uuid> {
+    use std::collections::HashMap;
+    // adjacency over entity ids, from every non-m2m relationship
+    let mut adj: HashMap<Uuid, Vec<(Uuid, Uuid)>> = HashMap::new(); // from -> [(rel_id, to)]
+    for e in active.entities.iter().chain(draft.entities.iter()) {
+        for r in &e.relationships {
+            if r.cardinality != "many_to_many" {
+                adj.entry(e.id)
+                    .or_default()
+                    .push((r.id, r.target_entity_id));
+            }
+        }
+    }
+    let on_cycle = |from: Uuid, to: Uuid| -> bool {
+        // DFS from `to`; a cycle iff `from` is reachable
+        let mut seen = HashSet::new();
+        let mut stack = vec![to];
+        while let Some(n) = stack.pop() {
+            if n == from {
+                return true;
+            }
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Some(next) = adj.get(&n) {
+                for (_, t) in next {
+                    stack.push(*t);
+                }
+            }
+        }
+        false
+    };
+    let mut out = HashSet::new();
+    for e in active.entities.iter().chain(draft.entities.iter()) {
+        for r in &e.relationships {
+            if r.cardinality != "many_to_many" && on_cycle(e.id, r.target_entity_id) {
+                out.insert(r.id);
+            }
+        }
+    }
+    out
 }
