@@ -171,6 +171,56 @@ async fn gql(ctx: &Ctx, query: &str) -> Value {
     v
 }
 
+// Anti-regression: a tenant with no published model (fresh tenant, version 0)
+// must still get a valid schema. build_schema used to register empty
+// Query/Mutation objects for a model with zero entities, which async-graphql
+// rejects ("Object \"Query\" must define one or more fields") — every
+// /api/graphql request 500'd until the first publish. The fresh-tenant state
+// is the common one in production (every new deployment starts there).
+#[tokio::test]
+async fn graphql_empty_model_serves_a_valid_schema() {
+    let Some(ctx) = setup().await else {
+        return;
+    };
+
+    // No publish: the tenant has no active model. Introspection must succeed
+    // (HTTP 200, valid Query + Mutation root types) — not a 500.
+    let v = gql(
+        &ctx,
+        "{ __schema { queryType { name } mutationType { name } } }",
+    )
+    .await;
+    assert_eq!(v["data"]["__schema"]["queryType"]["name"], "Query");
+    assert_eq!(v["data"]["__schema"]["mutationType"]["name"], "Mutation");
+    assert!(
+        v["errors"].as_array().map(|e| e.is_empty()).unwrap_or(true),
+        "{v}"
+    );
+
+    // The placeholder field is queryable (proves the schema executes, not
+    // just builds).
+    let v = gql(&ctx, "{ _empty }").await;
+    assert_eq!(v["data"]["_empty"], true, "{v}");
+
+    // A data query is an ordinary GraphQL *validation* error (unknown field),
+    // never a 500.
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/graphql",
+        &ctx.token,
+        Some(json!({"query": "{ customers { name } }"}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "must be 200 + errors[], not a 500: {v}");
+    let errs = v["errors"].as_array().unwrap();
+    assert!(
+        !errs.is_empty(),
+        "unknown field must be a validation error: {v}"
+    );
+    assert!(v["data"].is_null(), "{v}");
+}
+
 #[tokio::test]
 async fn graphql_lists_and_fetches_with_traversal() {
     let Some(ctx) = setup().await else {

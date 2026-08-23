@@ -558,6 +558,17 @@ async fn build_schema(st: &AppState, tenant: Uuid) -> Result<Schema, Error> {
         );
     }
 
+    if defs.is_empty() {
+        // A tenant with no active entities — a fresh tenant (version 0) or an
+        // active model with zero entities — would otherwise register empty
+        // Query/Mutation objects, which async-graphql rejects (`Object "Query"
+        // must define one or more fields`), and every /api/graphql request
+        // would 500 until the first publish. Placeholder fields keep the schema
+        // valid + introspectable; real fields appear after the first publish.
+        query = query.field(placeholder_field());
+        mutation = mutation.field(placeholder_field());
+    }
+
     builder = builder.register(query).register(mutation);
     builder
         .limit_depth(MAX_DEPTH)
@@ -603,6 +614,15 @@ fn api_err_to_gql(e: crate::error::ApiError) -> async_graphql::Error {
         other => other.to_string(),
     };
     async_graphql::Error::new(msg).extend_with(move |_, v| v.set("code", code))
+}
+
+/// A `Boolean!` placeholder field (`_empty`) registered on Query and Mutation
+/// when the tenant's active model has no entities, so both root objects are
+/// non-empty and the schema builds (see [`build_schema`]).
+fn placeholder_field() -> Field {
+    Field::new("_empty", TypeRef::named(TypeRef::BOOLEAN), |_| {
+        FieldFuture::Value(Some(FieldValue::value(true)))
+    })
 }
 
 /// `PascalCase` → `camelCase` for query field names.

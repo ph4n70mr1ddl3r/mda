@@ -523,6 +523,30 @@ deliberate panic, and its `oversized_body_rejected` test builds a custom
 `EdgeConfig` (64-byte body limit) so it cannot reuse `setup()` — left as-is.
 No production code changed.
 
+## Tenth pass (2026-08-23): review — empty-model GraphQL 500
+
+### `/api/graphql` 500'd for a tenant with no active model (medium)
+
+`build_schema` registers one Query/Mutation field pair per *active* entity.
+A tenant with no published model — **every fresh deployment starts in this
+state** (version 0), and a publishable zero-entity model reaches it too —
+yields empty root objects, which async-graphql rejects at `finish()`
+(`Object "Query" must define one or more fields`). The error surfaced as a
+scrubbed 500 envelope on every `/api/graphql` request until the first
+publish, so a GraphQL client's first contact with a new tenant was always a
+failure (introspection included). Found by a production-readiness smoke test:
+release binary, production role, never-published tenant.
+
+Fix: when the tenant's active model has no entities, a `Boolean!` placeholder
+field (`_empty`) is registered on both root objects, so the schema builds,
+stays introspectable, and unknown-field queries return ordinary GraphQL
+*validation* errors instead of a 500 (`crates/mda-api/src/graphql.rs`). Real
+fields appear after the first publish; the `(tenant, version)` cache key is
+unaffected (version 0 caches like any other). Regression:
+`graphql_empty_model_serves_a_valid_schema` (graphql suite) — fresh tenant,
+no publish: introspection 200 with valid Query + Mutation roots, `_empty`
+resolves, and a data query is a validation error, never a 500.
+
 ## Verifying a deployment yourself
 
 ```bash
