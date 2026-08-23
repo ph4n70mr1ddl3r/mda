@@ -58,6 +58,11 @@ async fn create_report(
     AuthUser(user): AuthUser,
     Json(body): Json<CreateBody>,
 ) -> ApiResult<(axum::http::StatusCode, Json<ReportRow>)> {
+    // Authoring is admin-gated, matching every other Studio surface (rules,
+    // workflows, page designers): a report definition is shared tenant-wide
+    // and feeds schedules — any-authenticated-user authoring would let a
+    // lesser role silently rewrite (upsert-by-name) or delete them.
+    crate::admin::require_admin(&user)?;
     if body.name.trim().is_empty() {
         return Err(Error::Invalid("name is required".into()).into());
     }
@@ -122,6 +127,7 @@ async fn update_report(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateBody>,
 ) -> ApiResult<Json<ReportRow>> {
+    crate::admin::require_admin(&user)?;
     let existing = load_row(&st, user.tenant_id, id).await?;
     let name = body.name.unwrap_or(existing.name);
     let dataset = match body.dataset {
@@ -153,6 +159,7 @@ async fn delete_report(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<axum::http::StatusCode> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let res = sqlx::query("DELETE FROM meta.md_report WHERE tenant_id = $1 AND id = $2")

@@ -167,6 +167,9 @@ async fn upsert_form(
     Path(entity): Path<String>,
     Json(body): Json<UpsertUiBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    // Authoring is admin-gated (Studio page designers); render paths stay
+    // open to every reader — they resolve against the CALLER's security.
+    crate::admin::require_admin(&user)?;
     let layout = body.layout.unwrap_or_else(|| json!({"sections": []}));
     validate_layout(&layout)?;
     upsert_ui_row(
@@ -192,6 +195,7 @@ async fn delete_form(
     AuthUser(user): AuthUser,
     Path((entity, name)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     delete_ui_row(&st, user.tenant_id, "meta.md_form", &entity, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -257,6 +261,7 @@ async fn upsert_view(
     Path(entity): Path<String>,
     Json(body): Json<UpsertUiBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    crate::admin::require_admin(&user)?;
     let columns = body.columns.unwrap_or_else(|| json!([]));
     if !columns.is_array() {
         return Err(Error::Invalid("columns must be an array".into()).into());
@@ -295,6 +300,7 @@ async fn delete_view(
     AuthUser(user): AuthUser,
     Path((entity, name)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     delete_ui_row(&st, user.tenant_id, "meta.md_view", &entity, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -384,6 +390,7 @@ async fn upsert_dashboard(
     AuthUser(user): AuthUser,
     Json(body): Json<UpsertUiBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    crate::admin::require_admin(&user)?;
     let name = body.name.clone();
     if name.trim().is_empty() || name == "default" {
         return Err(Error::Invalid("a dashboard needs an explicit name".into()).into());
@@ -429,6 +436,7 @@ async fn delete_dashboard(
     AuthUser(user): AuthUser,
     Path(id): Path<Uuid>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let res = sqlx::query("DELETE FROM meta.md_dashboard WHERE tenant_id = $1 AND id = $2")
@@ -508,6 +516,7 @@ async fn upsert_navigation(
     AuthUser(user): AuthUser,
     Json(body): Json<UpsertUiBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
+    crate::admin::require_admin(&user)?;
     let items = body.items.unwrap_or_else(|| json!([]));
     if !items.is_array() {
         return Err(Error::Invalid("items must be an array".into()).into());
@@ -567,6 +576,7 @@ async fn delete_navigation(
     AuthUser(user): AuthUser,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let res = sqlx::query("DELETE FROM meta.md_navigation WHERE tenant_id = $1 AND name = $2")

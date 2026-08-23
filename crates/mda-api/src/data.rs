@@ -1007,10 +1007,17 @@ async fn import_records(
         target: Option<(Uuid, i64)>, // Some for an existing record (update)
         errors: Vec<Value>,
     }
-    // relationship column → target table (for FK-existence checks)
+    // relationship column → target table (for FK-existence checks).
+    // many-to-many fields are skipped: they have no hoisted column, so an
+    // import row addressing one fails validate_record's clear m2m error
+    // instead of a confusing existence check on a field that can't be set.
     let mut fk_targets: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for r in &def.relationships {
+    for r in def
+        .relationships
+        .iter()
+        .filter(|r| r.cardinality != "many_to_many")
+    {
         let tdef =
             mda_meta::loader::load_entity_definition(&st.pool, user.tenant_id, r.target_entity_id)
                 .await
@@ -1541,6 +1548,12 @@ async fn export_records(
     for r in &def.relationships {
         // FLS grain 4: a `none` grant on a reference column must not export
         // the FK ids either (same projection as the JSON read surfaces).
+        // many-to-many fields are skipped: they have no column and never
+        // appear in a record, so exporting them would emit a permanently
+        // empty column (and imply settable single-uuid semantics).
+        if r.cardinality == "many_to_many" {
+            continue;
+        }
         if user.field_access(&entity, &r.source_field_name) != Access::None {
             columns.push(r.source_field_name.clone());
         }

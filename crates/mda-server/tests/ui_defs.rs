@@ -633,3 +633,114 @@ async fn navigation_is_permission_filtered() {
     .await;
     assert_eq!(st, StatusCode::NO_CONTENT);
 }
+
+/// UI-definition authoring (POST/DELETE on forms/views/dashboards/navigation)
+/// is admin-gated, matching the Studio page designers. Render paths (GET) stay
+/// open to every reader — they resolve against the CALLER's security, so they
+/// can never widen access.
+#[tokio::test]
+async fn ui_authoring_requires_admin() {
+    let Some(ctx) = setup().await else { return };
+    let model = crm_model(
+        &format!("cust_{}", Uuid::new_v4().simple()),
+        &format!("region_{}", Uuid::new_v4().simple()),
+    );
+    publish(&ctx, model).await;
+    let token = seed_restricted_user(&ctx).await;
+
+    // forms
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/forms/Customer",
+        &token,
+        Some(json!({"layout": {"sections": []}}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin form upsert: {v}");
+    let (st, v) = call(
+        &ctx.app,
+        "DELETE",
+        "/api/forms/Customer/default",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin form delete: {v}");
+
+    // views
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/views/Customer",
+        &token,
+        Some(json!({"columns": []}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin view upsert: {v}");
+    let (st, v) = call(
+        &ctx.app,
+        "DELETE",
+        "/api/views/Customer/default",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin view delete: {v}");
+
+    // dashboards
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/dashboards",
+        &token,
+        Some(json!({"name": "x", "items": []}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin dashboard upsert: {v}");
+    let (st, v) = call(
+        &ctx.app,
+        "DELETE",
+        "/api/dashboards/00000000-0000-0000-0000-000000000000",
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin dashboard delete: {v}");
+
+    // navigation
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/navigation",
+        &token,
+        Some(json!({"items": []}).to_string()),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "non-admin navigation upsert: {v}"
+    );
+    let (st, v) = call(&ctx.app, "DELETE", "/api/navigation/default", &token, None).await;
+    assert_eq!(
+        st,
+        StatusCode::FORBIDDEN,
+        "non-admin navigation delete: {v}"
+    );
+
+    // admin authoring still works, and the reader's GET paths stay open
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/forms/Customer",
+        &ctx.admin_token,
+        Some(json!({"layout": {"sections": []}}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "admin form upsert: {v}");
+    let (st, v) = call(&ctx.app, "GET", "/api/forms/Customer", &token, None).await;
+    assert_eq!(st, StatusCode::OK, "reader render: {v}");
+    let (st, v) = call(&ctx.app, "GET", "/api/navigation", &token, None).await;
+    assert_eq!(st, StatusCode::OK, "reader navigation: {v}");
+}

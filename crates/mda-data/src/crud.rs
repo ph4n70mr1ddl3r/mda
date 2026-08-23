@@ -98,6 +98,18 @@ enum Bind {
     TextArray(Vec<String>),
 }
 
+/// Does this relationship hoist a real FK column on the record's own table?
+/// Many-to-many relationships materialize a **join table** instead (§5.7) —
+/// there is no per-record column, so every column-addressing path (the create
+/// INSERT column list, the update SET list, the restore column list, the
+/// filter/sort LHS) must skip them, and a record body addressing one is a
+/// client error: links live in `biz.<a>_<b>`, not in `attributes` or a column.
+/// Addressing a nonexistent column is a guaranteed 'column does not exist'
+/// 500, not a validation failure — hence the explicit gate everywhere below.
+fn is_column_rel(r: &mda_meta::Relationship) -> bool {
+    r.cardinality != "many_to_many"
+}
+
 enum ListBind {
     Uuid(Uuid),
     Text(String),
@@ -288,6 +300,12 @@ pub async fn create_tx(
     let mut fk_cols: Vec<&str> = Vec::new();
     let mut fk_values: Vec<Option<Uuid>> = Vec::new();
     for r in &def.relationships {
+        // m2m links live in the join table (no hoisted column — see
+        // is_column_rel); validate_record already rejected a body that tried
+        // to address one.
+        if !is_column_rel(r) {
+            continue;
+        }
         fk_cols.push(r.source_field_name.as_str());
         fk_values.push(uuid_or_null(
             body.get(&r.source_field_name),
@@ -509,6 +527,10 @@ pub async fn update_tx(
         sets.push(format!("attributes = {expr}"));
     }
     for r in &def.relationships {
+        // m2m links live in the join table, not a column (see is_column_rel).
+        if !is_column_rel(r) {
+            continue;
+        }
         if let Some(v) = body.get(&r.source_field_name) {
             let u = uuid_or_null(Some(v), &r.source_field_name)?;
             if r.required && u.is_none() {
@@ -798,6 +820,7 @@ fn build_list_where(
     let fk: HashSet<&str> = def
         .relationships
         .iter()
+        .filter(|r| is_column_rel(r))
         .map(|r| r.source_field_name.as_str())
         .collect();
     let core = ["state", "version", "created_at", "updated_at", "owner_id"];
@@ -899,6 +922,17 @@ fn build_list_where(
             Uuid::parse_str(&f.value)
                 .map_err(|_| Error::Invalid(format!("not a valid uuid: {}", f.value)))?;
             (f.field.clone(), "::uuid")
+        } else if def
+            .relationships
+            .iter()
+            .any(|r| !is_column_rel(r) && r.source_field_name == f.field)
+        {
+            // an m2m field has no column to filter on (join table) — reject
+            // with the reason instead of falling to unknown-field.
+            return Err(Error::Invalid(format!(
+                "field {} is many-to-many: it has no per-record column to filter on",
+                f.field
+            )));
         } else if core.contains(&f.field.as_str()) {
             match f.field.as_str() {
                 "state" => {
@@ -983,6 +1017,7 @@ fn build_order(def: &EntityDefinition, sort: &[Sort]) -> Result<String> {
     let fk: HashSet<&str> = def
         .relationships
         .iter()
+        .filter(|r| is_column_rel(r))
         .map(|r| r.source_field_name.as_str())
         .collect();
     let core = [
@@ -1004,6 +1039,17 @@ fn build_order(def: &EntityDefinition, sort: &[Sort]) -> Result<String> {
                 format!("(attributes->>'{}')", s.field)
             };
             parts.push(format!("{expr} {}", dir(s.asc)));
+        } else if def
+            .relationships
+            .iter()
+            .any(|r| !is_column_rel(r) && r.source_field_name == s.field)
+        {
+            // an m2m field has no column to sort by — reject with the reason
+            // instead of the generic unknown-sort-field message.
+            return Err(Error::Invalid(format!(
+                "field {} is many-to-many: it has no per-record column to sort by",
+                s.field
+            )));
         } else {
             // Unknown sort field: reject (consistent with the filter path's
             // unknown-field 400). Silently ignoring it returns id-ordered rows
@@ -1112,6 +1158,27 @@ pub fn validate_record(def: &EntityDefinition, body: &Map<String, Value>) -> Res
     }
 
     for r in &def.relationships {
+        // A many-to-many field is not a column on the record row (links live
+        // in the join table) — addressing one in a record body is a client
+        // error with a message saying where links live, never a silent drop
+        // (which would later 500 on the column) or a bogus single-uuid FK.
+        if !is_column_rel(r) {
+            if let Some(v) = body.get(&r.source_field_name) {
+                // `null` on an m2m field is a no-op clear (nothing to clear);
+                // any other value claims to set links through the record body.
+                if !v.is_null() {
+                    errs.push(FieldError::new(
+                        &r.source_field_name,
+                        "mda.invalid_reference",
+                        format!(
+                            "field {} is many-to-many: links are managed via the join table, not the record body",
+                            r.source_field_name
+                        ),
+                    ));
+                }
+            }
+            continue;
+        }
         let v = body.get(&r.source_field_name);
         if matches!(v, None | Some(Value::Null)) {
             if r.required {
@@ -1191,6 +1258,7 @@ pub async fn restore_tx(
     let fk = def
         .relationships
         .iter()
+        .filter(|r| is_column_rel(r))
         .map(|r| r.source_field_name.as_str())
         .collect::<Vec<_>>()
         .join(", ");

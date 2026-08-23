@@ -450,6 +450,32 @@ pub fn diff(active: &DraftModel, draft: &DraftModel) -> DiffReport {
                 }
                 _ => {}
             }
+            // Many-to-many rides a JOIN TABLE (§5.7), not a per-record FK
+            // column: the join's FKs are fixed CASCADE (deleting either
+            // endpoint removes the link), and links are not part of the
+            // record row — so per-record `required`, a master_detail strength,
+            // and an `on_delete` are all unsatisfiable/ignored on an m2m and
+            // are rejected at author time instead of silently mis-behaving.
+            if r.cardinality == "many_to_many" {
+                if r.required {
+                    report.errors.push(format!(
+                        "relationship {} on {}: many_to_many cannot be required — links live in the join table, not on the record",
+                        r.source_field_name, e.name
+                    ));
+                }
+                if r.strength == "master_detail" {
+                    report.errors.push(format!(
+                        "relationship {} on {}: many_to_many cannot be master_detail (no per-record NOT NULL FK column)",
+                        r.source_field_name, e.name
+                    ));
+                }
+                if r.on_delete.is_some() {
+                    report.errors.push(format!(
+                        "relationship {} on {}: many_to_many join FKs are always ON DELETE CASCADE; on_delete is lookup-only",
+                        r.source_field_name, e.name
+                    ));
+                }
+            }
             // explicit join-table overrides must be safe identifiers
             if let Some(j) = r.join_table_name.as_deref() {
                 if !is_valid_table_name(j) {
@@ -1275,6 +1301,65 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("targets unknown entity")));
+    }
+
+    #[test]
+    fn rejects_unsatisfiable_many_to_many_options() {
+        // m2m rides a join table, not a per-record FK column: `required`,
+        // master_detail, and on_delete are all unsatisfiable/ignored on it.
+        for (required, strength, on_delete, expect) in [
+            (true, "lookup", None, "cannot be required"),
+            (false, "master_detail", None, "cannot be master_detail"),
+            (
+                false,
+                "lookup",
+                Some("set_null"),
+                "join FKs are always ON DELETE CASCADE",
+            ),
+        ] {
+            let mut draft = DraftModel::empty();
+            draft.entities.push(ent(1, "Customer"));
+            let mut e = ent(2, "Tag");
+            e.relationships.push(DraftRelationship {
+                id: Uuid::from_u128(7),
+                source_field_name: "tags".into(),
+                target_entity_id: Uuid::from_u128(1),
+                cardinality: "many_to_many".into(),
+                strength: strength.into(),
+                on_delete: on_delete.map(str::to_string),
+                required,
+                reference_qualifier: None,
+                rollup_summary: None,
+                join_table_name: None,
+            });
+            draft.entities.push(e);
+            let r = diff(&DraftModel::empty(), &draft);
+            assert!(!r.valid, "m2m required={required} strength={strength} on_delete={on_delete:?} must be rejected");
+            assert!(
+                r.errors.iter().any(|e| e.contains(expect)),
+                "expected `{expect}` in {:?}",
+                r.errors
+            );
+        }
+        // a plain m2m stays valid
+        let mut draft = DraftModel::empty();
+        draft.entities.push(ent(1, "Customer"));
+        let mut e = ent(2, "Tag");
+        e.relationships.push(DraftRelationship {
+            id: Uuid::from_u128(7),
+            source_field_name: "tags".into(),
+            target_entity_id: Uuid::from_u128(1),
+            cardinality: "many_to_many".into(),
+            strength: "lookup".into(),
+            on_delete: None,
+            required: false,
+            reference_qualifier: None,
+            rollup_summary: None,
+            join_table_name: None,
+        });
+        draft.entities.push(e);
+        let r = diff(&DraftModel::empty(), &draft);
+        assert!(r.valid, "{:?}", r.errors);
     }
 
     #[test]

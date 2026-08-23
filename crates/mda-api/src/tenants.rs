@@ -404,7 +404,8 @@ async fn restore_teams(
             None => {
                 sqlx::query(
                     "INSERT INTO sec.sec_team (id, tenant_id, name) VALUES ($1, $2, $3)
-                     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+                     WHERE sec.sec_team.tenant_id = excluded.tenant_id",
                 )
                 .bind(id)
                 .bind(tenant)
@@ -501,7 +502,8 @@ async fn restore_roles(
             None => {
                 sqlx::query(
                     "INSERT INTO sec.sec_role (id, tenant_id, name) VALUES ($1, $2, $3)
-                     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+                     ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+                     WHERE sec.sec_role.tenant_id = excluded.tenant_id",
                 )
                 .bind(id)
                 .bind(tenant)
@@ -673,7 +675,8 @@ async fn restore_templates(
                     "INSERT INTO meta.md_template (id, tenant_id, name, kind, body, content_type, locale)
                      VALUES ($1, $2, $3, $4, $5, $6, $7)
                      ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, kind = EXCLUDED.kind,
-                     body = EXCLUDED.body, content_type = EXCLUDED.content_type, locale = EXCLUDED.locale",
+                     body = EXCLUDED.body, content_type = EXCLUDED.content_type, locale = EXCLUDED.locale
+                     WHERE meta.md_template.tenant_id = excluded.tenant_id",
                 )
                 .bind(id)
                 .bind(tenant)
@@ -747,7 +750,8 @@ async fn restore_notification_types(
                      VALUES ($1, $2, $3, $4, $5, $6, $7)
                      ON CONFLICT (id) DO UPDATE SET key = EXCLUDED.key, label = EXCLUDED.label,
                         default_channels = EXCLUDED.default_channels,
-                        template_name = EXCLUDED.template_name, digestible = EXCLUDED.digestible",
+                        template_name = EXCLUDED.template_name, digestible = EXCLUDED.digestible
+                     WHERE meta.md_notification_type.tenant_id = excluded.tenant_id",
                 )
                 .bind(id)
                 .bind(tenant)
@@ -788,7 +792,8 @@ async fn restore_reports(
         map.insert(id, actual);
         sqlx::query(
             "INSERT INTO meta.md_report (id, tenant_id, name, dataset) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, dataset = EXCLUDED.dataset",
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, dataset = EXCLUDED.dataset
+                     WHERE meta.md_report.tenant_id = excluded.tenant_id",
         )
         .bind(actual)
         .bind(tenant)
@@ -827,7 +832,8 @@ async fn restore_rules(
                 entity = EXCLUDED.entity, event = EXCLUDED.event, condition = EXCLUDED.condition,
                 action_type = EXCLUDED.action_type, action_field = EXCLUDED.action_field,
                 action_value = EXCLUDED.action_value, active = EXCLUDED.active,
-                priority = EXCLUDED.priority",
+                priority = EXCLUDED.priority
+                     WHERE meta.md_rule.tenant_id = excluded.tenant_id",
         )
         .bind(id)
         .bind(tenant)
@@ -913,7 +919,8 @@ async fn restore_connectors(
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name, transport = EXCLUDED.transport,
-                base_url = EXCLUDED.base_url, auth = EXCLUDED.auth",
+                base_url = EXCLUDED.base_url, auth = EXCLUDED.auth
+                     WHERE int.connector.tenant_id = excluded.tenant_id",
         )
         .bind(actual)
         .bind(tenant)
@@ -950,7 +957,8 @@ async fn restore_value_maps(
         sqlx::query(
             "INSERT INTO int.value_map (id, tenant_id, name, entries)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, entries = EXCLUDED.entries",
+             ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, entries = EXCLUDED.entries
+                     WHERE int.value_map.tenant_id = excluded.tenant_id",
         )
         .bind(actual)
         .bind(tenant)
@@ -1016,7 +1024,8 @@ async fn restore_flows(
                 endpoint_path = EXCLUDED.endpoint_path, mapping = EXCLUDED.mapping,
                 external_key_field = EXCLUDED.external_key_field,
                 conflict_policy = EXCLUDED.conflict_policy, system = EXCLUDED.system,
-                active = EXCLUDED.active, running_user_id = EXCLUDED.running_user_id",
+                active = EXCLUDED.active, running_user_id = EXCLUDED.running_user_id
+                     WHERE int.flow.tenant_id = excluded.tenant_id",
         )
         .bind(actual)
         .bind(tenant)
@@ -1133,7 +1142,8 @@ async fn restore_share_rules(
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO UPDATE SET entity = EXCLUDED.entity,
                  condition = EXCLUDED.condition, principal_id = EXCLUDED.principal_id,
-                 access = EXCLUDED.access, epoch = EXCLUDED.epoch, active = EXCLUDED.active",
+                 access = EXCLUDED.access, epoch = EXCLUDED.epoch, active = EXCLUDED.active
+                     WHERE sec.sec_share_rule.tenant_id = excluded.tenant_id",
         )
         .bind(id)
         .bind(tenant)

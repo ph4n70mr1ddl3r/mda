@@ -451,6 +451,15 @@ async fn resolve_field(
             .iter()
             .find(|r| r.source_field_name == *seg)
         {
+            // m2m relationships materialize a join table (§5.7) — there is no
+            // hoisted FK column to traverse or select. Traversing one is a
+            // compile-time client error, never a nonexistent-column 500 at run.
+            if rel.cardinality == "many_to_many" {
+                return Err(Error::Invalid(format!(
+                    "field path '{path}': {} is many-to-many — many-to-many traversal is not supported (no hoisted reference column)",
+                    rel.source_field_name
+                )));
+            }
             // a reference — either the leaf (the id itself) or the next hop
             let leaf_sql = format!("{alias}.{seg}");
             if last {

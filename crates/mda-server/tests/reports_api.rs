@@ -844,3 +844,93 @@ async fn scheduled_report_notifies_on_delivery() {
     .unwrap();
     assert_eq!(n, 1, "scheduled report delivery enqueued a notification");
 }
+
+/// Authoring (create/update/delete) is admin-gated like every other Studio
+/// surface; run/export stay open to readers (per-run security governs them).
+/// A non-admin upserting a report name would silently rewrite a shared
+/// definition that schedules and dashboards depend on.
+#[tokio::test]
+async fn report_authoring_requires_admin() {
+    let Some(ctx) = setup().await else { return };
+    publish(
+        &ctx,
+        order_model(
+            &format!("order_{}", Uuid::new_v4().simple()),
+            &format!("customer_{}", Uuid::new_v4().simple()),
+        ),
+    )
+    .await;
+
+    // a reader: read on both entities, nothing else
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(&ctx.pool, ctx.tenant, &email, "u", &hash).await;
+    let role = common::seed_role(
+        &ctx.pool,
+        ctx.tenant,
+        "viewer",
+        &[("Order", "read"), ("Customer", "read")],
+    )
+    .await;
+    common::seed_assignment(&ctx.pool, ctx.tenant, uid, role).await;
+    let jwt = JwtConfig::from_env();
+    let token = jwt.issue_access(uid, ctx.tenant, None).unwrap();
+
+    let body = json!({
+        "name": "stealer",
+        "dataset": {"base_entity":"Order","fields":[{"field":"ref"}]}
+    })
+    .to_string();
+    let (st, v) = call(&ctx.app, "POST", "/api/reports", &token, Some(body)).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin create: {v}");
+
+    // admin creates it; the reader still cannot rewrite or delete it.
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/reports",
+        &ctx.admin_token,
+        Some(
+            json!({
+                "name": "stealer",
+                "dataset": {"base_entity":"Order","fields":[{"field":"ref"}]}
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    let id = v["id"].as_str().unwrap().parse::<Uuid>().unwrap();
+
+    let (st, v) = call(
+        &ctx.app,
+        "PATCH",
+        &format!("/api/reports/{id}"),
+        &token,
+        Some(json!({"name": "hijacked"}).to_string()),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin update: {v}");
+    let (st, v) = call(
+        &ctx.app,
+        "DELETE",
+        &format!("/api/reports/{id}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin delete: {v}");
+
+    // reads stay open for the reader (the definition list a dashboard picks from)
+    let (st, v) = call(&ctx.app, "GET", "/api/reports", &token, None).await;
+    assert_eq!(st, StatusCode::OK, "reader can list: {v}");
+    let (st, v) = call(
+        &ctx.app,
+        "GET",
+        &format!("/api/reports/{id}/run"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "reader can run: {v}");
+}

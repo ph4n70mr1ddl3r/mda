@@ -117,6 +117,10 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 # Bulk import/export (§5.13) — mapped, validated, safe record import (CSV or JSON):
 #   POST /api/impex/:entity/import?mode=upsert&key=email&dry_run=true&on_error=abort  (text/csv body)
 #   GET  /api/impex/:entity/export  (-> text/csv; respects field-level read security)
+# many_to_many relationships materialize a real join table (biz.<a>_<b>, §5.7); the
+# m2m field is NOT a column on the record row — record bodies, filters, sorts and
+# report traversals reject it with a 422 pointing at the join table (a dedicated
+# link-management API is the follow-up that completes the m2m runtime surface)
 # Manual record sharing (§5.11) — grant / list / revoke (owner-or-superuser):
 #   POST   /api/shares/:entity/:id              {"principal_id":"…","access":"read|write"}
 #   GET    /api/shares/:entity/:id              -> [{principal_id, access, name, email, created_at}]
@@ -131,11 +135,13 @@ curl "localhost:8080/api/data/Customer?filter=name:eq:Acme" -H "x-tenant-id: $TE
 #   GET  /api/views/:entity[?name=]   grid columns + default filters/sort/page size
 #   GET  /api/dashboards[/:id]        definitions; :id RUNS each report under the caller
 #   GET  /api/navigation              the caller's permission-filtered menu
-#   (POST/PATCH/DELETE on the same paths author the definitions)
+#   (POST/PATCH/DELETE on the same paths author the definitions — admin-gated,
+#    like every Studio authoring surface; renders stay open to all readers)
 
 # Reports (§5.17) — author, run, export (csv|html|xlsx|pdf); fields may traverse
 # references (customer_id.name) via real LEFT JOINs over the hoisted FK columns:
-#   POST/GET /api/reports[/:id]       CRUD on meta.md_report
+#   POST/GET /api/reports[/:id]       CRUD on meta.md_report (writes admin-gated;
+#                                      run/export open to readers, per-run security)
 #   GET  /api/reports/:id/run         run under the caller's full security
 #   GET  /api/reports/:id/export?format=pdf
 

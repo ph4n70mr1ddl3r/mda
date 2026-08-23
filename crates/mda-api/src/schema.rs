@@ -150,6 +150,22 @@ fn build(
         if user.field_access(entity, &r.source_field_name) == Access::None {
             continue;
         }
+        if r.cardinality == "many_to_many" {
+            // m2m fields are NOT record columns (links live in the join
+            // table) — advertise the shape truthfully so clients don't send
+            // a single uuid the write path would reject.
+            props.insert(
+                r.source_field_name.clone(),
+                json!({
+                    "type": ["array", "null"],
+                    "items": { "type": "string", "format": "uuid" },
+                    "x-mda-type": "many_to_many",
+                    "x-mda-on-delete": r.on_delete,
+                    "x-mda-note": "links are managed via the join table, not the record body",
+                }),
+            );
+            continue;
+        }
         let mut spec = json!({
             "type": ["string", "null"],
             "format": "uuid",

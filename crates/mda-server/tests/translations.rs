@@ -281,3 +281,47 @@ async fn template_render_localizes_via_i18n_bundle() {
     .await;
     assert_eq!(res["body"], "Subject: Your order");
 }
+
+/// Translation authoring is admin-gated (the bundle is tenant-shared metadata
+/// injected into template rendering); reads stay open — every UI localizes.
+#[tokio::test]
+async fn translation_authoring_requires_admin() {
+    let Some(ctx) = setup().await else { return };
+
+    // a non-admin user
+    let hash = mda_security::hash_password("x").unwrap();
+    let email = format!("u{}@test", Uuid::new_v4().simple());
+    let uid = common::seed_user(&ctx.pool, ctx.tenant, &email, "u", &hash).await;
+    let jwt = JwtConfig::from_env();
+    let token = jwt.issue_access(uid, ctx.tenant, None).unwrap();
+
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/translations",
+        &token,
+        Some(
+            json!({"locale":"fr","namespace":"ui","key":"greeting","value":"Bonjour"}).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin upsert: {v}");
+    let (st, v) = call(&ctx.app, "DELETE", "/api/translations/fr", &token, None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "non-admin locale delete: {v}");
+
+    // admin authors; the reader's bundle reads stay open
+    let (st, v) = call(
+        &ctx.app,
+        "POST",
+        "/api/translations",
+        &ctx.token,
+        Some(
+            json!({"locale":"fr","namespace":"ui","key":"greeting","value":"Bonjour"}).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "admin upsert: {v}");
+    let (st, v) = call(&ctx.app, "GET", "/api/i18n/fr", &token, None).await;
+    assert_eq!(st, StatusCode::OK, "reader bundle: {v}");
+    assert_eq!(v["translations"]["ui.greeting"], "Bonjour");
+}

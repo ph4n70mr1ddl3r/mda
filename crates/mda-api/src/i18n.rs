@@ -82,6 +82,10 @@ async fn upsert_translation(
     AuthUser(user): AuthUser,
     Json(body): Json<UpsertBody>,
 ) -> ApiResult<(StatusCode, Json<TranslationRow>)> {
+    // The bundle is tenant-shared metadata that feeds template rendering
+    // (§5.19 i18n injection) — authoring is admin-gated like every other
+    // metadata-writing surface. Reads stay open: every UI localizes.
+    crate::admin::require_admin(&user)?;
     if body.key.trim().is_empty() {
         return Err(Error::Invalid("key is required".into()).into());
     }
@@ -202,6 +206,7 @@ async fn delete_locale(
     Path(locale): Path<String>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let n = if let Some(ns) = &q.namespace {
@@ -238,6 +243,7 @@ async fn delete_translation(
     AuthUser(user): AuthUser,
     Path((locale, namespace, key)): Path<(String, String, String)>,
 ) -> ApiResult<StatusCode> {
+    crate::admin::require_admin(&user)?;
     let mut tx = st.pool.begin().await.map_err(Error::internal)?;
     mda_security::set_tenant(&mut tx, user.tenant_id).await?;
     let n = sqlx::query(
