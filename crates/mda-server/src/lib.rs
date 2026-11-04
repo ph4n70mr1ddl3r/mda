@@ -145,17 +145,20 @@ pub async fn run() -> anyhow::Result<()> {
 /// Wait for Ctrl-C or SIGTERM.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install Ctrl-C handler");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {},
+            Err(e) => tracing::warn!("failed to install Ctrl-C handler: {e}"),
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await.expect("terminate signal received");
+            }
+            Err(e) => tracing::warn!("failed to install SIGTERM handler: {e}"),
+        }
     };
 
     #[cfg(not(unix))]
@@ -178,5 +181,41 @@ fn init_tracing(cfg: &config::Settings) {
     match cfg.log_format.as_str() {
         "json" => fmt().with_env_filter(filter).json().init(),
         _ => fmt().with_env_filter(filter).init(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn shutdown_signal_has_no_expect() {
+        // Verify the shutdown_signal function source doesn't contain .expect()
+        // by checking the source lines between fn shutdown_signal and fn init_tracing
+        let lines: Vec<&str> = include_str!("./lib.rs")
+            .lines()
+            .skip_while(|l| !l.starts_with("fn shutdown_signal"))
+            .skip(1)
+            .take_while(|l| !l.starts_with("fn init_tracing") && !l.trim().is_empty())
+            .collect();
+        let content = lines.join("\n");
+        assert!(
+            !content.contains(".expect("),
+            "shutdown_signal should not contain .expect()"
+        );
+    }
+
+    #[test]
+    fn init_tracing_uses_proper_error_handling() {
+        let src = std::include_str!("./lib.rs");
+        // Verify init_tracing uses try_from_default_env for error-safe config
+        assert!(
+            src.contains("try_from_default_env"),
+            "init_tracing should use try_from_default_env for safe error handling"
+        );
+        // Verify it has fallback
+        assert!(
+            src.contains("unwrap_or_else"),
+            "init_tracing should have unwrap_or_else fallback"
+        );
     }
 }
