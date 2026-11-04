@@ -156,7 +156,10 @@ pub async fn access_log(req: Request, next: Next) -> Response {
         .headers()
         .get("x-request-id")
         .cloned()
-        .unwrap_or_else(|| HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap());
+        .unwrap_or_else(|| {
+            HeaderValue::from_str(&Uuid::new_v4().to_string())
+                .expect("failed to create request ID header value from uuid")
+        });
 
     let method = req.method().clone();
     let start = Instant::now();
