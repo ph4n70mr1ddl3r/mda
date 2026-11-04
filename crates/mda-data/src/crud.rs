@@ -311,7 +311,7 @@ pub async fn create_tx(
             body.get(&r.source_field_name),
             &r.source_field_name,
         )?);
-        if r.required && fk_values.last().unwrap().is_none() {
+        if r.required && fk_values.last().map_or(false, |v| v.is_none()) {
             return Err(Error::Invalid(format!(
                 "field {} is required",
                 r.source_field_name
