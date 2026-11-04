@@ -366,7 +366,7 @@ async fn malformed_input_and_error_content_type() {
 /// requests are rejected before handlers run.
 #[tokio::test]
 async fn oversized_body_rejected() {
-    let url = std::env::var("DATABASE_URL").unwrap();
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for the security suite");
     let (pool, _db) = common::spawn_db(&url).await;
     let tenant = Uuid::nil();
     let role_id = common::seed_role(&pool, tenant, "admin", &[("*", "*")]).await;
@@ -399,11 +399,11 @@ async fn oversized_body_rejected() {
                 .uri("/api/auth/login")
                 .header("content-type", "application/json")
                 .body(Body::from(format!("{{\"padding\":\"{big}\"}}")))
-                .unwrap(),
+                .expect("Request::builder body should not fail"),
         )
         .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        .expect("oneshot should succeed");
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "expected payload too large, got {:?}", resp.status());
     let _ = token;
 }
 
