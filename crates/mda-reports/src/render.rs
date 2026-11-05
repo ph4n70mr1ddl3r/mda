@@ -331,6 +331,7 @@ fn pdf_escape(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '(' => out.push_str("\\("),
             ')' => out.push_str("\\)"),
+            '%' => out.push_str("%%"),
             '\r' | '\n' => out.push(' '),
             c if (c as u32) < 256 => out.push(c),
             _ => out.push('?'),
@@ -492,6 +493,20 @@ mod tests {
         let bytes = to_pdf(&res, "t").unwrap();
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains(r"a\(b\)c\\d"));
+    }
+
+    #[test]
+    fn pdf_percent_sign_is_escaped() {
+        let mut m = Map::new();
+        m.insert("v".into(), Value::String("100% increase".into()));
+        let res = ReportResult {
+            columns: vec!["v".into()],
+            rows: vec![m],
+        };
+        let bytes = to_pdf(&res, "t").unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("%%"));
+        assert!(!s.contains("100% increase"), "unescaped % would break PDF");
     }
 
     #[test]
